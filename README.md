@@ -15,6 +15,7 @@ Notebook [marimo](https://marimo.io) untuk chat panjang dengan Qwen3.8-27B ablit
   - `history_search` / `history_read`: cari dan baca ulang pesan asli, termasuk yang sudah diringkas
 - **SQLite**: semua chat, setiap pesan (utuh, termasuk thinking dan hasil tool), ringkasan, dan memory dalam satu file
 - **Auto compaction di 90% konteks**: buang thinking lama dulu, lalu ringkas giliran lama. Pesan asli tetap tersimpan dan bisa dibaca ulang lewat `history_read`
+- **Lampiran** (maks 25 MB per file): gambar dan video langsung dilihat model; PDF jadi teks + gambar 12 halaman pertama; DOCX, XLSX, PPTX, ZIP, dan file teks jadi teks. Audio tidak didukung. `visit` bisa mengirim screenshot halaman
 - **Jendela chat**: sidebar daftar chat, riwayat bisa di-scroll, streaming, blok thinking dan kartu tool buka-tutup, ringkasan compaction terlihat, system prompt per chat, meteran konteks, statistik token/s, indikator belum disimpan
 
 ## Cara pakai
