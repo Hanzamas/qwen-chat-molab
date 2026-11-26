@@ -233,7 +233,7 @@ def _(mo):
         value="512K (YaRN factor 2.0)",
         label="Konteks",
     )
-    use_mtp = mo.ui.switch(value=False, label="MTP speculative decoding (generate lebih cepat, startup pertama compile kernel)")
+    use_mtp = mo.ui.switch(value=True, label="MTP speculative decoding (generate lebih cepat, startup pertama compile kernel)")
     install_btn = mo.ui.run_button(label="Install")
     start_btn = mo.ui.run_button(label="Start", kind="success")
     stop_btn = mo.ui.run_button(label="Stop", kind="danger")
