@@ -1,6 +1,46 @@
 class TXT:
     """Text utilities: search queries, counting, similarity, and the RP quality checks."""
 
+    MONTH_NAMES = {}
+    for _i, _names in enumerate([
+            "januari january januar jan", "februari february februar feb", "maret march märz maerz mar mär",
+            "april apr", "mei may mai", "juni june jun", "juli july jul", "agustus august aug agu",
+            "september sep sept", "oktober october okt oct", "november nov", "desember december dezember des dec dez"]):
+        for _n in _names.split():
+            MONTH_NAMES[_n] = _i + 1
+    del _i, _names, _n
+
+    @staticmethod
+    def parse_datetime(text):
+        """A date and time from what models write: 2026-11-01 07:30, 2026-11-01T07:30, 01.11.2026 07:30,
+        1 November 2026 pukul 07.30, 1. November 2026, um 7:30 Uhr. Returns None when there is no full date."""
+        s = str(text or "").strip()
+        for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
+            try:
+                return datetime.strptime(s, fmt)
+            except ValueError:
+                pass
+        clock = r"(?:[ ,T]+(?:pukul|jam|um|at|kl\.?)?\s*(\d{1,2})[:.](\d{2}))?"
+        found = None
+        m = re.search(r"(\d{4})-(\d{1,2})-(\d{1,2})" + clock, s)
+        if m:
+            found = (m.group(1), m.group(2), m.group(3), m.group(4), m.group(5))
+        if not found:
+            m = re.search(r"(\d{1,2})[./](\d{1,2})[./](\d{4})" + clock, s)
+            if m:
+                found = (m.group(3), m.group(2), m.group(1), m.group(4), m.group(5))
+        if not found:
+            m = re.search(r"(\d{1,2})\.?\s+([^\W\d_]+)\.?,?\s+(\d{4})" + clock, s)
+            if m and m.group(2).lower() in TXT.MONTH_NAMES:
+                found = (m.group(3), TXT.MONTH_NAMES[m.group(2).lower()], m.group(1), m.group(4), m.group(5))
+        if not found:
+            return None
+        y, mo, d, h, mi = found
+        try:
+            return datetime(int(y), int(mo), int(d), int(h or 0), int(mi or 0))
+        except ValueError:
+            return None
+
     STOP = {
         "id": set("""yang dan di ke dari ini itu dengan untuk pada adalah dalam tidak akan juga sudah saya aku kamu dia
             mereka kami kita ada atau bisa jadi karena oleh seperti tapi tetapi lalu kemudian saat ketika masih hanya

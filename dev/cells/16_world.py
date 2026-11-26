@@ -15,12 +15,7 @@ class World:
 
     @staticmethod
     def parse_time(text):
-        for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
-            try:
-                return datetime.strptime((text or "").strip(), fmt)
-            except ValueError:
-                pass
-        return None
+        return TXT.parse_datetime(text)
 
     @staticmethod
     def minutes(label):

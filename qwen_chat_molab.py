@@ -1523,9 +1523,49 @@ def _(BACKUP, bk_interval, bk_now, bk_repo, bk_restore, bk_token, ctl_hf, mo):
 
 
 @app.cell(hide_code=True)
-def _(re):
+def _(datetime, re):
     class TXT:
         """Text utilities: search queries, counting, similarity, and the RP quality checks."""
+
+        MONTH_NAMES = {}
+        for _i, _names in enumerate([
+                "januari january januar jan", "februari february februar feb", "maret march märz maerz mar mär",
+                "april apr", "mei may mai", "juni june jun", "juli july jul", "agustus august aug agu",
+                "september sep sept", "oktober october okt oct", "november nov", "desember december dezember des dec dez"]):
+            for _n in _names.split():
+                MONTH_NAMES[_n] = _i + 1
+        del _i, _names, _n
+
+        @staticmethod
+        def parse_datetime(text):
+            """A date and time from what models write: 2026-11-01 07:30, 2026-11-01T07:30, 01.11.2026 07:30,
+            1 November 2026 pukul 07.30, 1. November 2026, um 7:30 Uhr. Returns None when there is no full date."""
+            s = str(text or "").strip()
+            for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
+                try:
+                    return datetime.strptime(s, fmt)
+                except ValueError:
+                    pass
+            clock = r"(?:[ ,T]+(?:pukul|jam|um|at|kl\.?)?\s*(\d{1,2})[:.](\d{2}))?"
+            found = None
+            m = re.search(r"(\d{4})-(\d{1,2})-(\d{1,2})" + clock, s)
+            if m:
+                found = (m.group(1), m.group(2), m.group(3), m.group(4), m.group(5))
+            if not found:
+                m = re.search(r"(\d{1,2})[./](\d{1,2})[./](\d{4})" + clock, s)
+                if m:
+                    found = (m.group(3), m.group(2), m.group(1), m.group(4), m.group(5))
+            if not found:
+                m = re.search(r"(\d{1,2})\.?\s+([^\W\d_]+)\.?,?\s+(\d{4})" + clock, s)
+                if m and m.group(2).lower() in TXT.MONTH_NAMES:
+                    found = (m.group(3), TXT.MONTH_NAMES[m.group(2).lower()], m.group(1), m.group(4), m.group(5))
+            if not found:
+                return None
+            y, mo, d, h, mi = found
+            try:
+                return datetime(int(y), int(mo), int(d), int(h or 0), int(mi or 0))
+            except ValueError:
+                return None
 
         STOP = {
             "id": set("""yang dan di ke dari ini itu dengan untuk pada adalah dalam tidak akan juga sudah saya aku kamu dia
@@ -1885,7 +1925,7 @@ def _():
 
 
 @app.cell(hide_code=True)
-def _(DEFAULT_CARDS, DEFAULT_SCHEMAS, STORE, base64, json, re, time):
+def _(DEFAULT_CARDS, DEFAULT_SCHEMAS, STORE, TXT, base64, json, re, time):
     import struct as _struct
     import zlib as _zlib
 
@@ -2068,6 +2108,19 @@ def _(DEFAULT_CARDS, DEFAULT_SCHEMAS, STORE, base64, json, re, time):
                         out[k] = [self._cell(x) for x in v if self._cell(x)]
                 elif t in ("text", "longtext", "select") and isinstance(v, (list, dict)):
                     out[k] = "\n".join(map(self._cell, v)) if isinstance(v, list) else self._cell(v)
+                if t == "datetime" and isinstance(out[k], str):
+                    dt = TXT.parse_datetime(out[k])
+                    if dt:
+                        out[k] = dt.strftime("%Y-%m-%d %H:%M")
+                elif t == "select" and isinstance(out[k], str):
+                    match = next((o for o in f.get("options") or [] if o.lower() == out[k].strip().lower()), None)
+                    if match:
+                        out[k] = match
+                elif t == "number" and isinstance(out[k], str):
+                    m = re.fullmatch(r"\s*(-?\d+(?:[.,]\d+)?)\s*", out[k])
+                    if m:
+                        n = float(m.group(1).replace(",", "."))
+                        out[k] = int(n) if n.is_integer() else n
             return out
 
         # ---------- cards ----------
@@ -2461,6 +2514,7 @@ def _(
     Cards,
     STORE,
     STORIES,
+    TXT,
     datetime,
     json,
     random,
@@ -2485,12 +2539,7 @@ def _(
 
         @staticmethod
         def parse_time(text):
-            for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
-                try:
-                    return datetime.strptime((text or "").strip(), fmt)
-                except ValueError:
-                    pass
-            return None
+            return TXT.parse_datetime(text)
 
         @staticmethod
         def minutes(label):
@@ -4358,6 +4407,11 @@ def _(CARDS, MEM, Memory, STORE, STORIES, TXT, WEB, WORLD, World, json):
         def _field_report(self, card_id, field, value):
             card = self.cards.get(card_id)
             f = next((x for x in self.cards.schema(card["type"])["fields"] if x["key"] == field), None)
+            stored = card["data"].get(field)
+            if f and f.get("type") == "datetime" and stored and not TXT.parse_datetime(stored):
+                return {"error": f"'{field}' tidak terbaca sebagai tanggal. Tulis YYYY-MM-DD HH:MM, misalnya 1916-07-01 06:30."}
+            if f and f.get("type") == "select" and stored and stored not in (f.get("options") or []):
+                return {"note": f"'{stored}' bukan pilihan {field}. Pilihan: {', '.join(f.get('options') or [])}."}
             if not f or f.get("type") != "table":
                 return {}
             rows = card["data"].get(field) or []
@@ -5947,6 +6001,11 @@ def _():
     const KIND_ICON = { chat: "chat", rp: "book", group: "users", studio: "sparkles" };
 
     function render({ model, el }) {
+      // marimo may render into the same element again: drop the previous view's listeners first,
+      // or every click runs twice and toggles undo themselves.
+      if (el.__qrCleanup) el.__qrCleanup();
+      const ac = new AbortController();
+      const listen = (type, fn, capture) => el.addEventListener(type, fn, { capture: !!capture, signal: ac.signal });
       el.classList.add("qr");
       el.innerHTML = `
       <aside class="qr-side">
@@ -6340,7 +6399,12 @@ def _():
         if (f.type === "longtext") return `${label}<textarea id="${name}" data-field="${f.key}" data-type="longtext" rows="3">${esc(v ?? "")}</textarea>`;
         if (f.type === "list") return `${label}<textarea id="${name}" data-field="${f.key}" data-type="list" rows="3" placeholder="Satu per baris">${esc((Array.isArray(v) ? v : v ? [v] : []).join("\n"))}</textarea>`;
         if (f.type === "tags") return `${label}<input id="${name}" data-field="${f.key}" data-type="tags" value="${esc((Array.isArray(v) ? v : v ? [v] : []).join(", "))}" placeholder="Pisahkan dengan koma">`;
-        if (f.type === "select") return `${label}<select id="${name}" data-field="${f.key}" data-type="text"><option value=""></option>${(f.options || []).map((o) => `<option ${o === v ? "selected" : ""}>${esc(o)}</option>`).join("")}</select>`;
+        if (f.type === "select") {
+          const opts = [...(f.options || [])];
+          if (v && !opts.includes(v)) opts.push(v);
+          return `${label}<select id="${name}" data-field="${f.key}" data-type="text"><option value=""></option>${opts.map((o) => `<option ${o === v ? "selected" : ""}>${esc(o)}</option>`).join("")}</select>`;
+        }
+        if (f.type === "number" && v !== undefined && v !== null && v !== "" && isNaN(Number(v))) return `${label}<input id="${name}" data-field="${f.key}" data-type="text" value="${esc(v)}">`;
         if (f.type === "number") return `${label}<input id="${name}" type="number" data-field="${f.key}" data-type="number" value="${esc(v ?? "")}">`;
         if (f.type === "table") {
           const cols = f.columns || ["nilai"];
@@ -6580,7 +6644,7 @@ def _():
       main.addEventListener("drop", (e) => { e.preventDefault(); depth = 0; $(".qr-drop").hidden = true; addFiles([...(e.dataTransfer?.files || [])]); });
       $(".qr-search-in").addEventListener("input", renderChats);
       $(".qr-search-in").addEventListener("keydown", (e) => { if (e.key === "Enter" && e.target.value.trim()) send("search", { q: e.target.value.trim() }); });
-      el.addEventListener("toggle", (e) => {
+      listen("toggle", (e) => {
         const d = e.target;
         if (!(d instanceof HTMLDetailsElement) || !d.dataset.key) return;
         d.open ? state.open.add(d.dataset.key) : state.open.delete(d.dataset.key);
@@ -6606,8 +6670,8 @@ def _():
       });
       // typing in a card form marks it as having unsaved edits
       const markDirty = (e) => { const f = e.target.closest && e.target.closest(".qr-card-form"); if (f && !e.target.closest(".qr-lore-edit, .qr-tl")) state.formDirty = Number(f.dataset.card); };
-      el.addEventListener("input", markDirty);
-      el.addEventListener("change", markDirty);
+      listen("input", markDirty);
+      listen("change", markDirty);
       dbody.addEventListener("input", (e) => {
         const t = e.target;
         if (t.dataset.smp && t.type === "range") t.nextElementSibling.textContent = t.value;
@@ -6629,7 +6693,7 @@ def _():
       });
       modal.addEventListener("click", (e) => { if (e.target === modal) closeModal(); });
 
-      el.addEventListener("click", (e) => {
+      listen("click", (e) => {
         const chatRow = e.target.closest(".qr-chat");
         const btn = e.target.closest("[data-act]");
         if (!btn && chatRow) { send("select", { chat_id: Number(chatRow.dataset.chat) }); el.classList.remove("side-open"); return; }
@@ -6846,7 +6910,13 @@ def _():
       for (const [ev, fn] of Object.entries(handlers)) model.on(ev, fn);
       const timer = setInterval(renderBackup, 30000);
       onChat(); renderBusy(); renderLive(); renderPanels(); renderBackup(); renderStatusLine();
-      return () => { for (const [ev, fn] of Object.entries(handlers)) model.off(ev, fn); clearInterval(timer); themeObs.disconnect(); };
+      const cleanup = () => {
+        for (const [ev, fn] of Object.entries(handlers)) model.off(ev, fn);
+        clearInterval(timer); themeObs.disconnect(); ac.abort();
+        if (el.__qrCleanup === cleanup) el.__qrCleanup = null;
+      };
+      el.__qrCleanup = cleanup;
+      return cleanup;
     }
     export default { render };
     """

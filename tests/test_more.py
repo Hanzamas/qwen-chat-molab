@@ -326,3 +326,44 @@ def test_tool_calls_refresh_widget(nb, engine):
             break
         _t.sleep(0.05)
     assert app.w.rev > rev
+
+
+def test_dates_in_model_formats(nb):
+    P = nb["TXT"].parse_datetime
+    want = "2026-11-01 07:30"
+    for s in ["2026-11-01 07:30", "2026-11-01T07:30:00", "01.11.2026 07:30", "1 November 2026 pukul 07.30",
+              "Minggu, 1 November 2026, 07:30", "1. November 2026, um 7:30 Uhr", "1 Nov 2026 07:30"]:
+        assert P(s) and P(s).strftime("%Y-%m-%d %H:%M") == want, s
+    assert P("1 Desember 1916").strftime("%Y-%m-%d %H:%M") == "1916-12-01 00:00"
+    assert P("besok pagi") is None and P("") is None
+
+
+def test_scenario_card_from_studio_is_readable(engine, nb):
+    T, C = nb["TOOLS"], nb["CARDS"]
+    chat = engine.new_chat("studio", "Studio skenario")
+
+    def put(field, value, cid=None):
+        args = {"type": "scenario", "field": field, "value": value}
+        if cid:
+            args["card_id"] = cid
+        out, failed, _ = T.call(chat, None, "card_draft_update", json.dumps(args))
+        return json.loads(out)
+
+    sid = put("title", "The Haircut")["card_id"]
+    rep = put("start_time", "Minggu, 1 November 2026, 07:30", sid)
+    assert "error" not in rep and C.get(sid)["data"]["start_time"] == "2026-11-01 07:30"
+    rep = put("start_time", "pagi hari pertama", sid)
+    assert "error" in rep and "YYYY-MM-DD" in rep["error"]
+    put("start_time", "2026-11-01 07:30", sid)
+    style = C.save(None, "style", {"name": "Gaya uji"})
+    T.call(chat, None, "card_draft_update", json.dumps({"type": "style", "card_id": style, "field": "pov", "value": "ORANG KETIGA"}))
+    assert C.get(style)["data"]["pov"] == "orang ketiga"  # matched to the option, so the form shows it
+    out, _, _ = T.call(chat, None, "card_draft_update", json.dumps({"type": "style", "card_id": style, "field": "pov",
+                                                                  "value": "campuran"}))
+    assert "Pilihan" in json.loads(out)["note"] and C.get(style)["data"]["pov"] == "campuran"
+    put("start_stats", [{"key": "lapar", "nilai": 42}], sid)
+    card = C.get(sid)
+    assert card["data"]["start_stats"] == [["lapar", "42"]]
+    assert nb["WORLD"].start_time({"scenario": card}).strftime("%Y-%m-%d %H:%M") == "2026-11-01 07:30"
+    drafts = nb["STORE"].chat(chat)["settings"]["studio"]["drafts"]
+    assert drafts["scenario"] == sid

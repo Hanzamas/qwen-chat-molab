@@ -5,6 +5,11 @@ const TAB_NAMES = { chat: "Chat", story: "Cerita", cards: "Kartu", memory: "Memo
 const KIND_ICON = { chat: "chat", rp: "book", group: "users", studio: "sparkles" };
 
 function render({ model, el }) {
+  // marimo may render into the same element again: drop the previous view's listeners first,
+  // or every click runs twice and toggles undo themselves.
+  if (el.__qrCleanup) el.__qrCleanup();
+  const ac = new AbortController();
+  const listen = (type, fn, capture) => el.addEventListener(type, fn, { capture: !!capture, signal: ac.signal });
   el.classList.add("qr");
   el.innerHTML = `
   <aside class="qr-side">
@@ -398,7 +403,12 @@ function render({ model, el }) {
     if (f.type === "longtext") return `${label}<textarea id="${name}" data-field="${f.key}" data-type="longtext" rows="3">${esc(v ?? "")}</textarea>`;
     if (f.type === "list") return `${label}<textarea id="${name}" data-field="${f.key}" data-type="list" rows="3" placeholder="Satu per baris">${esc((Array.isArray(v) ? v : v ? [v] : []).join("\n"))}</textarea>`;
     if (f.type === "tags") return `${label}<input id="${name}" data-field="${f.key}" data-type="tags" value="${esc((Array.isArray(v) ? v : v ? [v] : []).join(", "))}" placeholder="Pisahkan dengan koma">`;
-    if (f.type === "select") return `${label}<select id="${name}" data-field="${f.key}" data-type="text"><option value=""></option>${(f.options || []).map((o) => `<option ${o === v ? "selected" : ""}>${esc(o)}</option>`).join("")}</select>`;
+    if (f.type === "select") {
+      const opts = [...(f.options || [])];
+      if (v && !opts.includes(v)) opts.push(v);
+      return `${label}<select id="${name}" data-field="${f.key}" data-type="text"><option value=""></option>${opts.map((o) => `<option ${o === v ? "selected" : ""}>${esc(o)}</option>`).join("")}</select>`;
+    }
+    if (f.type === "number" && v !== undefined && v !== null && v !== "" && isNaN(Number(v))) return `${label}<input id="${name}" data-field="${f.key}" data-type="text" value="${esc(v)}">`;
     if (f.type === "number") return `${label}<input id="${name}" type="number" data-field="${f.key}" data-type="number" value="${esc(v ?? "")}">`;
     if (f.type === "table") {
       const cols = f.columns || ["nilai"];
@@ -638,7 +648,7 @@ function render({ model, el }) {
   main.addEventListener("drop", (e) => { e.preventDefault(); depth = 0; $(".qr-drop").hidden = true; addFiles([...(e.dataTransfer?.files || [])]); });
   $(".qr-search-in").addEventListener("input", renderChats);
   $(".qr-search-in").addEventListener("keydown", (e) => { if (e.key === "Enter" && e.target.value.trim()) send("search", { q: e.target.value.trim() }); });
-  el.addEventListener("toggle", (e) => {
+  listen("toggle", (e) => {
     const d = e.target;
     if (!(d instanceof HTMLDetailsElement) || !d.dataset.key) return;
     d.open ? state.open.add(d.dataset.key) : state.open.delete(d.dataset.key);
@@ -664,8 +674,8 @@ function render({ model, el }) {
   });
   // typing in a card form marks it as having unsaved edits
   const markDirty = (e) => { const f = e.target.closest && e.target.closest(".qr-card-form"); if (f && !e.target.closest(".qr-lore-edit, .qr-tl")) state.formDirty = Number(f.dataset.card); };
-  el.addEventListener("input", markDirty);
-  el.addEventListener("change", markDirty);
+  listen("input", markDirty);
+  listen("change", markDirty);
   dbody.addEventListener("input", (e) => {
     const t = e.target;
     if (t.dataset.smp && t.type === "range") t.nextElementSibling.textContent = t.value;
@@ -687,7 +697,7 @@ function render({ model, el }) {
   });
   modal.addEventListener("click", (e) => { if (e.target === modal) closeModal(); });
 
-  el.addEventListener("click", (e) => {
+  listen("click", (e) => {
     const chatRow = e.target.closest(".qr-chat");
     const btn = e.target.closest("[data-act]");
     if (!btn && chatRow) { send("select", { chat_id: Number(chatRow.dataset.chat) }); el.classList.remove("side-open"); return; }
@@ -904,7 +914,13 @@ function render({ model, el }) {
   for (const [ev, fn] of Object.entries(handlers)) model.on(ev, fn);
   const timer = setInterval(renderBackup, 30000);
   onChat(); renderBusy(); renderLive(); renderPanels(); renderBackup(); renderStatusLine();
-  return () => { for (const [ev, fn] of Object.entries(handlers)) model.off(ev, fn); clearInterval(timer); themeObs.disconnect(); };
+  const cleanup = () => {
+    for (const [ev, fn] of Object.entries(handlers)) model.off(ev, fn);
+    clearInterval(timer); themeObs.disconnect(); ac.abort();
+    if (el.__qrCleanup === cleanup) el.__qrCleanup = null;
+  };
+  el.__qrCleanup = cleanup;
+  return cleanup;
 }
 export default { render };
 """

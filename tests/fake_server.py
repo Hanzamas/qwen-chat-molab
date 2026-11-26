@@ -97,6 +97,9 @@ def _reply(body):
             {"name": "memory_save", "arguments": json.dumps({"text": f"Catatan uji {user_texts.count('CARDTEST')}", "scope": "user"})},
             {"name": "card_draft_update", "arguments": json.dumps({"type": "world", "field": "stats",
                                                                    "value": f"lapar, Lapar, 0, 100, {20 + user_texts.count('CARDTEST')}, 4"})}]}
+    if "THINKTEST" in user_texts and last_role == "user":
+        return {"content": "Selesai mikir.", "slow_think": 0.25,
+                "reasoning": "\n".join(f"Baris pikiran {i}: menimbang detail adegan dan fakta." for i in range(80))}
     if "SLOWTEST" in text:
         return {"content": NARRATION + "\n\n" + NARRATION, "slow": 0.15}
     if "TOOLTEST" in user_texts and last_role == "user":
@@ -153,7 +156,11 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.flush()
 
         if r.get("reasoning"):
-            send({"choices": [{"index": 0, "delta": {"reasoning_content": r["reasoning"]}}]})
+            parts = [r["reasoning"]] if not r.get("slow_think") else r["reasoning"].split("\n")
+            for part in parts:
+                send({"choices": [{"index": 0, "delta": {"reasoning_content": part + ("\n" if r.get("slow_think") else "")}}]})
+                if r.get("slow_think"):
+                    time.sleep(r["slow_think"])
         content = r.get("content", "")
         pieces = 40 if r.get("slow") else 3
         step = max(1, len(content) // pieces + 1)

@@ -180,6 +180,19 @@ class Cards:
                     out[k] = [self._cell(x) for x in v if self._cell(x)]
             elif t in ("text", "longtext", "select") and isinstance(v, (list, dict)):
                 out[k] = "\n".join(map(self._cell, v)) if isinstance(v, list) else self._cell(v)
+            if t == "datetime" and isinstance(out[k], str):
+                dt = TXT.parse_datetime(out[k])
+                if dt:
+                    out[k] = dt.strftime("%Y-%m-%d %H:%M")
+            elif t == "select" and isinstance(out[k], str):
+                match = next((o for o in f.get("options") or [] if o.lower() == out[k].strip().lower()), None)
+                if match:
+                    out[k] = match
+            elif t == "number" and isinstance(out[k], str):
+                m = re.fullmatch(r"\s*(-?\d+(?:[.,]\d+)?)\s*", out[k])
+                if m:
+                    n = float(m.group(1).replace(",", "."))
+                    out[k] = int(n) if n.is_integer() else n
         return out
 
     # ---------- cards ----------

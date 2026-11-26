@@ -293,6 +293,11 @@ class ToolBox:
     def _field_report(self, card_id, field, value):
         card = self.cards.get(card_id)
         f = next((x for x in self.cards.schema(card["type"])["fields"] if x["key"] == field), None)
+        stored = card["data"].get(field)
+        if f and f.get("type") == "datetime" and stored and not TXT.parse_datetime(stored):
+            return {"error": f"'{field}' tidak terbaca sebagai tanggal. Tulis YYYY-MM-DD HH:MM, misalnya 1916-07-01 06:30."}
+        if f and f.get("type") == "select" and stored and stored not in (f.get("options") or []):
+            return {"note": f"'{stored}' bukan pilihan {field}. Pilihan: {', '.join(f.get('options') or [])}."}
         if not f or f.get("type") != "table":
             return {}
         rows = card["data"].get(field) or []
