@@ -19,7 +19,12 @@ CFG = SimpleNamespace(
     VLLM_VERSION="0.32.0",
     LLAMA_DIR=Path.home() / "llama.cpp",
     LLAMA_TAG="b12757",
-    LLAMA_ASSET="ubuntu-cuda-13.5-x64",
+    LLAMA_ASSETS={
+        "llama-b12757-bin-ubuntu-cuda-13.5-x64.tar.gz":
+            "15f610dc4e643a725972db99ca2283f2fe7e126d41c9be259247b155c80895cc",
+        "cudart-llama-b12757-bin-ubuntu-cuda-13.5-x64.tar.gz":
+            "94c0023cd24eeebe806f62fb401a6586c31496f4bb2acc8e283275ec7d64e48f",
+    },
     MODEL_DIR=Path.home() / "models",
     PIP_PINS={
         "camoufox[geoip]": "0.5.9",

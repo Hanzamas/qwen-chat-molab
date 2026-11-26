@@ -1,4 +1,6 @@
 def _act():
+    if ctl_hf.value.strip():
+        os.environ["HF_TOKEN"] = ctl_hf.value.strip()
     if ctl_install.value:
         try:
             SERVERS.install()

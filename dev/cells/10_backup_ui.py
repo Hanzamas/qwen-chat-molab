@@ -10,6 +10,7 @@ bk_now = mo.ui.run_button(label="Backup sekarang")
 bk_restore = mo.ui.run_button(label="Pulihkan terbaru", kind="danger")
 mo.accordion({"Backup ke Hugging Face": mo.vstack([
     mo.md("Token hanya disimpan di memori kernel, tidak pernah ditulis ke database, disk, atau file backup. "
-          "Kalau kosong, dipakai env `HF_TOKEN`. Repo dibuat **private**."),
+          "Kalau kosong, dipakai token di panel **Server model** (env `HF_TOKEN`); token itu harus punya izin write. "
+          "Repo dibuat **private**."),
     bk_token, mo.hstack([bk_repo, bk_interval], widths=[3, 1]), mo.hstack([bk_now, bk_restore], justify="start"),
 ])})

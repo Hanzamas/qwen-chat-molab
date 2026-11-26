@@ -117,7 +117,12 @@ def _(Path, SimpleNamespace, json, os, secrets):
         VLLM_VERSION="0.32.0",
         LLAMA_DIR=Path.home() / "llama.cpp",
         LLAMA_TAG="b12757",
-        LLAMA_ASSET="ubuntu-cuda-13.5-x64",
+        LLAMA_ASSETS={
+            "llama-b12757-bin-ubuntu-cuda-13.5-x64.tar.gz":
+                "15f610dc4e643a725972db99ca2283f2fe7e126d41c9be259247b155c80895cc",
+            "cudart-llama-b12757-bin-ubuntu-cuda-13.5-x64.tar.gz":
+                "94c0023cd24eeebe806f62fb401a6586c31496f4bb2acc8e283275ec7d64e48f",
+        },
         MODEL_DIR=Path.home() / "models",
         PIP_PINS={
             "camoufox[geoip]": "0.5.9",
@@ -549,16 +554,20 @@ def _(
                     raise RuntimeError("Gagal memasang vLLM. Lihat log di atas.")
                 CFG.VLLM_OK.touch()
             if not self.llama_bin():
-                rel = Sys.get_json(f"https://api.github.com/repos/ggml-org/llama.cpp/releases/tags/{CFG.LLAMA_TAG}", timeout=30)
-                urls = [a["browser_download_url"] for a in rel["assets"]
-                        if CFG.LLAMA_ASSET in a["name"] and a["name"].endswith("-x64.tar.gz")]
-                code = Sys.run_live(
-                    f"set -e; rm -rf {CFG.LLAMA_DIR}; mkdir -p {CFG.LLAMA_DIR}; cd {CFG.LLAMA_DIR}; "
-                    + "; ".join(f"curl -fsSL '{u}' | tar xz" for u in urls) + "; find . -name llama-server -type f",
-                    f"llama.cpp {CFG.LLAMA_TAG}", log)
+                code = Sys.run_live(self.llama_install_cmd(), f"llama.cpp {CFG.LLAMA_TAG}", log)
                 if code != 0 or not self.llama_bin():
                     raise RuntimeError("Gagal memasang llama.cpp. Lihat log di atas.")
             return True
+
+        @staticmethod
+        def llama_install_cmd():
+            """Shell command that downloads the pinned llama.cpp release files, checks their sha256 and unpacks them."""
+            base = f"https://github.com/ggml-org/llama.cpp/releases/download/{CFG.LLAMA_TAG}"
+            steps = [f"rm -rf {CFG.LLAMA_DIR}", f"mkdir -p {CFG.LLAMA_DIR}", f"cd {CFG.LLAMA_DIR}"]
+            for name, sha in CFG.LLAMA_ASSETS.items():
+                steps += [f"curl -fL --retry 5 --retry-all-errors --retry-delay 3 -o '{name}' '{base}/{name}'",
+                          f"echo '{sha}  {name}' | sha256sum -c -", f"tar xzf '{name}'", f"rm '{name}'"]
+            return "set -e; " + "; ".join(steps) + "; find . -name llama-server -type f"
 
         def installed(self):
             return CFG.VLLM_OK.exists() and bool(self.llama_bin())
@@ -807,6 +816,8 @@ def _(CTX_CHOICES, PRESETS, STORE, mo):
     ctl_ctx = mo.ui.dropdown(options=CTX_CHOICES, value=_ctx_label, label="Konteks")
     ctl_mtp = mo.ui.switch(value=_last.get("mtp", True), label="MTP (lebih cepat)")
     ctl_embed = mo.ui.switch(value=_last.get("embed", True), label="Embedder (pencarian memory lebih pintar)")
+    ctl_hf = mo.ui.text(kind="password", full_width=True,
+                         label="Token Hugging Face (opsional; untuk model gated, download lebih cepat, dan backup)")
     ctl_install = mo.ui.run_button(label="Install")
     ctl_start = mo.ui.run_button(label="Start", kind="success")
     ctl_stop = mo.ui.run_button(label="Stop", kind="danger")
@@ -814,11 +825,14 @@ def _(CTX_CHOICES, PRESETS, STORE, mo):
         mo.md("### Server model"),
         ctl_preset,
         mo.hstack([ctl_ctx, ctl_mtp, ctl_embed], justify="start", align="center", gap=2),
+        ctl_hf,
+        mo.md("_Token hanya disimpan di memori kernel (env `HF_TOKEN`), tidak ditulis ke database, disk, atau backup._"),
         mo.hstack([ctl_install, ctl_start, ctl_stop], justify="start"),
     ])
     return (
         ctl_ctx,
         ctl_embed,
+        ctl_hf,
         ctl_install,
         ctl_mtp,
         ctl_preset,
@@ -834,14 +848,18 @@ def _(
     STORE,
     ctl_ctx,
     ctl_embed,
+    ctl_hf,
     ctl_install,
     ctl_mtp,
     ctl_preset,
     ctl_start,
     ctl_stop,
     mo,
+    os,
 ):
     def _act():
+        if ctl_hf.value.strip():
+            os.environ["HF_TOKEN"] = ctl_hf.value.strip()
         if ctl_install.value:
             try:
                 SERVERS.install()
@@ -1475,16 +1493,17 @@ def _(STORE, mo):
     bk_restore = mo.ui.run_button(label="Pulihkan terbaru", kind="danger")
     mo.accordion({"Backup ke Hugging Face": mo.vstack([
         mo.md("Token hanya disimpan di memori kernel, tidak pernah ditulis ke database, disk, atau file backup. "
-              "Kalau kosong, dipakai env `HF_TOKEN`. Repo dibuat **private**."),
+              "Kalau kosong, dipakai token di panel **Server model** (env `HF_TOKEN`); token itu harus punya izin write. "
+              "Repo dibuat **private**."),
         bk_token, mo.hstack([bk_repo, bk_interval], widths=[3, 1]), mo.hstack([bk_now, bk_restore], justify="start"),
     ])})
     return bk_interval, bk_now, bk_repo, bk_restore, bk_token
 
 
 @app.cell(hide_code=True)
-def _(BACKUP, bk_interval, bk_now, bk_repo, bk_restore, bk_token, mo):
+def _(BACKUP, bk_interval, bk_now, bk_repo, bk_restore, bk_token, ctl_hf, mo):
     def _backup_act():
-        BACKUP.configure(bk_token.value, bk_repo.value, bk_interval.value)
+        BACKUP.configure(bk_token.value or ctl_hf.value, bk_repo.value, bk_interval.value)
         if not BACKUP.status["enabled"]:
             return mo.md(f"_Backup mati: {BACKUP.status['last_error'] or 'belum ada token.'}_")
         try:

@@ -1,5 +1,5 @@
 def _backup_act():
-    BACKUP.configure(bk_token.value, bk_repo.value, bk_interval.value)
+    BACKUP.configure(bk_token.value or ctl_hf.value, bk_repo.value, bk_interval.value)
     if not BACKUP.status["enabled"]:
         return mo.md(f"_Backup mati: {BACKUP.status['last_error'] or 'belum ada token.'}_")
     try:

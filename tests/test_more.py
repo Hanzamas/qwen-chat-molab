@@ -177,3 +177,10 @@ def test_dark_gemistry_vllm_cmd_uses_marlin_and_mtp(nb):
     spec = json.loads(cmd[cmd.index("--speculative-config") + 1])
     assert spec["model"] == "/d" and spec["num_speculative_tokens"] == 3
     assert "--tool-call-parser" in cmd and cmd[cmd.index("--tool-call-parser") + 1] == "gemma4"
+
+
+def test_llama_install_skips_github_api_and_checks_sha(nb):
+    cmd = nb["ServerManager"].llama_install_cmd()
+    assert "api.github.com" not in cmd
+    for name, sha in nb["CFG"].LLAMA_ASSETS.items():
+        assert f"releases/download/{nb['CFG'].LLAMA_TAG}/{name}" in cmd and f"echo '{sha}  {name}' | sha256sum -c -" in cmd

@@ -6,6 +6,8 @@ ctl_preset = mo.ui.dropdown(options=list(PRESETS), value=_last.get("preset") if 
 ctl_ctx = mo.ui.dropdown(options=CTX_CHOICES, value=_ctx_label, label="Konteks")
 ctl_mtp = mo.ui.switch(value=_last.get("mtp", True), label="MTP (lebih cepat)")
 ctl_embed = mo.ui.switch(value=_last.get("embed", True), label="Embedder (pencarian memory lebih pintar)")
+ctl_hf = mo.ui.text(kind="password", full_width=True,
+                     label="Token Hugging Face (opsional; untuk model gated, download lebih cepat, dan backup)")
 ctl_install = mo.ui.run_button(label="Install")
 ctl_start = mo.ui.run_button(label="Start", kind="success")
 ctl_stop = mo.ui.run_button(label="Stop", kind="danger")
@@ -13,5 +15,7 @@ mo.vstack([
     mo.md("### Server model"),
     ctl_preset,
     mo.hstack([ctl_ctx, ctl_mtp, ctl_embed], justify="start", align="center", gap=2),
+    ctl_hf,
+    mo.md("_Token hanya disimpan di memori kernel (env `HF_TOKEN`), tidak ditulis ke database, disk, atau backup._"),
     mo.hstack([ctl_install, ctl_start, ctl_stop], justify="start"),
 ])

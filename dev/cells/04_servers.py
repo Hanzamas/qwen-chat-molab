@@ -161,16 +161,20 @@ class ServerManager:
                 raise RuntimeError("Gagal memasang vLLM. Lihat log di atas.")
             CFG.VLLM_OK.touch()
         if not self.llama_bin():
-            rel = Sys.get_json(f"https://api.github.com/repos/ggml-org/llama.cpp/releases/tags/{CFG.LLAMA_TAG}", timeout=30)
-            urls = [a["browser_download_url"] for a in rel["assets"]
-                    if CFG.LLAMA_ASSET in a["name"] and a["name"].endswith("-x64.tar.gz")]
-            code = Sys.run_live(
-                f"set -e; rm -rf {CFG.LLAMA_DIR}; mkdir -p {CFG.LLAMA_DIR}; cd {CFG.LLAMA_DIR}; "
-                + "; ".join(f"curl -fsSL '{u}' | tar xz" for u in urls) + "; find . -name llama-server -type f",
-                f"llama.cpp {CFG.LLAMA_TAG}", log)
+            code = Sys.run_live(self.llama_install_cmd(), f"llama.cpp {CFG.LLAMA_TAG}", log)
             if code != 0 or not self.llama_bin():
                 raise RuntimeError("Gagal memasang llama.cpp. Lihat log di atas.")
         return True
+
+    @staticmethod
+    def llama_install_cmd():
+        """Shell command that downloads the pinned llama.cpp release files, checks their sha256 and unpacks them."""
+        base = f"https://github.com/ggml-org/llama.cpp/releases/download/{CFG.LLAMA_TAG}"
+        steps = [f"rm -rf {CFG.LLAMA_DIR}", f"mkdir -p {CFG.LLAMA_DIR}", f"cd {CFG.LLAMA_DIR}"]
+        for name, sha in CFG.LLAMA_ASSETS.items():
+            steps += [f"curl -fL --retry 5 --retry-all-errors --retry-delay 3 -o '{name}' '{base}/{name}'",
+                      f"echo '{sha}  {name}' | sha256sum -c -", f"tar xzf '{name}'", f"rm '{name}'"]
+        return "set -e; " + "; ".join(steps) + "; find . -name llama-server -type f"
 
     def installed(self):
         return CFG.VLLM_OK.exists() and bool(self.llama_bin())
