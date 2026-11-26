@@ -118,6 +118,15 @@ EMBEDDER = dict(repo="Qwen/Qwen3-Embedding-0.6B-GGUF", revision="370f27d7550e0de
 CTX_CHOICES = {"128K": 131072, "262K (native)": 262144, "512K (YaRN)": 524288, "1M (YaRN, Qwen)": 1000000}
 
 
+def quant_of(preset):
+    """Quantization of a preset, from its declared value, its GGUF file name, or its repo name."""
+    if preset.get("quant"):
+        return preset["quant"]
+    text = f"{preset.get('file') or ''} {preset.get('repo') or ''}"
+    m = re.search(r"(I?Q\d(?:_[A-Z0-9]+)*|BF16|F16|FP8|W8A16|W4A16|NVFP4|MXFP4|AWQ|GPTQ)", text, re.I)
+    return m.group(1).upper() if m else ("BF16" if preset.get("quantization") == "fp8" else "")
+
+
 def thinking_kwargs(preset, level):
     """chat_template_kwargs for a thinking level. Unknown keys are ignored by the other family's template."""
     levels = preset["thinking"]

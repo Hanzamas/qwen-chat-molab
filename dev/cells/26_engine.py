@@ -488,6 +488,8 @@ class Engine(EngineView):
         stats = {"tokens": totals["tokens"], "tps": totals["tokens"] / totals["gen_s"] if totals["tokens"] and totals["gen_s"] else None,
                  "think_s": totals["think_s"] or None, "tools": totals["tools"] or None, "total_s": time.time() - t0,
                  "stopped": self.stop.is_set(), "model": self.servers.state.get("preset"), "ctx": self.servers.state.get("ctx"),
+                 "quant": quant_of(c["preset"]), "yarn": bool((self.servers.state.get("ctx") or 0) > c["preset"]["max_ctx"]),
+                 "seed": (c["settings"].get("sampling") or {}).get("seed"),
                  "sampling": self.prompt.sampling(c), "thinking": self.prompt.kwargs(c), "mtp": self.servers.state.get("mtp")}
         live["active"] = False
         self.emit("live", {})
@@ -1052,6 +1054,12 @@ class Engine(EngineView):
     def _continue_inner(self, chat_id, mid):
         c = self.prompt.ctx(chat_id)
         m = self.store.msg(mid)
+        if self.store.children(chat_id, mid):
+            # Later turns hang on this reply: writing into it would change their history. Continue a copy instead,
+            # as a new branch; the old branch keeps its turns.
+            mid = self.store.add_message(chat_id, m["parent_id"], "assistant", m["content"], m["reasoning"],
+                                         meta={**m["meta"], "continued_from": mid}, status=m["status"])
+            m = self.store.msg(mid)
         self.store.set_head(chat_id, mid)
         live = {"active": True, "content": m["content"], "reasoning": "", "tools": [], "phase": "Melanjutkan…", "chat_id": chat_id}
         self.emit("live", live)

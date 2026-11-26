@@ -909,3 +909,51 @@ def test_relationships_and_card_proposals(engine, nb, fake):
     assert engine.decide_proposal(chat, pids[0], True)
     lotte = nb["STORIES"].cards_of(S.chat(chat)["story_id"], latest=True)["character"][0]
     assert lotte["data"]["relations"][0][0] == "Raka"
+
+
+def test_delete_chat_removes_tahap8_rows(engine, nb):
+    chat, _ = _story(nb, engine)
+    S = nb["STORE"]
+    engine.send(chat, "Halo.")
+    wait_idle(engine)
+    head = S.chat(chat)["head_id"]
+    nb["KNOW"].add(chat, head, ["Lotte Braun"], "Sesuatu")
+    tid = nb["THREADS"].open(chat, head, "utang", "Utang")
+    nb["THREADS"].close(chat, head, tid, "selesai")
+    nb["RELATIONS"].change(chat, head, "Lotte Braun", "player", 5, "baik")
+    nb["STORIES"].canon_set(S.chat(chat)["story_id"], "Bagian", "isi", chat, message_id=head)
+    S.delete_chat(chat)
+    for table in ("knowledge", "threads", "relations_log", "canon_log", "card_proposals"):
+        assert not S.q(f"SELECT 1 AS x FROM {table} WHERE chat_id = ?", (chat,)), table
+    assert not S.q("SELECT 1 AS x FROM thread_events WHERE thread_id = ?", (tid,))
+
+
+def test_continue_on_an_older_turn_branches(engine, nb, fake):
+    chat = engine.new_chat("chat", "lanjut lama")
+    S = nb["STORE"]
+    fake["script"].append({"content": "Jawaban pertama."})
+    engine.send(chat, "Satu")
+    wait_idle(engine)
+    first = S.chat(chat)["head_id"]
+    engine.send(chat, "Dua")
+    wait_idle(engine)
+    later = S.chat(chat)["head_id"]
+    fake["script"].append({"content": "lalu tambahan."})
+    engine.continue_msg(chat, first)
+    wait_idle(engine)
+    assert S.msg(first)["content"] == "Jawaban pertama."  # the old branch is untouched
+    head = S.chat(chat)["head_id"]
+    assert head != first and S.msg(head)["content"].startswith("Jawaban pertama.") and "tambahan" in S.msg(head)["content"]
+    assert later in S.path_ids(chat, later)
+
+
+def test_message_metadata_and_quant(nb, engine):
+    q = nb["quant_of"]
+    P = nb["PRESETS"]
+    assert q(P["Dark-Gemistry 31B FP8 (W8A16) · vLLM"]) in ("W8A16", "FP8")
+    assert q(next(p for n, p in P.items() if "Q8_0" in n)) == "Q8_0"
+    chat = engine.new_chat("chat", "meta")
+    engine.send(chat, "Halo")
+    wait_idle(engine)
+    stats = nb["STORE"].msg(nb["STORE"].chat(chat)["head_id"])["meta"]["stats"]
+    assert "quant" in stats and "yarn" in stats and "seed" in stats

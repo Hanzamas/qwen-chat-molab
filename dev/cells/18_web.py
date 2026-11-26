@@ -55,6 +55,13 @@ class WebTools:
         self.engine_name = ""
         self.last_used = 0.0
         self.camoufox_failed = (0.0, "")  # (when, error): Chromium is used for a while after Camoufox fails
+        self.dead = False
+
+    def shutdown(self):
+        """A newer WebTools took over (the cell ran again): close the browser and end the worker."""
+        self.dead = True
+        if self.thread is not None and self.thread.is_alive():
+            self.jobs.put((lambda: None, (), {}, threading.Event()))  # wake the worker so it sees `dead`
 
     # ---------- browser worker ----------
 
@@ -77,6 +84,9 @@ class WebTools:
     def _loop(self):
         me = threading.current_thread()
         while True:
+            if self.dead:
+                self._close()
+                return
             try:
                 fn, args, box, done = self.jobs.get(timeout=300)
             except _queue.Empty:
@@ -261,4 +271,8 @@ class WebTools:
                            "text": text[:limit], "truncated": len(text) > limit}, ensure_ascii=False)
 
 
+_reg = sys.modules.setdefault("_qchat_runtime", SimpleNamespace(engines=[]))
+if getattr(_reg, "web", None) is not None:
+    _reg.web.shutdown()
 WEB = WebTools()
+_reg.web = WEB

@@ -95,7 +95,7 @@ def _():
 
 
 @app.cell(hide_code=True)
-def _(Path, SimpleNamespace, json, os, secrets):
+def _(Path, SimpleNamespace, json, os, re, secrets):
     _work = Path(os.environ.get("QCHAT_WORK", "/tmp/qwen-chat"))
     _work.mkdir(parents=True, exist_ok=True)
     _key_file = _work / "api_key"
@@ -216,6 +216,15 @@ def _(Path, SimpleNamespace, json, os, secrets):
     CTX_CHOICES = {"128K": 131072, "262K (native)": 262144, "512K (YaRN)": 524288, "1M (YaRN, Qwen)": 1000000}
 
 
+    def quant_of(preset):
+        """Quantization of a preset, from its declared value, its GGUF file name, or its repo name."""
+        if preset.get("quant"):
+            return preset["quant"]
+        text = f"{preset.get('file') or ''} {preset.get('repo') or ''}"
+        m = re.search(r"(I?Q\d(?:_[A-Z0-9]+)*|BF16|F16|FP8|W8A16|W4A16|NVFP4|MXFP4|AWQ|GPTQ)", text, re.I)
+        return m.group(1).upper() if m else ("BF16" if preset.get("quantization") == "fp8" else "")
+
+
     def thinking_kwargs(preset, level):
         """chat_template_kwargs for a thinking level. Unknown keys are ignored by the other family's template."""
         levels = preset["thinking"]
@@ -233,7 +242,7 @@ def _(Path, SimpleNamespace, json, os, secrets):
             return {"enable_thinking": False, "preserve_thinking": True}
         return {"enable_thinking": True, "reasoning_effort": level, "preserve_thinking": True}
 
-    return CFG, CTX_CHOICES, EMBEDDER, PRESETS, thinking_kwargs
+    return CFG, CTX_CHOICES, EMBEDDER, PRESETS, quant_of, thinking_kwargs
 
 
 @app.cell(hide_code=True)
@@ -1400,10 +1409,11 @@ def _(CFG, Path, json, os, sqlite3, threading, time):
             return c
 
         def chat_settings(self, chat_id, **updates):
-            c = self.chat(chat_id)
-            s = {**(c["settings"] if c else {}), **updates}
-            self.x("UPDATE chats SET settings = ?, updated = ? WHERE id = ?", (json.dumps(s), time.time(), chat_id))
-            return s
+            with self.lock:  # two threads updating different keys must not drop each other's change
+                c = self.chat(chat_id)
+                s = {**(c["settings"] if c else {}), **updates}
+                self.x("UPDATE chats SET settings = ?, updated = ? WHERE id = ?", (json.dumps(s), time.time(), chat_id))
+                return s
 
         def chats(self):
             return self.q("SELECT id, title, kind, story_id, updated FROM chats ORDER BY updated DESC")
@@ -1422,6 +1432,12 @@ def _(CFG, Path, json, os, sqlite3, threading, time):
                               "dice_log", "pending_changes", "memory_log", "side_log"):
                     self.conn.execute(f"DELETE FROM {table} WHERE chat_id = ?", (chat_id,))
                 self.conn.execute("DELETE FROM memories WHERE chat_id = ? AND (scope = 'chat' OR kind = 'summary_core')", (chat_id,))
+                # Tahap 8 tables: what the characters know, threads, relationships, story book changes, card proposals
+                for (kid,) in self.conn.execute("SELECT id FROM knowledge WHERE chat_id = ?", (chat_id,)).fetchall():
+                    self.conn.execute("DELETE FROM vectors WHERE kind = 'know' AND ref_id = ?", (kid,))
+                self.conn.execute("DELETE FROM thread_events WHERE thread_id IN (SELECT id FROM threads WHERE chat_id = ?)", (chat_id,))
+                for table in ("knowledge", "threads", "thread_events", "relations_log", "canon_log", "card_proposals"):
+                    self.conn.execute(f"DELETE FROM {table} WHERE chat_id = ?", (chat_id,))
                 self.conn.execute("DELETE FROM chats WHERE id = ?", (chat_id,))
                 self.conn.commit()
                 self._changed()
@@ -2331,6 +2347,10 @@ def _(DEFAULT_CARDS, DEFAULT_SCHEMAS, STORE, TXT, base64, json, re, time):
 
         def save(self, card_id, type_, data, name=None, avatar=None):
             """Create or update a card. Every change of data makes a new version. Returns the card id."""
+            with self.store.lock:  # read version, write version + 1: one writer at a time (UI and Studio tools)
+                return self._save(card_id, type_, data, name, avatar)
+
+        def _save(self, card_id, type_, data, name=None, avatar=None):
             data = self.normalize(type_, dict(data or {}))
             name = (name or data.get("name") or data.get("title") or "Tanpa nama").strip()
             now = time.time()
@@ -2359,9 +2379,10 @@ def _(DEFAULT_CARDS, DEFAULT_SCHEMAS, STORE, TXT, base64, json, re, time):
             return card_id
 
         def set_field(self, card_id, key, value):
-            c = self.get(card_id)
-            data = {**c["data"], key: value}
-            return self.save(card_id, c["type"], data, name=c["name"] if key not in ("name", "title") else None)
+            with self.store.lock:
+                c = self.get(card_id)
+                data = {**c["data"], key: value}
+                return self.save(card_id, c["type"], data, name=c["name"] if key not in ("name", "title") else None)
 
         def delete(self, card_id):
             # SQLite reuses the highest id after a delete, so everything that points at this card goes with it.
@@ -3735,7 +3756,18 @@ def _(
 
 
 @app.cell(hide_code=True)
-def _(Sys, json, os, random, re, threading, time, urllib):
+def _(
+    SimpleNamespace,
+    Sys,
+    json,
+    os,
+    random,
+    re,
+    sys,
+    threading,
+    time,
+    urllib,
+):
     import asyncio as _asyncio
     import queue as _queue
 
@@ -3793,6 +3825,13 @@ def _(Sys, json, os, random, re, threading, time, urllib):
             self.engine_name = ""
             self.last_used = 0.0
             self.camoufox_failed = (0.0, "")  # (when, error): Chromium is used for a while after Camoufox fails
+            self.dead = False
+
+        def shutdown(self):
+            """A newer WebTools took over (the cell ran again): close the browser and end the worker."""
+            self.dead = True
+            if self.thread is not None and self.thread.is_alive():
+                self.jobs.put((lambda: None, (), {}, threading.Event()))  # wake the worker so it sees `dead`
 
         # ---------- browser worker ----------
 
@@ -3815,6 +3854,9 @@ def _(Sys, json, os, random, re, threading, time, urllib):
         def _loop(self):
             me = threading.current_thread()
             while True:
+                if self.dead:
+                    self._close()
+                    return
                 try:
                     fn, args, box, done = self.jobs.get(timeout=300)
                 except _queue.Empty:
@@ -3999,7 +4041,11 @@ def _(Sys, json, os, random, re, threading, time, urllib):
                                "text": text[:limit], "truncated": len(text) > limit}, ensure_ascii=False)
 
 
+    _reg = sys.modules.setdefault("_qchat_runtime", SimpleNamespace(engines=[]))
+    if getattr(_reg, "web", None) is not None:
+        _reg.web.shutdown()
     WEB = WebTools()
+    _reg.web = WEB
     return (WEB,)
 
 
@@ -5800,6 +5846,7 @@ def _(
     World,
     json,
     os,
+    quant_of,
     random,
     re,
     sys,
@@ -6298,6 +6345,8 @@ def _(
             stats = {"tokens": totals["tokens"], "tps": totals["tokens"] / totals["gen_s"] if totals["tokens"] and totals["gen_s"] else None,
                      "think_s": totals["think_s"] or None, "tools": totals["tools"] or None, "total_s": time.time() - t0,
                      "stopped": self.stop.is_set(), "model": self.servers.state.get("preset"), "ctx": self.servers.state.get("ctx"),
+                     "quant": quant_of(c["preset"]), "yarn": bool((self.servers.state.get("ctx") or 0) > c["preset"]["max_ctx"]),
+                     "seed": (c["settings"].get("sampling") or {}).get("seed"),
                      "sampling": self.prompt.sampling(c), "thinking": self.prompt.kwargs(c), "mtp": self.servers.state.get("mtp")}
             live["active"] = False
             self.emit("live", {})
@@ -6862,6 +6911,12 @@ def _(
         def _continue_inner(self, chat_id, mid):
             c = self.prompt.ctx(chat_id)
             m = self.store.msg(mid)
+            if self.store.children(chat_id, mid):
+                # Later turns hang on this reply: writing into it would change their history. Continue a copy instead,
+                # as a new branch; the old branch keeps its turns.
+                mid = self.store.add_message(chat_id, m["parent_id"], "assistant", m["content"], m["reasoning"],
+                                             meta={**m["meta"], "continued_from": mid}, status=m["status"])
+                m = self.store.msg(mid)
             self.store.set_head(chat_id, mid)
             live = {"active": True, "content": m["content"], "reasoning": "", "tools": [], "phase": "Melanjutkan…", "chat_id": chat_id}
             self.emit("live", live)

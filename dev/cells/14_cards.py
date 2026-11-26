@@ -218,6 +218,10 @@ class Cards:
 
     def save(self, card_id, type_, data, name=None, avatar=None):
         """Create or update a card. Every change of data makes a new version. Returns the card id."""
+        with self.store.lock:  # read version, write version + 1: one writer at a time (UI and Studio tools)
+            return self._save(card_id, type_, data, name, avatar)
+
+    def _save(self, card_id, type_, data, name=None, avatar=None):
         data = self.normalize(type_, dict(data or {}))
         name = (name or data.get("name") or data.get("title") or "Tanpa nama").strip()
         now = time.time()
@@ -246,9 +250,10 @@ class Cards:
         return card_id
 
     def set_field(self, card_id, key, value):
-        c = self.get(card_id)
-        data = {**c["data"], key: value}
-        return self.save(card_id, c["type"], data, name=c["name"] if key not in ("name", "title") else None)
+        with self.store.lock:
+            c = self.get(card_id)
+            data = {**c["data"], key: value}
+            return self.save(card_id, c["type"], data, name=c["name"] if key not in ("name", "title") else None)
 
     def delete(self, card_id):
         # SQLite reuses the highest id after a delete, so everything that points at this card goes with it.

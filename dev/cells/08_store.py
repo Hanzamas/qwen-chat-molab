@@ -450,10 +450,11 @@ class Store:
         return c
 
     def chat_settings(self, chat_id, **updates):
-        c = self.chat(chat_id)
-        s = {**(c["settings"] if c else {}), **updates}
-        self.x("UPDATE chats SET settings = ?, updated = ? WHERE id = ?", (json.dumps(s), time.time(), chat_id))
-        return s
+        with self.lock:  # two threads updating different keys must not drop each other's change
+            c = self.chat(chat_id)
+            s = {**(c["settings"] if c else {}), **updates}
+            self.x("UPDATE chats SET settings = ?, updated = ? WHERE id = ?", (json.dumps(s), time.time(), chat_id))
+            return s
 
     def chats(self):
         return self.q("SELECT id, title, kind, story_id, updated FROM chats ORDER BY updated DESC")
@@ -472,6 +473,12 @@ class Store:
                           "dice_log", "pending_changes", "memory_log", "side_log"):
                 self.conn.execute(f"DELETE FROM {table} WHERE chat_id = ?", (chat_id,))
             self.conn.execute("DELETE FROM memories WHERE chat_id = ? AND (scope = 'chat' OR kind = 'summary_core')", (chat_id,))
+            # Tahap 8 tables: what the characters know, threads, relationships, story book changes, card proposals
+            for (kid,) in self.conn.execute("SELECT id FROM knowledge WHERE chat_id = ?", (chat_id,)).fetchall():
+                self.conn.execute("DELETE FROM vectors WHERE kind = 'know' AND ref_id = ?", (kid,))
+            self.conn.execute("DELETE FROM thread_events WHERE thread_id IN (SELECT id FROM threads WHERE chat_id = ?)", (chat_id,))
+            for table in ("knowledge", "threads", "thread_events", "relations_log", "canon_log", "card_proposals"):
+                self.conn.execute(f"DELETE FROM {table} WHERE chat_id = ?", (chat_id,))
             self.conn.execute("DELETE FROM chats WHERE id = ?", (chat_id,))
             self.conn.commit()
             self._changed()
