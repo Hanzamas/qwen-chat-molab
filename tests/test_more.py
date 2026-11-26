@@ -184,3 +184,14 @@ def test_llama_install_skips_github_api_and_checks_sha(nb):
     assert "api.github.com" not in cmd
     for name, sha in nb["CFG"].LLAMA_ASSETS.items():
         assert f"releases/download/{nb['CFG'].LLAMA_TAG}/{name}" in cmd and f"echo '{sha}  {name}' | sha256sum -c -" in cmd
+
+
+def test_tool_rounds_have_no_cap(engine, nb, fake):
+    chat, _ = _story(nb, engine)
+    call = {"tool_calls": [{"name": "fact_lookup", "arguments": json.dumps({"query": "x"})}]}
+    fake["script"] += [call] * 15 + [{"content": "Selesai setelah lima belas tool."}]
+    engine.send(chat, "Cari terus.")
+    wait_idle(engine, 60)
+    last = engine.display(chat)["items"][-1]
+    assert last["content"].startswith("Selesai") and not last.get("error"), last
+    assert len(last["tools"]) >= 15

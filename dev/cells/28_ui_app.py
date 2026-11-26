@@ -317,6 +317,7 @@ function render({ model, el }) {
         <div class="qr-live-tools"></div><div class="qr-md"></div><div class="qr-phase qr-muted"></div>
         <div class="qr-typing"><span></span><span></span><span></span></div></div>`;
       liveParts = { think: liveBox.querySelector(".qr-think"), sum: liveBox.querySelector(".qr-think summary span"),
+        count: liveBox.querySelector(".qr-think summary .qr-muted"),
         box: liveBox.querySelector(".qr-think-box"), body: liveBox.querySelector(".qr-think-body"),
         follow: liveBox.querySelector(".qr-think-follow"), tools: liveBox.querySelector(".qr-live-tools"),
         md: liveBox.querySelector(".qr-live-row > .qr-md"), phase: liveBox.querySelector(".qr-phase"), typing: liveBox.querySelector(".qr-typing") };
@@ -330,7 +331,8 @@ function render({ model, el }) {
     const p = liveParts;
     if (lv.reasoning) {
       p.think.hidden = false;
-      p.sum.textContent = lv.content ? "Berpikir selesai" : "Sedang berpikir";
+      p.sum.textContent = lv.thinking ? "Sedang berpikir" : "Berpikir selesai";
+      p.count.textContent = `${fmtN(words(lv.reasoning))} kata`;
       p.body.textContent = lv.reasoning;
       if (thinkFollow) p.box.scrollTop = p.box.scrollHeight;
     }

@@ -38,8 +38,6 @@ tahu tulis "tidak tahu". Jawab HANYA JSON: {{"answers": ["...", "..."]}}
 
 
 class Engine(EngineView):
-    MAX_TOOL_ROUNDS = 12
-
     def __init__(self, emit=None):
         self.store, self.prompt, self.llm, self.tools = STORE, PROMPT, LLM_CLIENT, TOOLS
         self.compactor = Compactor(STORE, PROMPT, LLM_CLIENT, MEM)
@@ -268,7 +266,8 @@ class Engine(EngineView):
             raise RuntimeError("Server model belum READY. Klik Start dan tunggu status READY.")
         c = self.prompt.ctx(chat_id)
         tools = self.tools.specs(c)
-        live = {"active": True, "content": "", "reasoning": "", "tools": [], "phase": "", "chat_id": chat_id}
+        live = {"active": True, "content": "", "reasoning": "", "tools": [], "phase": "", "chat_id": chat_id,
+                "thinking": False}
         self.emit("live", live)
 
         def phase(msg):
@@ -291,7 +290,16 @@ class Engine(EngineView):
             extra.append("Hindari frasa yang sudah berulang ini: " + "; ".join(f'"{p}"' for p in avoid[:8]))
         error = None
         try:
-            for _round in range(self.MAX_TOOL_ROUNDS):
+            _round = -1
+            while True:
+                _round += 1
+                if _round:
+                    # Many rounds of tool results can fill the context: compact older history between rounds too.
+                    used = self.compactor.maybe(chat_id, tools, self.tools, phase,
+                                                last_used=self.last_used.get(chat_id, 0))
+                    if used:
+                        self.last_used[chat_id] = used
+                    phase("")
                 path = self.store.path(chat_id)
                 msgs, used_round = self.prompt.build(chat_id, path, extra=extra if _round == 0 else None)
                 if _round == 0:
@@ -306,6 +314,7 @@ class Engine(EngineView):
                 def on_delta(acc, base_c=base_c, base_r=base_r, state=state):
                     live["content"] = base_c + ("\n\n" if base_c and acc["content"] else "") + acc["content"]
                     live["reasoning"] = base_r + ("\n\n" if base_r and acc["reasoning"] else "") + acc["reasoning"]
+                    live["thinking"] = bool(acc["reasoning"]) and not acc["content"] and not acc["calls"]
                     self.emit("live", live)
                     now = time.time()
                     if now - state["saved"] > 3:
@@ -320,6 +329,7 @@ class Engine(EngineView):
                 acc = self.llm.chat(msgs, tools=tools, kwargs=self.prompt.kwargs(c), sampling=self.prompt.sampling(c),
                                     max_tokens=c["settings"].get("max_tokens") or self._default_max_tokens(c),
                                     on_delta=on_delta, stop=self.stop)
+                live["thinking"] = False
                 usage = acc["usage"] or usage
                 if acc["usage"]:
                     self.last_used[chat_id] = acc["usage"].get("total_tokens") or self.last_used.get(chat_id, 0)
@@ -362,8 +372,6 @@ class Engine(EngineView):
                         self.last_used[chat_id] += len(res) // 3 + 1500 * len(media)
                 if self.stop.is_set():
                     break
-            else:
-                error = f"Berhenti setelah {self.MAX_TOOL_ROUNDS} putaran tool."
         except urllib.error.HTTPError as e:
             error = f"Server menolak request (HTTP {e.code}): {e.read().decode('utf-8', 'replace')[:400]}"
         except Exception as e:
