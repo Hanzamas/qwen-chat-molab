@@ -235,7 +235,7 @@ class Compactor:
     def entity_check(self, chat_id, msgs, summary):
         """Capitalized names that recur in the chunk but appear neither in the summary nor in the story book."""
         c = self.prompt.ctx(chat_id)
-        canon = self.prompt.stories.canon_text(c["story"]["id"], visible=self.store.visible_ids(chat_id)) if c["story"] else ""
+        canon = self.prompt.stories.canon_text(c["story"]["id"], visible=self.store.visible_ids(chat_id), chat_id=chat_id) if c["story"] else ""
         have = (summary + "\n" + canon).lower()
         counts = {}
         for m in msgs:

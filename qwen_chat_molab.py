@@ -1140,6 +1140,7 @@ def _(CFG, Path, json, os, sqlite3, threading, time):
         ("memories", "importance", "REAL NOT NULL DEFAULT 0.5"),
         ("memory_log", "message_id", "INTEGER"),
         ("lore_entries", "known_to", "TEXT NOT NULL DEFAULT ''"),  # empty: common knowledge; else who knows this lore
+        ("pending_changes", "message_id", "INTEGER"),  # a change made by a turn waits only on that turn's branch
     ]
     _SCHEMA_V2 = """
     CREATE TABLE IF NOT EXISTS canon_log (
@@ -1428,10 +1429,28 @@ def _(CFG, Path, json, os, sqlite3, threading, time):
 
         # ---------- chats ----------
 
+        def _next_id(self, table):
+            """Next id for a table that must never reuse an id (SQLite reuses the highest one after a delete).
+            The high-water mark lives in meta; call with the lock held."""
+            key = f"hwm_{table}"
+            r = self.conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+            hwm = int(json.loads(r[0])) if r else 0
+            top = self.conn.execute(f"SELECT MAX(id) FROM {table}").fetchone()[0] or 0
+            nid = max(hwm, top) + 1
+            self.conn.execute("INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                              (key, json.dumps(nid)))
+            return nid
+
         def new_chat(self, title, kind="chat", story_id=None, settings=None, system=""):
             now = time.time()
-            return self.x("INSERT INTO chats (title, kind, story_id, settings, system, created, updated) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                          (title, kind, story_id, json.dumps(settings or {}), system, now, now))
+            with self.lock:
+                cid = self._next_id("chats")
+                self.conn.execute("INSERT INTO chats (id, title, kind, story_id, settings, system, created, updated) "
+                                  "VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (cid, title, kind, story_id, json.dumps(settings or {}),
+                                                                      system, now, now))
+                self.conn.commit()
+                self._changed()
+                return cid
 
         def chat(self, chat_id):
             c = self.one("SELECT * FROM chats WHERE id = ?", (chat_id,))
@@ -1452,6 +1471,7 @@ def _(CFG, Path, json, os, sqlite3, threading, time):
         def delete_chat(self, chat_id):
             with self.lock:
                 ids = [r["id"] for r in self.q("SELECT id FROM messages WHERE chat_id = ?", (chat_id,))]
+                self.purge_messages(ids)
                 for i in range(0, len(ids), 500):
                     part = ids[i:i + 500]
                     marks = ",".join("?" * len(part))
@@ -1466,6 +1486,8 @@ def _(CFG, Path, json, os, sqlite3, threading, time):
                 # Tahap 8 tables: what the characters know, threads, relationships, story book changes, card proposals
                 for (kid,) in self.conn.execute("SELECT id FROM knowledge WHERE chat_id = ?", (chat_id,)).fetchall():
                     self.conn.execute("DELETE FROM vectors WHERE kind = 'know' AND ref_id = ?", (kid,))
+                for (cid_,) in self.conn.execute("SELECT id FROM canon_log WHERE chat_id = ?", (chat_id,)).fetchall():
+                    self.conn.execute("DELETE FROM vectors WHERE kind = 'canon' AND ref_id = ?", (cid_,))
                 self.conn.execute("DELETE FROM thread_events WHERE thread_id IN (SELECT id FROM threads WHERE chat_id = ?)", (chat_id,))
                 for table in ("knowledge", "threads", "thread_events", "relations_log", "canon_log", "card_proposals"):
                     self.conn.execute(f"DELETE FROM {table} WHERE chat_id = ?", (chat_id,))
@@ -1478,13 +1500,13 @@ def _(CFG, Path, json, os, sqlite3, threading, time):
         def add_message(self, chat_id, parent_id, role, content="", reasoning="", tool_calls=None, tool_call_id=None,
                         meta=None, ooc=False, status="final", media=None, set_head=True):
             with self.lock:
-                cur = self.conn.execute(
-                    "INSERT INTO messages (chat_id, parent_id, role, content, reasoning, tool_calls, tool_call_id, ooc, status, meta, created) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (chat_id, parent_id, role, content or "", reasoning or "",
+                mid = self._next_id("messages")
+                self.conn.execute(
+                    "INSERT INTO messages (id, chat_id, parent_id, role, content, reasoning, tool_calls, tool_call_id, ooc, status, "
+                    "meta, created) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (mid, chat_id, parent_id, role, content or "", reasoning or "",
                      json.dumps(tool_calls) if tool_calls else None, tool_call_id, int(bool(ooc)), status,
                      json.dumps(meta or {}), time.time()))
-                mid = cur.lastrowid
                 for a in media or []:
                     self.conn.execute("INSERT INTO attachments (message_id, kind, mime, name, data) VALUES (?, ?, ?, ?, ?)",
                                       (mid, a["kind"], a["mime"], a["name"], a["data"]))
@@ -1530,24 +1552,58 @@ def _(CFG, Path, json, os, sqlite3, threading, time):
                 cur = parents[cur]
             return out[::-1]
 
+        def purge_messages(self, ids):
+            """Everything a turn left behind, for messages that are being deleted (call with the lock held, before the
+            messages themselves go). Memory logs stay: an update whose message is gone simply never applies again."""
+            ids = list(ids)
+            for i in range(0, len(ids), 500):
+                part = ids[i:i + 500]
+                marks = ",".join("?" * len(part))
+                for kind, table in (("know", "knowledge"), ("canon", "canon_log"), ("mem", "memories")):
+                    extra = " AND scope IN ('story', 'chat')" if table == "memories" else ""
+                    for (rid,) in self.conn.execute(f"SELECT id FROM {table} WHERE message_id IN ({marks}){extra}", part).fetchall():
+                        self.conn.execute("DELETE FROM vectors WHERE kind = ? AND ref_id = ?", (kind, rid))
+                    self.conn.execute(f"DELETE FROM {table} WHERE message_id IN ({marks}){extra}", part)
+                self.conn.execute(f"UPDATE knowledge SET forgotten_at = NULL WHERE forgotten_at IN ({marks})", part)
+                self.conn.execute(f"UPDATE memory_log SET undone = 1 WHERE action = 'hide' AND message_id IN ({marks})", part)
+                self.conn.execute(f"UPDATE memories SET forgotten_at = (SELECT MAX(message_id) FROM memory_log WHERE memory_id = "
+                                  f"memories.id AND action = 'hide' AND undone = 0) WHERE forgotten_at IN ({marks})", part)
+                self.conn.execute(f"DELETE FROM thread_events WHERE thread_id IN (SELECT id FROM threads WHERE message_id IN ({marks}))", part)
+                for table in ("threads", "thread_events", "relations_log", "pending_changes"):
+                    self.conn.execute(f"DELETE FROM {table} WHERE message_id IN ({marks})", part)
+                for (eid,) in self.conn.execute(f"SELECT id FROM world_events WHERE message_id IN ({marks})", part).fetchall():
+                    self.conn.execute("DELETE FROM vectors WHERE kind = 'event' AND ref_id = ?", (eid,))
+                for (sid,) in self.conn.execute(f"SELECT id FROM summaries WHERE node_id IN ({marks})", part).fetchall():
+                    self.conn.execute("DELETE FROM vectors WHERE kind = 'sum' AND ref_id = ?", (sid,))
+
+        def clone_effects(self, old_mid, new_mid):
+            """A copy of a reply (Continue on an older turn) carries what the original changed: time, status, dice,
+            events, what characters learned, threads, relationships, story book changes."""
+            with self.lock:
+                for table in ("status_events", "world_events", "dice_log", "knowledge", "relations_log", "canon_log", "threads",
+                              "thread_events", "memories", "memory_log"):
+                    cols = [c for c in self._columns(table) if c not in ("id", "message_id")]
+                    where = " AND action IN ('update', 'hide') AND undone = 0" if table == "memory_log" else ""
+                    self.conn.execute(f"INSERT INTO {table} ({', '.join(cols)}, message_id) SELECT {', '.join(cols)}, ? FROM {table} "
+                                      f"WHERE message_id = ?{where}", (new_mid, old_mid))
+                self.conn.commit()
+                self._changed()
+
         def lineage(self, chat_id):
-            """This chat and the chats it continues, oldest last."""
-            out, cur = [], chat_id
-            while cur and cur not in out and len(out) < 20:
-                out.append(cur)
-                cur = ((self.chat(cur) or {}).get("settings") or {}).get("continued_from")
-            return out
+            """The chats whose rows count for this one. A continued chat gets a copy of what was true when it was
+            continued (see Engine.continue_in_new_chat), so deleting the old chat never takes anything with it."""
+            return [chat_id] if chat_id else []
 
         def visible_ids(self, chat_id):
-            """Messages whose effects (memories, story book changes) count in this chat: its active path, plus the path of
-            the chat it continues up to the point it was continued (and so on). Other chats of the same story, and
-            branches that were rerolled away, are not included."""
-            out, cur, head, depth = set(), chat_id, None, 0
-            while cur and depth < 20:
-                out.update(self.path_ids(cur, head))
-                chat = self.chat(cur)
-                s = (chat or {}).get("settings") or {}
-                cur, head, depth = s.get("continued_from"), s.get("continued_head"), depth + 1
+            """Messages whose effects (memories, story book changes, what characters know) count in this chat: its active
+            path. Other chats of the same story and branches that were rerolled away are not included. Cached until the
+            next write, because one turn asks many times."""
+            key = (chat_id, self.rev)
+            cache = getattr(self, "_vis_cache", None)
+            if cache and cache[0] == key:
+                return cache[1]
+            out = set(self.path_ids(chat_id))
+            self._vis_cache = (key, out)
             return out
 
         def path(self, chat_id, head=None, ids=None):
@@ -2423,6 +2479,8 @@ def _(DEFAULT_CARDS, DEFAULT_SCHEMAS, STORE, TXT, base64, json, re, time):
                 for r in self.store.q(sql, (card_id,)):
                     self.store.x("DELETE FROM vectors WHERE kind = ? AND ref_id = ?", (kind, r["id"]))
             self.store.x("DELETE FROM facts WHERE world_card_id = ?", (card_id,))
+            self.store.x("DELETE FROM card_proposals WHERE card_id = ?", (card_id,))
+            self.store.x("DELETE FROM vectors WHERE kind = 'card' AND ref_id = ?", (card_id,))
             self.store.x("DELETE FROM memories WHERE scope = 'card' AND card_id = ?", (card_id,))
             for t in ("cards", "card_versions"):
                 self.store.x(f"DELETE FROM {t} WHERE {'id' if t == 'cards' else 'card_id'} = ?", (card_id,))
@@ -2755,10 +2813,13 @@ def _(CARDS, STORE, json, time):
 
         # ---------- canon and never-forget ----------
 
-        def canon_set(self, story_id, section, text, chat_id=None, message_id=None):
-            """message_id given (the model wrote it during a turn): logged on that branch. Without (edited in the UI):
-            changes the base every chat of the story starts from."""
-            if message_id:
+        def canon_set(self, story_id, section, text, chat_id=None, message_id=None, chat_wide=False):
+            """message_id given (the model wrote it during a turn): logged on that branch. chat_wide (edited in the UI
+            while a chat is open): logged for that whole chat. Neither: changes the base every chat of the story starts from."""
+            if chat_wide and chat_id:
+                self.store.x("INSERT INTO canon_log (story_id, chat_id, message_id, section, text, created) VALUES (?, ?, NULL, ?, ?, ?)",
+                             (story_id, chat_id, section, text.strip(), time.time()))
+            elif message_id:
                 self.store.x("INSERT INTO canon_log (story_id, chat_id, message_id, section, text, created) VALUES (?, ?, ?, ?, ?, ?)",
                              (story_id, chat_id, message_id, section, text.strip(), time.time()))
             else:
@@ -2768,28 +2829,31 @@ def _(CARDS, STORE, json, time):
                 else:
                     s["data"]["canon"].pop(section, None)
                 self._save_data(story_id, s["data"])
-            self.pending(story_id, chat_id, f"Buku cerita · {section}: {text.strip() or '(dihapus)'}")
+            self.pending(story_id, chat_id, f"Buku cerita · {section}: {text.strip() or '(dihapus)'}",
+                         message_id=message_id, chat_only=bool(chat_wide or message_id))
 
-        def canon(self, story_id, visible=None):
+        def canon(self, story_id, visible=None, chat_id=None):
             """Sections as they are on a branch: the base, then the logged changes whose message is visible."""
             s = self.get(story_id)
             if not s:
                 return {}
             out = dict(s["data"]["canon"])
-            if visible:
-                for r in self.store.q("SELECT message_id, section, text FROM canon_log WHERE story_id = ? ORDER BY id", (story_id,)):
-                    if r["message_id"] in visible:
+            if visible is not None:
+                for r in self.store.q("SELECT chat_id, message_id, section, text FROM canon_log WHERE story_id = ? ORDER BY id",
+                                      (story_id,)):
+                    # a turn's change counts on its branch; a manual edit (no message) counts in its whole chat
+                    if r["message_id"] in visible or (not r["message_id"] and chat_id and r["chat_id"] == chat_id):
                         if r["text"]:
                             out[r["section"]] = r["text"]
                         else:
                             out.pop(r["section"], None)
             return out
 
-        def canon_text(self, story_id, limit=48000, visible=None):
+        def canon_text(self, story_id, limit=48000, visible=None, chat_id=None):
             s = self.get(story_id)
             if not s:
                 return ""
-            parts = [f"### {k}\n{v}" for k, v in self.canon(story_id, visible).items()]
+            parts = [f"### {k}\n{v}" for k, v in self.canon(story_id, visible, chat_id).items()]
             nf = s["data"]["never_forget"]
             if nf:
                 parts.append("### Jangan pernah lupa\n" + "\n".join(f"- {x}" for x in nf))
@@ -2800,13 +2864,17 @@ def _(CARDS, STORE, json, time):
             s["data"]["never_forget"] = [x.strip() for x in items if x and x.strip()]
             self._save_data(story_id, s["data"])
 
-        def pending(self, story_id, chat_id, text):
-            self.store.x("INSERT INTO pending_changes (story_id, chat_id, text, created) VALUES (?, ?, ?, ?)",
-                         (story_id, chat_id, text[:2000], time.time()))
+        def pending(self, story_id, chat_id, text, message_id=None, chat_only=False):
+            """A change waiting for the next epoch. Story-wide (a card edited) unless chat_only: then it is this chat's,
+            and with message_id only on that turn's branch."""
+            self.store.x("INSERT INTO pending_changes (story_id, chat_id, text, created, message_id) VALUES (?, ?, ?, ?, ?)",
+                         (None if chat_only else story_id, chat_id, text[:2000], time.time(), message_id))
 
         def pending_list(self, story_id, chat_id):
-            return self.store.q("SELECT id, text FROM pending_changes WHERE (story_id = ? AND story_id IS NOT NULL) OR chat_id = ? "
-                                "ORDER BY id", (story_id, chat_id))
+            rows = self.store.q("SELECT id, text, message_id FROM pending_changes WHERE (story_id = ? AND story_id IS NOT NULL) "
+                                "OR chat_id = ? ORDER BY id", (story_id, chat_id))
+            vis = self.store.visible_ids(chat_id) if chat_id and any(r["message_id"] for r in rows) else set()
+            return [r for r in rows if not r["message_id"] or r["message_id"] in vis]
 
         def clear_pending(self, story_id, chat_id):
             self.store.x("DELETE FROM pending_changes WHERE (story_id = ? AND story_id IS NOT NULL) OR chat_id = ?",
@@ -3105,7 +3173,7 @@ def _(
         @staticmethod
         def _hour_in(spec, hour):
             """'8', '08-12', '22-06', '08:00-12:30' -> whether hour falls inside (end exclusive, wraps at midnight)."""
-            nums = [int(x) for x in re.findall(r"(\d{1,2})(?::\d{2})?", str(spec or ""))]
+            nums = [int(x) for x in re.findall(r"(\d{1,2})(?:[:.]\d{2})?", str(spec or ""))]
             if not nums:
                 return False
             a, b = (nums[0], nums[1]) if len(nums) > 1 else (nums[0], nums[0] + 1)
@@ -3119,6 +3187,8 @@ def _(
             for ch in (cards or {}).get("character", []):
                 rows = Cards.table_rows(ch["data"].get("schedule") or [], ["jam", "lokasi", "kegiatan"])
                 if not rows:
+                    continue
+                if str((st["status"].get(ch["name"]) or {}).get("keadaan") or "").lower() in ("ditahan", "pingsan", "mati", "pergi"):
                     continue
                 seen = (st.get("seen_at") or {}).get(ch["name"], {}).get("location")
                 if seen and (now - seen).total_seconds() < self.SCHEDULE_STALE_HOURS * 3600:
@@ -3297,10 +3367,17 @@ def _(
 
         def __init__(self, store, servers):
             self.store, self.servers = store, servers
-            self.queue = []
+            self.queue = []      # keys (kind, ref_id) waiting, oldest first
+            self.pending = {}    # key -> newest text; a key stays here while queued or being embedded
             self.qlock = threading.Lock()
-            self.cache = {}
+            self.cache = {}      # kind -> (ids, matrix)
+            self.qcache = {}     # (model, query) -> vector, a small LRU
             self.worker = None
+            self.working = False
+            self.gen = 0         # bumped when queued work no longer applies (Load, model change)
+            self.dim = None      # size of the vectors the running model returns
+            self._model = None
+            self.backfilling = False
             try:
                 import numpy
                 self.np = numpy
@@ -3308,20 +3385,47 @@ def _(
                 self.np = None
 
         def ready(self):
-            return self.np is not None and self.servers.embed_ready()
+            if self.np is None or not self.servers.embed_ready():
+                return False
+            model = self.servers.state.get("embed_model") or "0.6B"
+            if model != self._model:  # switched (Model tab, restart, Load): check the stored vectors once
+                self._model = model
+                self.dim = None
+                try:
+                    self.check_model()
+                except Exception:
+                    pass
+            return True
+
+        def reset(self):
+            """Drop queued work (after Load the ids belong to another database)."""
+            with self.qlock:
+                self.queue = []
+                self.pending = {}
+                self.gen += 1
+            self.cache.clear()
+            self.qcache.clear()
 
         def check_model(self):
-            """Vectors from another embedder model cannot be compared: rebuild them when the model changed."""
+            """Vectors from another embedder model cannot be compared: rebuild them when the model changed. A database
+            with no record of the model keeps only vectors of the running model's size."""
             model = self.servers.state.get("embed_model") or "0.6B"
             have = self.store.meta_get("embed_model")
             if have == model:
                 return
+            with self.qlock:
+                self.gen += 1  # a batch being embedded by the old model must not land
+                self.queue = list(self.pending)
             if have is not None:
                 self.store.x("DELETE FROM vectors")
-                with self.qlock:
-                    self.queue = []
-                    self.pending = {}
+            else:
+                try:
+                    self.embed(["dim"])
+                    self.store.x("DELETE FROM vectors WHERE dim != ?", (self.dim,))
+                except Exception:
+                    pass
             self.cache.clear()
+            self.qcache.clear()
             self.store.meta_set("embed_model", model)
 
         def embed(self, texts, query=False):
@@ -3334,65 +3438,101 @@ def _(
             vecs = [d["embedding"] for d in sorted(json.loads(text)["data"], key=lambda d: d["index"])]
             arr = self.np.asarray(vecs, dtype=self.np.float32)
             arr /= self.np.linalg.norm(arr, axis=1, keepdims=True) + 1e-9
+            self.dim = int(arr.shape[1])
             return arr
 
         def enqueue(self, kind, ref_id, text):
             if self.np is None or not (text or "").strip():
                 return
+            key = (kind, ref_id)
             with self.qlock:
-                pending = getattr(self, "pending", None)
-                if pending is None:
-                    pending = self.pending = {}
-                if (kind, ref_id) in pending:
-                    pending[(kind, ref_id)] = text  # already queued: embed the newest text once
-                    self.queue = [(k, r, text if (k, r) == (kind, ref_id) else t) for k, r, t in self.queue]
+                if key in self.pending:
+                    self.pending[key] = text  # already queued or being embedded: the newest text is embedded once
                     return
-                pending[(kind, ref_id)] = text
-                self.queue.append((kind, ref_id, text))
+                self.pending[key] = text
+                self.queue.append(key)
                 # The worker decides to stop under the same lock, so an item added now is never left behind.
-                if not getattr(self, "working", False):
+                if not self.working:
                     self.working = True
                     self.worker = threading.Thread(target=self._work, daemon=True)
                     self.worker.start()
 
+        def _settle(self, batch):
+            """After a batch, done or failed (call with qlock): keys whose text changed meanwhile go back in the queue;
+            the rest leave pending (a failed one is queued again by the next backfill)."""
+            for k, t in batch:
+                if k not in self.pending:
+                    continue
+                if self.pending[k] == t:
+                    self.pending.pop(k)
+                else:
+                    self.queue.append(k)
+
         def _work(self):
             while True:
                 with self.qlock:
-                    batch, self.queue = self.queue[:32], self.queue[32:]
-                    if not batch:
+                    keys, self.queue = self.queue[:32], self.queue[32:]
+                    if not keys:
                         self.working = False
                         return
+                    gen = self.gen
+                    batch = [(k, self.pending[k]) for k in keys if k in self.pending]
+                if not batch:
+                    continue
                 if not self.ready():
                     time.sleep(2)
                     with self.qlock:
-                        self.queue = batch + self.queue
-                    if not self.servers.state.get("embed"):
-                        with self.qlock:
+                        if gen == self.gen:
+                            self.queue = [k for k, _ in batch] + self.queue
+                        if not self.servers.state.get("embed"):
                             self.working = False
-                        return
+                            return
                     continue
                 try:
-                    arr = self.embed([t for _, _, t in batch])
-                    rows = [(k, r, arr.shape[1], arr[i].astype(self.np.float16).tobytes()) for i, (k, r, _) in enumerate(batch)]
-                    self.store.many("INSERT OR REPLACE INTO vectors (kind, ref_id, dim, v) VALUES (?, ?, ?, ?)", rows)
-                    with self.qlock:
-                        for k, r, t in batch:
-                            if self.pending.get((k, r)) == t:
-                                self.pending.pop((k, r), None)
-                    for k, _, _ in batch:
-                        self.cache.pop(k, None)
+                    arr = self.embed([t for _, t in batch])
                 except Exception:
+                    with self.qlock:
+                        self._settle(batch)
                     time.sleep(5)
+                    continue
+                with self.qlock:
+                    stale = gen != self.gen
+                    if stale:  # Load or a model change happened meanwhile: embed again what is still wanted
+                        self.queue += [k for k, _ in batch if k in self.pending]
+                if stale:
+                    continue
+                rows = [(k[0], k[1], arr.shape[1], arr[i].astype(self.np.float16).tobytes()) for i, (k, _) in enumerate(batch)]
+                self.store.many("INSERT OR REPLACE INTO vectors (kind, ref_id, dim, v) VALUES (?, ?, ?, ?)", rows)
+                with self.qlock:
+                    self._settle(batch)
+                for kind in {k[0] for k, _ in batch}:
+                    self.cache.pop(kind, None)
 
         def _matrix(self, kind):
-            if kind not in self.cache:
-                rows = self.store.q("SELECT ref_id, v FROM vectors WHERE kind = ?", (kind,))
+            hit = self.cache.get(kind)
+            if hit is None:
+                dim = self.dim or self.servers.embed_spec()["dim"]
+                rows = self.store.q("SELECT ref_id, v FROM vectors WHERE kind = ? AND dim = ?", (kind, dim))
                 if not rows:
-                    self.cache[kind] = ([], None)
+                    hit = ([], None)
                 else:
                     mat = self.np.stack([self.np.frombuffer(r["v"], dtype=self.np.float16) for r in rows]).astype(self.np.float32)
-                    self.cache[kind] = ([r["ref_id"] for r in rows], mat)
-            return self.cache[kind]
+                    hit = ([r["ref_id"] for r in rows], mat)
+                self.cache[kind] = hit
+            return hit
+
+        def _query_vec(self, query):
+            key = (self._model, query)
+            v = self.qcache.get(key)
+            if v is None:
+                v = self.embed([query], query=True)[0]
+                self.qcache[key] = v
+                while len(self.qcache) > 64:
+                    try:
+                        self.qcache.pop(next(iter(self.qcache)))
+                    except (StopIteration, KeyError, RuntimeError):
+                        break
+            return v
 
         def search(self, kind, query, limit=20, allowed=None):
             """[(ref_id, score)] by cosine similarity, restricted to `allowed` ids when given."""
@@ -3402,10 +3542,9 @@ def _(
             if mat is None:
                 return []
             try:
-                q = self.embed([query], query=True)[0]
-            except Exception:
+                scores = mat @ self._query_vec(query)
+            except Exception:  # embedder down, or a vector of another size
                 return []
-            scores = mat @ q
             order = self.np.argsort(-scores)
             out = []
             for i in order:
@@ -3416,7 +3555,16 @@ def _(
             return out
 
         def backfill(self):
-            """Queue everything that has no vector yet (after Load, or when the embedder starts)."""
+            """Queue everything that has no vector yet (after Load, or when the embedder starts). One at a time."""
+            if self.backfilling:
+                return
+            self.backfilling = True
+            try:
+                self._backfill()
+            finally:
+                self.backfilling = False
+
+        def _backfill(self):
             if self.ready():
                 self.check_model()
             have = {(r["kind"], r["ref_id"]) for r in self.store.q("SELECT kind, ref_id FROM vectors")}
@@ -3483,14 +3631,19 @@ def _(
         BRANCHED = ("story", "chat")  # user and card memories are about the real user / the character everywhere
 
         def _visible(self, row, ctx):
-            """A story/chat memory made by a message counts only where that message is on the path (or in the chat
-            it continues); a forget counts the same way. Memories made outside a chat count everywhere."""
+            """A story/chat memory made by a message counts only where that message is on the path; a forget made by a
+            turn hides it only on that turn's branch (several branches can each forget it). Memories made outside a chat
+            count everywhere."""
             if row.get("scope") not in self.BRANCHED or "visible" not in ctx:
                 return True
             vis = ctx["visible"]
             if row.get("message_id") and row["message_id"] not in vis:
                 return False
-            return not (row.get("forgotten_at") and row["forgotten_at"] in vis)
+            if not row.get("forgotten_at"):  # set while any branch has forgotten it
+                return True
+            hides = self.store.q("SELECT message_id FROM memory_log WHERE memory_id = ? AND action = 'hide' AND undone = 0",
+                                 (row["id"],))
+            return not any(h["message_id"] in vis for h in hides)
 
         def _resolve(self, rows, ctx):
             """Visible rows, with updates made on other branches undone."""
@@ -3502,13 +3655,22 @@ def _(
             logs = {}
             for i in range(0, len(ids), 500):
                 part = ids[i:i + 500]
-                for lg in self.store.q(f"SELECT memory_id, before, after, message_id FROM memory_log WHERE action = 'update' "
-                                       f"AND undone = 0 AND memory_id IN ({','.join('?' * len(part))}) ORDER BY id DESC", part):
+                for lg in self.store.q(f"SELECT memory_id, action, before, after, message_id FROM memory_log WHERE action IN "
+                                       f"('save', 'update') AND undone = 0 AND memory_id IN ({','.join('?' * len(part))}) ORDER BY id",
+                                       part):
                     logs.setdefault(lg["memory_id"], []).append(lg)
             for r in rows:
-                for lg in logs.get(r["id"], []):
-                    if lg["message_id"] and lg["message_id"] not in vis and lg["after"] == r["text"]:
-                        r["text"] = lg["before"]
+                # replay in order: the saved text, then each update this branch can see
+                seq = logs.get(r["id"], [])
+                if not any(lg["action"] == "update" for lg in seq):
+                    continue
+                text = next((lg["after"] for lg in seq if lg["action"] == "save"), None)
+                if text is None:
+                    text = next(lg["before"] for lg in seq if lg["action"] == "update")
+                for lg in seq:
+                    if lg["action"] == "update" and (not lg["message_id"] or lg["message_id"] in vis):
+                        text = lg["after"]
+                r["text"] = text
             return rows
 
         def _scope_sql(self, ctx):
@@ -3605,15 +3767,16 @@ def _(
                 self.store.x("UPDATE memories SET text = ?, updated = ? WHERE id = ?", (log["before"], time.time(), log["memory_id"]))
                 self.emb.enqueue("mem", log["memory_id"], log["before"])
             elif log["action"] == "hide":
-                self.store.x("UPDATE memories SET forgotten_at = NULL WHERE id = ?", (log["memory_id"],))
+                pass  # marking the log undone below is what brings it back on that branch
             elif log["action"] == "forget":
                 r = json.loads(log["before"])
-                cols = "scope, card_id, story_id, chat_id, kind, text, created, updated"
-                vals = (r["scope"], r["card_id"], r["story_id"], r["chat_id"], r["kind"], r["text"], r["created"], time.time())
+                cols = "scope, card_id, story_id, chat_id, kind, text, created, updated, message_id, importance"
+                vals = (r["scope"], r["card_id"], r["story_id"], r["chat_id"], r["kind"], r["text"], r["created"], time.time(),
+                        r.get("message_id"), r.get("importance", 0.5))
                 if cur is None:
-                    new_id = self.store.x(f"INSERT INTO memories (id, {cols}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", (r["id"],) + vals)
+                    new_id = self.store.x(f"INSERT INTO memories (id, {cols}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (r["id"],) + vals)
                 else:  # the old id is taken by a newer memory: bring it back under a new id
-                    new_id = self.store.x(f"INSERT INTO memories ({cols}) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", vals)
+                    new_id = self.store.x(f"INSERT INTO memories ({cols}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", vals)
                 self.emb.enqueue("mem", new_id, r["text"])
             self.store.x("UPDATE memory_log SET undone = 1 WHERE id = ?", (log_id,))
             return True
@@ -3787,8 +3950,9 @@ def _(
             hit = {}
             if q:
                 ids = {r["id"] for r in rows}
-                for rank, r in enumerate(self.store.q("SELECT rowid AS id FROM knowledge_fts WHERE knowledge_fts MATCH ? "
-                                                      "ORDER BY bm25(knowledge_fts) LIMIT 200", (q,))):
+                for rank, r in enumerate(self.store.q("SELECT k.id FROM knowledge_fts f JOIN knowledge k ON k.id = f.rowid "
+                                                      "WHERE knowledge_fts MATCH ? AND k.chat_id = ? AND k.holder = ? "
+                                                      "ORDER BY bm25(knowledge_fts) LIMIT 200", (q, chat_id, holder))):
                     if r["id"] in ids:
                         hit[r["id"]] = rank
             sim = {}
@@ -4433,7 +4597,7 @@ def _(
             if frozen:
                 parts.append("# Memory (dibekukan saat epoch ini dimulai)\n" + frozen)
             if c["story"]:
-                canon = self.stories.canon_text(c["story"]["id"], visible=self.store.visible_ids(chat_id))
+                canon = self.stories.canon_text(c["story"]["id"], visible=self.store.visible_ids(chat_id), chat_id=chat_id)
                 if canon:
                     parts.append("# Buku cerita\n" + canon)
             if last_node >= 0:
@@ -4982,7 +5146,7 @@ def _(TXT, re, threading, time):
         def entity_check(self, chat_id, msgs, summary):
             """Capitalized names that recur in the chunk but appear neither in the summary nor in the story book."""
             c = self.prompt.ctx(chat_id)
-            canon = self.prompt.stories.canon_text(c["story"]["id"], visible=self.store.visible_ids(chat_id)) if c["story"] else ""
+            canon = self.prompt.stories.canon_text(c["story"]["id"], visible=self.store.visible_ids(chat_id), chat_id=chat_id) if c["story"] else ""
             have = (summary + "\n" + canon).lower()
             counts = {}
             for m in msgs:
@@ -5446,7 +5610,7 @@ def _(
             out += [{"type": "ingatan", "holder": r["holder"], "text": KNOW.line(r)}
                     for r in self._rank(query, "know", KNOW._rows(chat_id), lambda r: r["text"])]
             if sid:
-                canon = self.stories.canon(sid, vis)
+                canon = self.stories.canon(sid, vis, chat_id)
                 logs = [r for r in self.store.q("SELECT id, message_id, section, text FROM canon_log WHERE story_id = ? AND text != ''",
                                                 (sid,)) if r["message_id"] in vis and canon.get(r["section"]) == r["text"]]
                 hit = {r["section"] for r in self._rank(query, "canon", logs, lambda r: f"{r['section']}: {r['text']}", 3)}
@@ -5996,6 +6160,7 @@ def _(
     LLM_CLIENT,
     MEM,
     PROMPT,
+    RELATIONS,
     SERVERS,
     STORE,
     STORIES,
@@ -6210,7 +6375,9 @@ def _(
                 self.continuity_jobs.clear()
                 self.last_used.clear()
                 self.active_chat = 0
-                EMB.cache.clear()
+                EMB.reset()
+                EMB._model = None      # the loaded database may have been embedded by another model
+                self.backfilled = False  # and its rows have no vectors yet: backfill on the next idle tick
             self.importing = False
 
         # ---------- chats and stories ----------
@@ -6273,6 +6440,7 @@ def _(
                                           meta={"carry_over": True})
             self.store.x("UPDATE summaries SET node_id = ?, from_id = ? WHERE chat_id = ? AND node_id = 0", (root, root, new))
             self.store.add_message(new, root, "assistant", intro, meta={"carry_over": True})
+            self._carry_state(chat_id, new, root, set(ids), old.get("story_id"))
             self.world.add_event(new, None, "world", "time", st["time"].strftime("%Y-%m-%d %H:%M"), "set", "lanjutan")
             for s in st["stats"]:
                 self.world.add_event(new, None, "player", s["key"], s["value"], "set", "lanjutan")
@@ -6281,6 +6449,51 @@ def _(
                     self.world.add_event(new, None, subject, k, v, "set", "lanjutan")
             self.emit("chats")
             return new
+
+        def _carry_state(self, old_id, new_id, root, vis, story_id):
+            """Copy the old chat's state onto the new chat's root message: story book changes, what the characters know,
+            open threads, relationships, memories made in that chat. The new chat then no longer depends on the old one
+            (deleting or rerolling it changes nothing here)."""
+            s, now = self.store, time.time()
+            story = self.stories.get(story_id) if story_id else None
+            if story:
+                base = story["data"]["canon"]
+                cur = self.stories.canon(story_id, vis, old_id)
+                for sec in set(base) | set(cur):
+                    if base.get(sec) != cur.get(sec):
+                        s.x("INSERT INTO canon_log (story_id, chat_id, message_id, section, text, created) VALUES (?, ?, ?, ?, ?, ?)",
+                            (story_id, new_id, root, sec, cur.get(sec, ""), now))
+            for r in KNOW._rows(old_id):
+                kid = s.x("INSERT INTO knowledge (chat_id, message_id, holder, text, kind, source, source_who, truth, importance, "
+                          "world_time, created) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                          (new_id, root, r["holder"], r["text"], r["kind"], r["source"], r["source_who"], r["truth"],
+                           r["importance"], r["world_time"], r["created"]))
+                EMB.enqueue("know", kid, r["text"])
+            for t in THREADS.list(old_id):
+                s.x("INSERT INTO threads (story_id, chat_id, message_id, kind, title, text, who, due, opened_at, created) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (t["story_id"], new_id, root, t["kind"], t["title"], t["text"], t["who"],
+                                                              t["due"], t["opened_at"], t["created"]))
+            for (a, b), v in RELATIONS.scores(old_id).items():
+                if v["score"]:
+                    s.x("INSERT INTO relations_log (chat_id, message_id, a, b, delta, reason, world_time, created) "
+                        "VALUES (?, ?, ?, ?, ?, ?, '', ?)", (new_id, root, a, b, v["score"], v["last"], now))
+            ctx = {"visible": vis, "chat_id": old_id, "story_id": story_id}
+            rows = s.q("SELECT * FROM memories WHERE kind != 'summary_core' AND ((scope = 'story' AND story_id = ?) "
+                       "OR (scope = 'chat' AND chat_id = ?))", (story_id or -1, old_id))
+            shown = {r["id"] for r in self.mem._resolve(rows, ctx)}
+            for r in self.mem._resolve(rows, ctx):
+                if r["scope"] == "story" and not r["message_id"]:
+                    continue  # made outside any turn: already counts in every chat of the story
+                mid = s.x("INSERT INTO memories (scope, card_id, story_id, chat_id, kind, text, created, updated, message_id, importance) "
+                          "VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)",
+                          (r["scope"], r["story_id"], new_id if r["scope"] == "chat" else None, r["kind"], r["text"], r["created"],
+                           now, root, r.get("importance", 0.5)))
+                self.mem.emb.enqueue("mem", mid, r["text"])
+            for r in rows:  # story memories the old chat forgot stay forgotten here
+                if r["scope"] == "story" and not r["message_id"] and r["id"] not in shown:
+                    s.x("INSERT INTO memory_log (memory_id, action, before, chat_id, created, message_id) VALUES (?, 'hide', ?, ?, ?, ?)",
+                        (r["id"], json.dumps(dict(r)), new_id, now, root))
+                    s.x("UPDATE memories SET forgotten_at = ? WHERE id = ? AND forgotten_at IS NULL", (root, r["id"]))
 
         # ---------- sending ----------
 
@@ -6846,7 +7059,7 @@ def _(
                     source, text = page.get("url", top["url"]), page.get("text", "")
                 else:
                     source = "lore dan buku cerita"
-                    text = self.stories.canon_text(c["story"]["id"], visible=self.store.visible_ids(chat_id)) if c["story"] else ""
+                    text = self.stories.canon_text(c["story"]["id"], visible=self.store.visible_ids(chat_id), chat_id=chat_id) if c["story"] else ""
                     text += "\n" + "\n".join(f"{e['title']}: {e['text']}" for e in self.mem.lore_triggered(c["mem"]["card_ids"], claim))
                 if not text.strip():
                     continue
@@ -6914,6 +7127,9 @@ def _(
         def decide_proposal(self, chat_id, pid, accept):
             p = self.store.one("SELECT * FROM card_proposals WHERE id = ? AND status = 'menunggu'", (int(pid),))
             if not p:
+                return False
+            if accept and not self.cards.get(p["card_id"]):
+                self.store.x("UPDATE card_proposals SET status = 'ditolak' WHERE id = ?", (p["id"],))
                 return False
             if accept:
                 self.cards.set_field(p["card_id"], p["field"], json.loads(p["value"]))
@@ -7125,8 +7341,14 @@ def _(
             if self.store.children(chat_id, mid):
                 # Later turns hang on this reply: writing into it would change their history. Continue a copy instead,
                 # as a new branch; the old branch keeps its turns.
+                old_mid = mid
                 mid = self.store.add_message(chat_id, m["parent_id"], "assistant", m["content"], m["reasoning"],
                                              meta={**m["meta"], "continued_from": mid}, status=m["status"])
+                self.store.clone_effects(old_mid, mid)
+                for r in self.store.q("SELECT id, text FROM memories WHERE message_id = ?", (mid,)):
+                    self.mem.emb.enqueue("mem", r["id"], r["text"])
+                for r in self.store.q("SELECT id, text FROM knowledge WHERE message_id = ?", (mid,)):
+                    EMB.enqueue("know", r["id"], r["text"])
                 m = self.store.msg(mid)
             self.store.set_head(chat_id, mid)
             live = {"active": True, "content": m["content"], "reasoning": "", "tools": [], "phase": "Melanjutkan…", "chat_id": chat_id}
@@ -7157,6 +7379,7 @@ def _(
                 sub.append(cur)
                 frontier += self.store.children(chat_id, cur)
             with self.store.lock:
+                self.store.purge_messages(sub)
                 for i in range(0, len(sub), 500):
                     part = sub[i:i + 500]
                     marks = ",".join("?" * len(part))
@@ -9276,7 +9499,7 @@ def _(
                 if c:
                     links.append({"id": c["id"], "role": l["role"], "name": c["name"], "version": l["version"],
                                   "latest": c["version"], "avatar": c["avatar"]})
-            return {"id": sid, "title": s["title"], "canon": STORIES.canon(sid, STORE.visible_ids(chat["id"])),
+            return {"id": sid, "title": s["title"], "canon": STORIES.canon(sid, STORE.visible_ids(chat["id"]), chat["id"]),
                     "never_forget": s["data"]["never_forget"],
                     "cards": links, "pending": [p["text"] for p in STORIES.pending_list(sid, chat["id"])]}
 
@@ -9690,7 +9913,7 @@ def _(
 
         def c_knowledge_add(self, holder, text, kind="fakta", truth="benar"):
             cid = self._cur()
-            KNOW.add(cid, STORE.chat(cid)["head_id"], [holder], text, kind, "lihat sendiri", "", truth)
+            KNOW.add(cid, None, [holder], text, kind, "lihat sendiri", "", truth)  # chat-wide: survives rerolls
             self.c_knowledge(holder)
 
         def c_knowledge_edit(self, kid, holder, text=None, truth=None):
@@ -9733,12 +9956,12 @@ def _(
         def c_thread_add(self, kind, title, due="", who=""):
             cid = self._cur()
             st = WORLD.state(cid, STORE.path_ids(cid))
-            THREADS.open(cid, STORE.chat(cid)["head_id"], kind, title, "", who, due, st["time_text"])
+            THREADS.open(cid, None, kind, title, "", who, due, st["time_text"])
             self.c_threads()
 
         def c_thread_close(self, tid, status):
             cid = self._cur()
-            THREADS.close(cid, STORE.chat(cid)["head_id"], int(tid), status)
+            THREADS.close(cid, None, int(tid), status)
             self.c_threads()
 
         # story
@@ -9746,8 +9969,7 @@ def _(
             sid = (self.w.story or {}).get("id")
             if sid:
                 # edited here: on this chat's branch (it is what this chat shows), not in the base of every chat
-                head = (STORE.chat(self._cur()) or {}).get("head_id")
-                STORIES.canon_set(sid, section, text, self._cur(), message_id=head)
+                STORIES.canon_set(sid, section, text, self._cur(), chat_wide=True)
                 self.w.story = self.story_info(STORE.chat(self._cur()))
 
         def c_never_forget(self, items):

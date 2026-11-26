@@ -150,6 +150,7 @@ _COLUMNS_V2 = [
     ("memories", "importance", "REAL NOT NULL DEFAULT 0.5"),
     ("memory_log", "message_id", "INTEGER"),
     ("lore_entries", "known_to", "TEXT NOT NULL DEFAULT ''"),  # empty: common knowledge; else who knows this lore
+    ("pending_changes", "message_id", "INTEGER"),  # a change made by a turn waits only on that turn's branch
 ]
 _SCHEMA_V2 = """
 CREATE TABLE IF NOT EXISTS canon_log (
@@ -438,10 +439,28 @@ class Store:
 
     # ---------- chats ----------
 
+    def _next_id(self, table):
+        """Next id for a table that must never reuse an id (SQLite reuses the highest one after a delete).
+        The high-water mark lives in meta; call with the lock held."""
+        key = f"hwm_{table}"
+        r = self.conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+        hwm = int(json.loads(r[0])) if r else 0
+        top = self.conn.execute(f"SELECT MAX(id) FROM {table}").fetchone()[0] or 0
+        nid = max(hwm, top) + 1
+        self.conn.execute("INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                          (key, json.dumps(nid)))
+        return nid
+
     def new_chat(self, title, kind="chat", story_id=None, settings=None, system=""):
         now = time.time()
-        return self.x("INSERT INTO chats (title, kind, story_id, settings, system, created, updated) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                      (title, kind, story_id, json.dumps(settings or {}), system, now, now))
+        with self.lock:
+            cid = self._next_id("chats")
+            self.conn.execute("INSERT INTO chats (id, title, kind, story_id, settings, system, created, updated) "
+                              "VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (cid, title, kind, story_id, json.dumps(settings or {}),
+                                                                  system, now, now))
+            self.conn.commit()
+            self._changed()
+            return cid
 
     def chat(self, chat_id):
         c = self.one("SELECT * FROM chats WHERE id = ?", (chat_id,))
@@ -462,6 +481,7 @@ class Store:
     def delete_chat(self, chat_id):
         with self.lock:
             ids = [r["id"] for r in self.q("SELECT id FROM messages WHERE chat_id = ?", (chat_id,))]
+            self.purge_messages(ids)
             for i in range(0, len(ids), 500):
                 part = ids[i:i + 500]
                 marks = ",".join("?" * len(part))
@@ -476,6 +496,8 @@ class Store:
             # Tahap 8 tables: what the characters know, threads, relationships, story book changes, card proposals
             for (kid,) in self.conn.execute("SELECT id FROM knowledge WHERE chat_id = ?", (chat_id,)).fetchall():
                 self.conn.execute("DELETE FROM vectors WHERE kind = 'know' AND ref_id = ?", (kid,))
+            for (cid_,) in self.conn.execute("SELECT id FROM canon_log WHERE chat_id = ?", (chat_id,)).fetchall():
+                self.conn.execute("DELETE FROM vectors WHERE kind = 'canon' AND ref_id = ?", (cid_,))
             self.conn.execute("DELETE FROM thread_events WHERE thread_id IN (SELECT id FROM threads WHERE chat_id = ?)", (chat_id,))
             for table in ("knowledge", "threads", "thread_events", "relations_log", "canon_log", "card_proposals"):
                 self.conn.execute(f"DELETE FROM {table} WHERE chat_id = ?", (chat_id,))
@@ -488,13 +510,13 @@ class Store:
     def add_message(self, chat_id, parent_id, role, content="", reasoning="", tool_calls=None, tool_call_id=None,
                     meta=None, ooc=False, status="final", media=None, set_head=True):
         with self.lock:
-            cur = self.conn.execute(
-                "INSERT INTO messages (chat_id, parent_id, role, content, reasoning, tool_calls, tool_call_id, ooc, status, meta, created) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (chat_id, parent_id, role, content or "", reasoning or "",
+            mid = self._next_id("messages")
+            self.conn.execute(
+                "INSERT INTO messages (id, chat_id, parent_id, role, content, reasoning, tool_calls, tool_call_id, ooc, status, "
+                "meta, created) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (mid, chat_id, parent_id, role, content or "", reasoning or "",
                  json.dumps(tool_calls) if tool_calls else None, tool_call_id, int(bool(ooc)), status,
                  json.dumps(meta or {}), time.time()))
-            mid = cur.lastrowid
             for a in media or []:
                 self.conn.execute("INSERT INTO attachments (message_id, kind, mime, name, data) VALUES (?, ?, ?, ?, ?)",
                                   (mid, a["kind"], a["mime"], a["name"], a["data"]))
@@ -540,24 +562,58 @@ class Store:
             cur = parents[cur]
         return out[::-1]
 
+    def purge_messages(self, ids):
+        """Everything a turn left behind, for messages that are being deleted (call with the lock held, before the
+        messages themselves go). Memory logs stay: an update whose message is gone simply never applies again."""
+        ids = list(ids)
+        for i in range(0, len(ids), 500):
+            part = ids[i:i + 500]
+            marks = ",".join("?" * len(part))
+            for kind, table in (("know", "knowledge"), ("canon", "canon_log"), ("mem", "memories")):
+                extra = " AND scope IN ('story', 'chat')" if table == "memories" else ""
+                for (rid,) in self.conn.execute(f"SELECT id FROM {table} WHERE message_id IN ({marks}){extra}", part).fetchall():
+                    self.conn.execute("DELETE FROM vectors WHERE kind = ? AND ref_id = ?", (kind, rid))
+                self.conn.execute(f"DELETE FROM {table} WHERE message_id IN ({marks}){extra}", part)
+            self.conn.execute(f"UPDATE knowledge SET forgotten_at = NULL WHERE forgotten_at IN ({marks})", part)
+            self.conn.execute(f"UPDATE memory_log SET undone = 1 WHERE action = 'hide' AND message_id IN ({marks})", part)
+            self.conn.execute(f"UPDATE memories SET forgotten_at = (SELECT MAX(message_id) FROM memory_log WHERE memory_id = "
+                              f"memories.id AND action = 'hide' AND undone = 0) WHERE forgotten_at IN ({marks})", part)
+            self.conn.execute(f"DELETE FROM thread_events WHERE thread_id IN (SELECT id FROM threads WHERE message_id IN ({marks}))", part)
+            for table in ("threads", "thread_events", "relations_log", "pending_changes"):
+                self.conn.execute(f"DELETE FROM {table} WHERE message_id IN ({marks})", part)
+            for (eid,) in self.conn.execute(f"SELECT id FROM world_events WHERE message_id IN ({marks})", part).fetchall():
+                self.conn.execute("DELETE FROM vectors WHERE kind = 'event' AND ref_id = ?", (eid,))
+            for (sid,) in self.conn.execute(f"SELECT id FROM summaries WHERE node_id IN ({marks})", part).fetchall():
+                self.conn.execute("DELETE FROM vectors WHERE kind = 'sum' AND ref_id = ?", (sid,))
+
+    def clone_effects(self, old_mid, new_mid):
+        """A copy of a reply (Continue on an older turn) carries what the original changed: time, status, dice,
+        events, what characters learned, threads, relationships, story book changes."""
+        with self.lock:
+            for table in ("status_events", "world_events", "dice_log", "knowledge", "relations_log", "canon_log", "threads",
+                          "thread_events", "memories", "memory_log"):
+                cols = [c for c in self._columns(table) if c not in ("id", "message_id")]
+                where = " AND action IN ('update', 'hide') AND undone = 0" if table == "memory_log" else ""
+                self.conn.execute(f"INSERT INTO {table} ({', '.join(cols)}, message_id) SELECT {', '.join(cols)}, ? FROM {table} "
+                                  f"WHERE message_id = ?{where}", (new_mid, old_mid))
+            self.conn.commit()
+            self._changed()
+
     def lineage(self, chat_id):
-        """This chat and the chats it continues, oldest last."""
-        out, cur = [], chat_id
-        while cur and cur not in out and len(out) < 20:
-            out.append(cur)
-            cur = ((self.chat(cur) or {}).get("settings") or {}).get("continued_from")
-        return out
+        """The chats whose rows count for this one. A continued chat gets a copy of what was true when it was
+        continued (see Engine.continue_in_new_chat), so deleting the old chat never takes anything with it."""
+        return [chat_id] if chat_id else []
 
     def visible_ids(self, chat_id):
-        """Messages whose effects (memories, story book changes) count in this chat: its active path, plus the path of
-        the chat it continues up to the point it was continued (and so on). Other chats of the same story, and
-        branches that were rerolled away, are not included."""
-        out, cur, head, depth = set(), chat_id, None, 0
-        while cur and depth < 20:
-            out.update(self.path_ids(cur, head))
-            chat = self.chat(cur)
-            s = (chat or {}).get("settings") or {}
-            cur, head, depth = s.get("continued_from"), s.get("continued_head"), depth + 1
+        """Messages whose effects (memories, story book changes, what characters know) count in this chat: its active
+        path. Other chats of the same story and branches that were rerolled away are not included. Cached until the
+        next write, because one turn asks many times."""
+        key = (chat_id, self.rev)
+        cache = getattr(self, "_vis_cache", None)
+        if cache and cache[0] == key:
+            return cache[1]
+        out = set(self.path_ids(chat_id))
+        self._vis_cache = (key, out)
         return out
 
     def path(self, chat_id, head=None, ids=None):

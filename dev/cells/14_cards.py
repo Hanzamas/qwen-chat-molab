@@ -263,6 +263,8 @@ class Cards:
             for r in self.store.q(sql, (card_id,)):
                 self.store.x("DELETE FROM vectors WHERE kind = ? AND ref_id = ?", (kind, r["id"]))
         self.store.x("DELETE FROM facts WHERE world_card_id = ?", (card_id,))
+        self.store.x("DELETE FROM card_proposals WHERE card_id = ?", (card_id,))
+        self.store.x("DELETE FROM vectors WHERE kind = 'card' AND ref_id = ?", (card_id,))
         self.store.x("DELETE FROM memories WHERE scope = 'card' AND card_id = ?", (card_id,))
         for t in ("cards", "card_versions"):
             self.store.x(f"DELETE FROM {t} WHERE {'id' if t == 'cards' else 'card_id'} = ?", (card_id,))

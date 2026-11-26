@@ -4,10 +4,17 @@ class Embedder:
 
     def __init__(self, store, servers):
         self.store, self.servers = store, servers
-        self.queue = []
+        self.queue = []      # keys (kind, ref_id) waiting, oldest first
+        self.pending = {}    # key -> newest text; a key stays here while queued or being embedded
         self.qlock = threading.Lock()
-        self.cache = {}
+        self.cache = {}      # kind -> (ids, matrix)
+        self.qcache = {}     # (model, query) -> vector, a small LRU
         self.worker = None
+        self.working = False
+        self.gen = 0         # bumped when queued work no longer applies (Load, model change)
+        self.dim = None      # size of the vectors the running model returns
+        self._model = None
+        self.backfilling = False
         try:
             import numpy
             self.np = numpy
@@ -15,20 +22,47 @@ class Embedder:
             self.np = None
 
     def ready(self):
-        return self.np is not None and self.servers.embed_ready()
+        if self.np is None or not self.servers.embed_ready():
+            return False
+        model = self.servers.state.get("embed_model") or "0.6B"
+        if model != self._model:  # switched (Model tab, restart, Load): check the stored vectors once
+            self._model = model
+            self.dim = None
+            try:
+                self.check_model()
+            except Exception:
+                pass
+        return True
+
+    def reset(self):
+        """Drop queued work (after Load the ids belong to another database)."""
+        with self.qlock:
+            self.queue = []
+            self.pending = {}
+            self.gen += 1
+        self.cache.clear()
+        self.qcache.clear()
 
     def check_model(self):
-        """Vectors from another embedder model cannot be compared: rebuild them when the model changed."""
+        """Vectors from another embedder model cannot be compared: rebuild them when the model changed. A database
+        with no record of the model keeps only vectors of the running model's size."""
         model = self.servers.state.get("embed_model") or "0.6B"
         have = self.store.meta_get("embed_model")
         if have == model:
             return
+        with self.qlock:
+            self.gen += 1  # a batch being embedded by the old model must not land
+            self.queue = list(self.pending)
         if have is not None:
             self.store.x("DELETE FROM vectors")
-            with self.qlock:
-                self.queue = []
-                self.pending = {}
+        else:
+            try:
+                self.embed(["dim"])
+                self.store.x("DELETE FROM vectors WHERE dim != ?", (self.dim,))
+            except Exception:
+                pass
         self.cache.clear()
+        self.qcache.clear()
         self.store.meta_set("embed_model", model)
 
     def embed(self, texts, query=False):
@@ -41,65 +75,101 @@ class Embedder:
         vecs = [d["embedding"] for d in sorted(json.loads(text)["data"], key=lambda d: d["index"])]
         arr = self.np.asarray(vecs, dtype=self.np.float32)
         arr /= self.np.linalg.norm(arr, axis=1, keepdims=True) + 1e-9
+        self.dim = int(arr.shape[1])
         return arr
 
     def enqueue(self, kind, ref_id, text):
         if self.np is None or not (text or "").strip():
             return
+        key = (kind, ref_id)
         with self.qlock:
-            pending = getattr(self, "pending", None)
-            if pending is None:
-                pending = self.pending = {}
-            if (kind, ref_id) in pending:
-                pending[(kind, ref_id)] = text  # already queued: embed the newest text once
-                self.queue = [(k, r, text if (k, r) == (kind, ref_id) else t) for k, r, t in self.queue]
+            if key in self.pending:
+                self.pending[key] = text  # already queued or being embedded: the newest text is embedded once
                 return
-            pending[(kind, ref_id)] = text
-            self.queue.append((kind, ref_id, text))
+            self.pending[key] = text
+            self.queue.append(key)
             # The worker decides to stop under the same lock, so an item added now is never left behind.
-            if not getattr(self, "working", False):
+            if not self.working:
                 self.working = True
                 self.worker = threading.Thread(target=self._work, daemon=True)
                 self.worker.start()
 
+    def _settle(self, batch):
+        """After a batch, done or failed (call with qlock): keys whose text changed meanwhile go back in the queue;
+        the rest leave pending (a failed one is queued again by the next backfill)."""
+        for k, t in batch:
+            if k not in self.pending:
+                continue
+            if self.pending[k] == t:
+                self.pending.pop(k)
+            else:
+                self.queue.append(k)
+
     def _work(self):
         while True:
             with self.qlock:
-                batch, self.queue = self.queue[:32], self.queue[32:]
-                if not batch:
+                keys, self.queue = self.queue[:32], self.queue[32:]
+                if not keys:
                     self.working = False
                     return
+                gen = self.gen
+                batch = [(k, self.pending[k]) for k in keys if k in self.pending]
+            if not batch:
+                continue
             if not self.ready():
                 time.sleep(2)
                 with self.qlock:
-                    self.queue = batch + self.queue
-                if not self.servers.state.get("embed"):
-                    with self.qlock:
+                    if gen == self.gen:
+                        self.queue = [k for k, _ in batch] + self.queue
+                    if not self.servers.state.get("embed"):
                         self.working = False
-                    return
+                        return
                 continue
             try:
-                arr = self.embed([t for _, _, t in batch])
-                rows = [(k, r, arr.shape[1], arr[i].astype(self.np.float16).tobytes()) for i, (k, r, _) in enumerate(batch)]
-                self.store.many("INSERT OR REPLACE INTO vectors (kind, ref_id, dim, v) VALUES (?, ?, ?, ?)", rows)
-                with self.qlock:
-                    for k, r, t in batch:
-                        if self.pending.get((k, r)) == t:
-                            self.pending.pop((k, r), None)
-                for k, _, _ in batch:
-                    self.cache.pop(k, None)
+                arr = self.embed([t for _, t in batch])
             except Exception:
+                with self.qlock:
+                    self._settle(batch)
                 time.sleep(5)
+                continue
+            with self.qlock:
+                stale = gen != self.gen
+                if stale:  # Load or a model change happened meanwhile: embed again what is still wanted
+                    self.queue += [k for k, _ in batch if k in self.pending]
+            if stale:
+                continue
+            rows = [(k[0], k[1], arr.shape[1], arr[i].astype(self.np.float16).tobytes()) for i, (k, _) in enumerate(batch)]
+            self.store.many("INSERT OR REPLACE INTO vectors (kind, ref_id, dim, v) VALUES (?, ?, ?, ?)", rows)
+            with self.qlock:
+                self._settle(batch)
+            for kind in {k[0] for k, _ in batch}:
+                self.cache.pop(kind, None)
 
     def _matrix(self, kind):
-        if kind not in self.cache:
-            rows = self.store.q("SELECT ref_id, v FROM vectors WHERE kind = ?", (kind,))
+        hit = self.cache.get(kind)
+        if hit is None:
+            dim = self.dim or self.servers.embed_spec()["dim"]
+            rows = self.store.q("SELECT ref_id, v FROM vectors WHERE kind = ? AND dim = ?", (kind, dim))
             if not rows:
-                self.cache[kind] = ([], None)
+                hit = ([], None)
             else:
                 mat = self.np.stack([self.np.frombuffer(r["v"], dtype=self.np.float16) for r in rows]).astype(self.np.float32)
-                self.cache[kind] = ([r["ref_id"] for r in rows], mat)
-        return self.cache[kind]
+                hit = ([r["ref_id"] for r in rows], mat)
+            self.cache[kind] = hit
+        return hit
+
+    def _query_vec(self, query):
+        key = (self._model, query)
+        v = self.qcache.get(key)
+        if v is None:
+            v = self.embed([query], query=True)[0]
+            self.qcache[key] = v
+            while len(self.qcache) > 64:
+                try:
+                    self.qcache.pop(next(iter(self.qcache)))
+                except (StopIteration, KeyError, RuntimeError):
+                    break
+        return v
 
     def search(self, kind, query, limit=20, allowed=None):
         """[(ref_id, score)] by cosine similarity, restricted to `allowed` ids when given."""
@@ -109,10 +179,9 @@ class Embedder:
         if mat is None:
             return []
         try:
-            q = self.embed([query], query=True)[0]
-        except Exception:
+            scores = mat @ self._query_vec(query)
+        except Exception:  # embedder down, or a vector of another size
             return []
-        scores = mat @ q
         order = self.np.argsort(-scores)
         out = []
         for i in order:
@@ -123,7 +192,16 @@ class Embedder:
         return out
 
     def backfill(self):
-        """Queue everything that has no vector yet (after Load, or when the embedder starts)."""
+        """Queue everything that has no vector yet (after Load, or when the embedder starts). One at a time."""
+        if self.backfilling:
+            return
+        self.backfilling = True
+        try:
+            self._backfill()
+        finally:
+            self.backfilling = False
+
+    def _backfill(self):
         if self.ready():
             self.check_model()
         have = {(r["kind"], r["ref_id"]) for r in self.store.q("SELECT kind, ref_id FROM vectors")}
@@ -190,14 +268,19 @@ class Memory:
     BRANCHED = ("story", "chat")  # user and card memories are about the real user / the character everywhere
 
     def _visible(self, row, ctx):
-        """A story/chat memory made by a message counts only where that message is on the path (or in the chat
-        it continues); a forget counts the same way. Memories made outside a chat count everywhere."""
+        """A story/chat memory made by a message counts only where that message is on the path; a forget made by a
+        turn hides it only on that turn's branch (several branches can each forget it). Memories made outside a chat
+        count everywhere."""
         if row.get("scope") not in self.BRANCHED or "visible" not in ctx:
             return True
         vis = ctx["visible"]
         if row.get("message_id") and row["message_id"] not in vis:
             return False
-        return not (row.get("forgotten_at") and row["forgotten_at"] in vis)
+        if not row.get("forgotten_at"):  # set while any branch has forgotten it
+            return True
+        hides = self.store.q("SELECT message_id FROM memory_log WHERE memory_id = ? AND action = 'hide' AND undone = 0",
+                             (row["id"],))
+        return not any(h["message_id"] in vis for h in hides)
 
     def _resolve(self, rows, ctx):
         """Visible rows, with updates made on other branches undone."""
@@ -209,13 +292,22 @@ class Memory:
         logs = {}
         for i in range(0, len(ids), 500):
             part = ids[i:i + 500]
-            for lg in self.store.q(f"SELECT memory_id, before, after, message_id FROM memory_log WHERE action = 'update' "
-                                   f"AND undone = 0 AND memory_id IN ({','.join('?' * len(part))}) ORDER BY id DESC", part):
+            for lg in self.store.q(f"SELECT memory_id, action, before, after, message_id FROM memory_log WHERE action IN "
+                                   f"('save', 'update') AND undone = 0 AND memory_id IN ({','.join('?' * len(part))}) ORDER BY id",
+                                   part):
                 logs.setdefault(lg["memory_id"], []).append(lg)
         for r in rows:
-            for lg in logs.get(r["id"], []):
-                if lg["message_id"] and lg["message_id"] not in vis and lg["after"] == r["text"]:
-                    r["text"] = lg["before"]
+            # replay in order: the saved text, then each update this branch can see
+            seq = logs.get(r["id"], [])
+            if not any(lg["action"] == "update" for lg in seq):
+                continue
+            text = next((lg["after"] for lg in seq if lg["action"] == "save"), None)
+            if text is None:
+                text = next(lg["before"] for lg in seq if lg["action"] == "update")
+            for lg in seq:
+                if lg["action"] == "update" and (not lg["message_id"] or lg["message_id"] in vis):
+                    text = lg["after"]
+            r["text"] = text
         return rows
 
     def _scope_sql(self, ctx):
@@ -312,15 +404,16 @@ class Memory:
             self.store.x("UPDATE memories SET text = ?, updated = ? WHERE id = ?", (log["before"], time.time(), log["memory_id"]))
             self.emb.enqueue("mem", log["memory_id"], log["before"])
         elif log["action"] == "hide":
-            self.store.x("UPDATE memories SET forgotten_at = NULL WHERE id = ?", (log["memory_id"],))
+            pass  # marking the log undone below is what brings it back on that branch
         elif log["action"] == "forget":
             r = json.loads(log["before"])
-            cols = "scope, card_id, story_id, chat_id, kind, text, created, updated"
-            vals = (r["scope"], r["card_id"], r["story_id"], r["chat_id"], r["kind"], r["text"], r["created"], time.time())
+            cols = "scope, card_id, story_id, chat_id, kind, text, created, updated, message_id, importance"
+            vals = (r["scope"], r["card_id"], r["story_id"], r["chat_id"], r["kind"], r["text"], r["created"], time.time(),
+                    r.get("message_id"), r.get("importance", 0.5))
             if cur is None:
-                new_id = self.store.x(f"INSERT INTO memories (id, {cols}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", (r["id"],) + vals)
+                new_id = self.store.x(f"INSERT INTO memories (id, {cols}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (r["id"],) + vals)
             else:  # the old id is taken by a newer memory: bring it back under a new id
-                new_id = self.store.x(f"INSERT INTO memories ({cols}) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", vals)
+                new_id = self.store.x(f"INSERT INTO memories ({cols}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", vals)
             self.emb.enqueue("mem", new_id, r["text"])
         self.store.x("UPDATE memory_log SET undone = 1 WHERE id = ?", (log_id,))
         return True
@@ -494,8 +587,9 @@ class Knowledge:
         hit = {}
         if q:
             ids = {r["id"] for r in rows}
-            for rank, r in enumerate(self.store.q("SELECT rowid AS id FROM knowledge_fts WHERE knowledge_fts MATCH ? "
-                                                  "ORDER BY bm25(knowledge_fts) LIMIT 200", (q,))):
+            for rank, r in enumerate(self.store.q("SELECT k.id FROM knowledge_fts f JOIN knowledge k ON k.id = f.rowid "
+                                                  "WHERE knowledge_fts MATCH ? AND k.chat_id = ? AND k.holder = ? "
+                                                  "ORDER BY bm25(knowledge_fts) LIMIT 200", (q, chat_id, holder))):
                 if r["id"] in ids:
                     hit[r["id"]] = rank
         sim = {}

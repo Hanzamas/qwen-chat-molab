@@ -272,7 +272,7 @@ class World:
     @staticmethod
     def _hour_in(spec, hour):
         """'8', '08-12', '22-06', '08:00-12:30' -> whether hour falls inside (end exclusive, wraps at midnight)."""
-        nums = [int(x) for x in re.findall(r"(\d{1,2})(?::\d{2})?", str(spec or ""))]
+        nums = [int(x) for x in re.findall(r"(\d{1,2})(?:[:.]\d{2})?", str(spec or ""))]
         if not nums:
             return False
         a, b = (nums[0], nums[1]) if len(nums) > 1 else (nums[0], nums[0] + 1)
@@ -286,6 +286,8 @@ class World:
         for ch in (cards or {}).get("character", []):
             rows = Cards.table_rows(ch["data"].get("schedule") or [], ["jam", "lokasi", "kegiatan"])
             if not rows:
+                continue
+            if str((st["status"].get(ch["name"]) or {}).get("keadaan") or "").lower() in ("ditahan", "pingsan", "mati", "pergi"):
                 continue
             seen = (st.get("seen_at") or {}).get(ch["name"], {}).get("location")
             if seen and (now - seen).total_seconds() < self.SCHEDULE_STALE_HOURS * 3600:

@@ -115,7 +115,7 @@ class ChatApp:
             if c:
                 links.append({"id": c["id"], "role": l["role"], "name": c["name"], "version": l["version"],
                               "latest": c["version"], "avatar": c["avatar"]})
-        return {"id": sid, "title": s["title"], "canon": STORIES.canon(sid, STORE.visible_ids(chat["id"])),
+        return {"id": sid, "title": s["title"], "canon": STORIES.canon(sid, STORE.visible_ids(chat["id"]), chat["id"]),
                 "never_forget": s["data"]["never_forget"],
                 "cards": links, "pending": [p["text"] for p in STORIES.pending_list(sid, chat["id"])]}
 
@@ -529,7 +529,7 @@ class ChatApp:
 
     def c_knowledge_add(self, holder, text, kind="fakta", truth="benar"):
         cid = self._cur()
-        KNOW.add(cid, STORE.chat(cid)["head_id"], [holder], text, kind, "lihat sendiri", "", truth)
+        KNOW.add(cid, None, [holder], text, kind, "lihat sendiri", "", truth)  # chat-wide: survives rerolls
         self.c_knowledge(holder)
 
     def c_knowledge_edit(self, kid, holder, text=None, truth=None):
@@ -572,12 +572,12 @@ class ChatApp:
     def c_thread_add(self, kind, title, due="", who=""):
         cid = self._cur()
         st = WORLD.state(cid, STORE.path_ids(cid))
-        THREADS.open(cid, STORE.chat(cid)["head_id"], kind, title, "", who, due, st["time_text"])
+        THREADS.open(cid, None, kind, title, "", who, due, st["time_text"])
         self.c_threads()
 
     def c_thread_close(self, tid, status):
         cid = self._cur()
-        THREADS.close(cid, STORE.chat(cid)["head_id"], int(tid), status)
+        THREADS.close(cid, None, int(tid), status)
         self.c_threads()
 
     # story
@@ -585,8 +585,7 @@ class ChatApp:
         sid = (self.w.story or {}).get("id")
         if sid:
             # edited here: on this chat's branch (it is what this chat shows), not in the base of every chat
-            head = (STORE.chat(self._cur()) or {}).get("head_id")
-            STORIES.canon_set(sid, section, text, self._cur(), message_id=head)
+            STORIES.canon_set(sid, section, text, self._cur(), chat_wide=True)
             self.w.story = self.story_info(STORE.chat(self._cur()))
 
     def c_never_forget(self, items):

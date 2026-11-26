@@ -395,7 +395,7 @@ class ToolBox:
         out += [{"type": "ingatan", "holder": r["holder"], "text": KNOW.line(r)}
                 for r in self._rank(query, "know", KNOW._rows(chat_id), lambda r: r["text"])]
         if sid:
-            canon = self.stories.canon(sid, vis)
+            canon = self.stories.canon(sid, vis, chat_id)
             logs = [r for r in self.store.q("SELECT id, message_id, section, text FROM canon_log WHERE story_id = ? AND text != ''",
                                             (sid,)) if r["message_id"] in vis and canon.get(r["section"]) == r["text"]]
             hit = {r["section"] for r in self._rank(query, "canon", logs, lambda r: f"{r['section']}: {r['text']}", 3)}

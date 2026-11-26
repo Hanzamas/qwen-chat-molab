@@ -190,7 +190,9 @@ class Engine(EngineView):
             self.continuity_jobs.clear()
             self.last_used.clear()
             self.active_chat = 0
-            EMB.cache.clear()
+            EMB.reset()
+            EMB._model = None      # the loaded database may have been embedded by another model
+            self.backfilled = False  # and its rows have no vectors yet: backfill on the next idle tick
         self.importing = False
 
     # ---------- chats and stories ----------
@@ -253,6 +255,7 @@ class Engine(EngineView):
                                       meta={"carry_over": True})
         self.store.x("UPDATE summaries SET node_id = ?, from_id = ? WHERE chat_id = ? AND node_id = 0", (root, root, new))
         self.store.add_message(new, root, "assistant", intro, meta={"carry_over": True})
+        self._carry_state(chat_id, new, root, set(ids), old.get("story_id"))
         self.world.add_event(new, None, "world", "time", st["time"].strftime("%Y-%m-%d %H:%M"), "set", "lanjutan")
         for s in st["stats"]:
             self.world.add_event(new, None, "player", s["key"], s["value"], "set", "lanjutan")
@@ -261,6 +264,51 @@ class Engine(EngineView):
                 self.world.add_event(new, None, subject, k, v, "set", "lanjutan")
         self.emit("chats")
         return new
+
+    def _carry_state(self, old_id, new_id, root, vis, story_id):
+        """Copy the old chat's state onto the new chat's root message: story book changes, what the characters know,
+        open threads, relationships, memories made in that chat. The new chat then no longer depends on the old one
+        (deleting or rerolling it changes nothing here)."""
+        s, now = self.store, time.time()
+        story = self.stories.get(story_id) if story_id else None
+        if story:
+            base = story["data"]["canon"]
+            cur = self.stories.canon(story_id, vis, old_id)
+            for sec in set(base) | set(cur):
+                if base.get(sec) != cur.get(sec):
+                    s.x("INSERT INTO canon_log (story_id, chat_id, message_id, section, text, created) VALUES (?, ?, ?, ?, ?, ?)",
+                        (story_id, new_id, root, sec, cur.get(sec, ""), now))
+        for r in KNOW._rows(old_id):
+            kid = s.x("INSERT INTO knowledge (chat_id, message_id, holder, text, kind, source, source_who, truth, importance, "
+                      "world_time, created) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                      (new_id, root, r["holder"], r["text"], r["kind"], r["source"], r["source_who"], r["truth"],
+                       r["importance"], r["world_time"], r["created"]))
+            EMB.enqueue("know", kid, r["text"])
+        for t in THREADS.list(old_id):
+            s.x("INSERT INTO threads (story_id, chat_id, message_id, kind, title, text, who, due, opened_at, created) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (t["story_id"], new_id, root, t["kind"], t["title"], t["text"], t["who"],
+                                                          t["due"], t["opened_at"], t["created"]))
+        for (a, b), v in RELATIONS.scores(old_id).items():
+            if v["score"]:
+                s.x("INSERT INTO relations_log (chat_id, message_id, a, b, delta, reason, world_time, created) "
+                    "VALUES (?, ?, ?, ?, ?, ?, '', ?)", (new_id, root, a, b, v["score"], v["last"], now))
+        ctx = {"visible": vis, "chat_id": old_id, "story_id": story_id}
+        rows = s.q("SELECT * FROM memories WHERE kind != 'summary_core' AND ((scope = 'story' AND story_id = ?) "
+                   "OR (scope = 'chat' AND chat_id = ?))", (story_id or -1, old_id))
+        shown = {r["id"] for r in self.mem._resolve(rows, ctx)}
+        for r in self.mem._resolve(rows, ctx):
+            if r["scope"] == "story" and not r["message_id"]:
+                continue  # made outside any turn: already counts in every chat of the story
+            mid = s.x("INSERT INTO memories (scope, card_id, story_id, chat_id, kind, text, created, updated, message_id, importance) "
+                      "VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)",
+                      (r["scope"], r["story_id"], new_id if r["scope"] == "chat" else None, r["kind"], r["text"], r["created"],
+                       now, root, r.get("importance", 0.5)))
+            self.mem.emb.enqueue("mem", mid, r["text"])
+        for r in rows:  # story memories the old chat forgot stay forgotten here
+            if r["scope"] == "story" and not r["message_id"] and r["id"] not in shown:
+                s.x("INSERT INTO memory_log (memory_id, action, before, chat_id, created, message_id) VALUES (?, 'hide', ?, ?, ?, ?)",
+                    (r["id"], json.dumps(dict(r)), new_id, now, root))
+                s.x("UPDATE memories SET forgotten_at = ? WHERE id = ? AND forgotten_at IS NULL", (root, r["id"]))
 
     # ---------- sending ----------
 
@@ -826,7 +874,7 @@ class Engine(EngineView):
                 source, text = page.get("url", top["url"]), page.get("text", "")
             else:
                 source = "lore dan buku cerita"
-                text = self.stories.canon_text(c["story"]["id"], visible=self.store.visible_ids(chat_id)) if c["story"] else ""
+                text = self.stories.canon_text(c["story"]["id"], visible=self.store.visible_ids(chat_id), chat_id=chat_id) if c["story"] else ""
                 text += "\n" + "\n".join(f"{e['title']}: {e['text']}" for e in self.mem.lore_triggered(c["mem"]["card_ids"], claim))
             if not text.strip():
                 continue
@@ -894,6 +942,9 @@ class Engine(EngineView):
     def decide_proposal(self, chat_id, pid, accept):
         p = self.store.one("SELECT * FROM card_proposals WHERE id = ? AND status = 'menunggu'", (int(pid),))
         if not p:
+            return False
+        if accept and not self.cards.get(p["card_id"]):
+            self.store.x("UPDATE card_proposals SET status = 'ditolak' WHERE id = ?", (p["id"],))
             return False
         if accept:
             self.cards.set_field(p["card_id"], p["field"], json.loads(p["value"]))
@@ -1105,8 +1156,14 @@ class Engine(EngineView):
         if self.store.children(chat_id, mid):
             # Later turns hang on this reply: writing into it would change their history. Continue a copy instead,
             # as a new branch; the old branch keeps its turns.
+            old_mid = mid
             mid = self.store.add_message(chat_id, m["parent_id"], "assistant", m["content"], m["reasoning"],
                                          meta={**m["meta"], "continued_from": mid}, status=m["status"])
+            self.store.clone_effects(old_mid, mid)
+            for r in self.store.q("SELECT id, text FROM memories WHERE message_id = ?", (mid,)):
+                self.mem.emb.enqueue("mem", r["id"], r["text"])
+            for r in self.store.q("SELECT id, text FROM knowledge WHERE message_id = ?", (mid,)):
+                EMB.enqueue("know", r["id"], r["text"])
             m = self.store.msg(mid)
         self.store.set_head(chat_id, mid)
         live = {"active": True, "content": m["content"], "reasoning": "", "tools": [], "phase": "Melanjutkan…", "chat_id": chat_id}
@@ -1137,6 +1194,7 @@ class Engine(EngineView):
             sub.append(cur)
             frontier += self.store.children(chat_id, cur)
         with self.store.lock:
+            self.store.purge_messages(sub)
             for i in range(0, len(sub), 500):
                 part = sub[i:i + 500]
                 marks = ",".join("?" * len(part))

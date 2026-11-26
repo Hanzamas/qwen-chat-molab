@@ -75,10 +75,13 @@ class Stories:
 
     # ---------- canon and never-forget ----------
 
-    def canon_set(self, story_id, section, text, chat_id=None, message_id=None):
-        """message_id given (the model wrote it during a turn): logged on that branch. Without (edited in the UI):
-        changes the base every chat of the story starts from."""
-        if message_id:
+    def canon_set(self, story_id, section, text, chat_id=None, message_id=None, chat_wide=False):
+        """message_id given (the model wrote it during a turn): logged on that branch. chat_wide (edited in the UI
+        while a chat is open): logged for that whole chat. Neither: changes the base every chat of the story starts from."""
+        if chat_wide and chat_id:
+            self.store.x("INSERT INTO canon_log (story_id, chat_id, message_id, section, text, created) VALUES (?, ?, NULL, ?, ?, ?)",
+                         (story_id, chat_id, section, text.strip(), time.time()))
+        elif message_id:
             self.store.x("INSERT INTO canon_log (story_id, chat_id, message_id, section, text, created) VALUES (?, ?, ?, ?, ?, ?)",
                          (story_id, chat_id, message_id, section, text.strip(), time.time()))
         else:
@@ -88,28 +91,31 @@ class Stories:
             else:
                 s["data"]["canon"].pop(section, None)
             self._save_data(story_id, s["data"])
-        self.pending(story_id, chat_id, f"Buku cerita · {section}: {text.strip() or '(dihapus)'}")
+        self.pending(story_id, chat_id, f"Buku cerita · {section}: {text.strip() or '(dihapus)'}",
+                     message_id=message_id, chat_only=bool(chat_wide or message_id))
 
-    def canon(self, story_id, visible=None):
+    def canon(self, story_id, visible=None, chat_id=None):
         """Sections as they are on a branch: the base, then the logged changes whose message is visible."""
         s = self.get(story_id)
         if not s:
             return {}
         out = dict(s["data"]["canon"])
-        if visible:
-            for r in self.store.q("SELECT message_id, section, text FROM canon_log WHERE story_id = ? ORDER BY id", (story_id,)):
-                if r["message_id"] in visible:
+        if visible is not None:
+            for r in self.store.q("SELECT chat_id, message_id, section, text FROM canon_log WHERE story_id = ? ORDER BY id",
+                                  (story_id,)):
+                # a turn's change counts on its branch; a manual edit (no message) counts in its whole chat
+                if r["message_id"] in visible or (not r["message_id"] and chat_id and r["chat_id"] == chat_id):
                     if r["text"]:
                         out[r["section"]] = r["text"]
                     else:
                         out.pop(r["section"], None)
         return out
 
-    def canon_text(self, story_id, limit=48000, visible=None):
+    def canon_text(self, story_id, limit=48000, visible=None, chat_id=None):
         s = self.get(story_id)
         if not s:
             return ""
-        parts = [f"### {k}\n{v}" for k, v in self.canon(story_id, visible).items()]
+        parts = [f"### {k}\n{v}" for k, v in self.canon(story_id, visible, chat_id).items()]
         nf = s["data"]["never_forget"]
         if nf:
             parts.append("### Jangan pernah lupa\n" + "\n".join(f"- {x}" for x in nf))
@@ -120,13 +126,17 @@ class Stories:
         s["data"]["never_forget"] = [x.strip() for x in items if x and x.strip()]
         self._save_data(story_id, s["data"])
 
-    def pending(self, story_id, chat_id, text):
-        self.store.x("INSERT INTO pending_changes (story_id, chat_id, text, created) VALUES (?, ?, ?, ?)",
-                     (story_id, chat_id, text[:2000], time.time()))
+    def pending(self, story_id, chat_id, text, message_id=None, chat_only=False):
+        """A change waiting for the next epoch. Story-wide (a card edited) unless chat_only: then it is this chat's,
+        and with message_id only on that turn's branch."""
+        self.store.x("INSERT INTO pending_changes (story_id, chat_id, text, created, message_id) VALUES (?, ?, ?, ?, ?)",
+                     (None if chat_only else story_id, chat_id, text[:2000], time.time(), message_id))
 
     def pending_list(self, story_id, chat_id):
-        return self.store.q("SELECT id, text FROM pending_changes WHERE (story_id = ? AND story_id IS NOT NULL) OR chat_id = ? "
-                            "ORDER BY id", (story_id, chat_id))
+        rows = self.store.q("SELECT id, text, message_id FROM pending_changes WHERE (story_id = ? AND story_id IS NOT NULL) "
+                            "OR chat_id = ? ORDER BY id", (story_id, chat_id))
+        vis = self.store.visible_ids(chat_id) if chat_id and any(r["message_id"] for r in rows) else set()
+        return [r for r in rows if not r["message_id"] or r["message_id"] in vis]
 
     def clear_pending(self, story_id, chat_id):
         self.store.x("DELETE FROM pending_changes WHERE (story_id = ? AND story_id IS NOT NULL) OR chat_id = ?",
