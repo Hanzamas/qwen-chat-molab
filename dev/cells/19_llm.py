@@ -107,10 +107,11 @@ class LLM:
             resp.close()
         return acc
 
-    def complete(self, messages, kwargs=None, sampling=None, max_tokens=4000, tools=None, timeout=7200, stop=None):
-        """Same as chat() without a delta callback; tools are sent (for an identical prompt prefix) but not used."""
+    def complete(self, messages, kwargs=None, sampling=None, max_tokens=4000, tools=None, timeout=7200, stop=None,
+                 on_delta=None):
+        """Like chat(); tools are sent (for an identical prompt prefix) but not used."""
         return self.chat(messages, tools=tools, kwargs=kwargs, sampling=sampling, max_tokens=max_tokens,
-                         tool_choice="none" if tools else None, timeout=timeout, stop=stop)
+                         tool_choice="none" if tools else None, timeout=timeout, stop=stop, on_delta=on_delta)
 
 
 LLM_CLIENT = LLM(SERVERS)

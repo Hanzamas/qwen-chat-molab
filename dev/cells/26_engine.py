@@ -38,6 +38,7 @@ tahu tulis "tidak tahu". Jawab HANYA JSON: {{"answers": ["...", "..."]}}
 
 
 class Engine(EngineView):
+    IDLE_COMPACT_AT = 0.75
     def __init__(self, emit=None):
         self.store, self.prompt, self.llm, self.tools = STORE, PROMPT, LLM_CLIENT, TOOLS
         self.compactor = Compactor(STORE, PROMPT, LLM_CLIENT, MEM)
@@ -275,7 +276,7 @@ class Engine(EngineView):
             self.emit("live", live)
 
         used = self.compactor.maybe(chat_id, tools, self.tools, phase, last_used=self.last_used.get(chat_id, 0),
-                                    pending_estimate=pending_estimate)
+                                    pending_estimate=pending_estimate, clear_cancel=not self.stop.is_set())
         if used:
             self.last_used[chat_id] = used
         phase("")
@@ -296,7 +297,7 @@ class Engine(EngineView):
                 if _round:
                     # Many rounds of tool results can fill the context: compact older history between rounds too.
                     used = self.compactor.maybe(chat_id, tools, self.tools, phase,
-                                                last_used=self.last_used.get(chat_id, 0))
+                                                last_used=self.last_used.get(chat_id, 0), clear_cancel=not self.stop.is_set())
                     if used:
                         self.last_used[chat_id] = used
                     phase("")
@@ -806,11 +807,19 @@ class Engine(EngineView):
             idle = time.time() - self.last_activity
             maxc = self.llm.max_context()
             used = self.last_used.get(chat_id, 0)
-            if maxc and used > 0.8 * maxc and idle > 60 and not self.busy:
-                self.emit("status", "Compaction saat diam…")
+            if maxc and used > self.IDLE_COMPACT_AT * maxc and idle > 60 and not self.busy:
+                # Runs while the player is away, so a turn rarely has to wait for it (a turn compacts at 90%).
+                # Sending a message cancels it; finished pieces stay, the rest is done later.
+                note = " (kirim pesan untuk membatalkan; bagian yang selesai tetap tersimpan)"
+                # run() marks the engine busy before it sets the cancel flag: clear first, then look at busy.
+                self.compactor.cancel.clear()
+                if self.busy:
+                    return
+                self.emit("status", "Compaction saat diam…" + note)
                 c = self.prompt.ctx(chat_id)
                 self.last_used[chat_id] = self.compactor.maybe(chat_id, self.tools.specs(c), self.tools,
-                                                               lambda m: self.emit("status", m), force=False, threshold=0.8)
+                                                               lambda m: self.emit("status", m + note), force=False,
+                                                               threshold=self.IDLE_COMPACT_AT, clear_cancel=False)
                 self.emit("status", "")
                 self.emit("history", chat_id)
             if chat["kind"] in ("rp", "group"):

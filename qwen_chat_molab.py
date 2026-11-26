@@ -3509,10 +3509,11 @@ def _(CFG, SERVERS, Sys, json, time, urllib):
                 resp.close()
             return acc
 
-        def complete(self, messages, kwargs=None, sampling=None, max_tokens=4000, tools=None, timeout=7200, stop=None):
-            """Same as chat() without a delta callback; tools are sent (for an identical prompt prefix) but not used."""
+        def complete(self, messages, kwargs=None, sampling=None, max_tokens=4000, tools=None, timeout=7200, stop=None,
+                     on_delta=None):
+            """Like chat(); tools are sent (for an identical prompt prefix) but not used."""
             return self.chat(messages, tools=tools, kwargs=kwargs, sampling=sampling, max_tokens=max_tokens,
-                             tool_choice="none" if tools else None, timeout=timeout, stop=stop)
+                             tool_choice="none" if tools else None, timeout=timeout, stop=stop, on_delta=on_delta)
 
 
     LLM_CLIENT = LLM(SERVERS)
@@ -3954,6 +3955,24 @@ def _(TXT, re, threading, time):
         def __init__(self, store, prompt, llm, memory):
             self.store, self.prompt, self.llm, self.mem = store, prompt, llm, memory
             self.cancel = threading.Event()
+            # One compaction at a time: the idle one and a turn's own must never write summaries side by side.
+            self.lock = threading.Lock()
+
+        @staticmethod
+        def progress(phase, label, limit=None):
+            """on_delta callback that shows how much the model has written so far (about 3.5 characters per token)."""
+            state = {"t": 0.0}
+
+            def on_delta(acc):
+                now = time.time()
+                if now - state["t"] < 1.0:
+                    return
+                state["t"] = now
+                think, out = len(acc["reasoning"]) * 2 // 7, len(acc["content"]) * 2 // 7
+                bits = ([f"mikir ≈{think:,}".replace(",", ".")] if think else []) + \
+                       [f"tulis ≈{out:,}".replace(",", ".") + (f" / {limit:,}".replace(",", ".") if limit else "") + " token"]
+                phase(f"{label} {' · '.join(bits)}")
+            return on_delta
 
         def measure(self, chat_id, tools):
             c = self.prompt.ctx(chat_id)
@@ -3961,8 +3980,10 @@ def _(TXT, re, threading, time):
             return self.llm.tokenize(msgs, tools, self.prompt.kwargs(c))
 
         def maybe(self, chat_id, tools, toolbox, phase=lambda m: None, force=False, threshold=None, last_used=0,
-                  pending_estimate=0):
-            """Compact when the prompt passes the threshold (or always with force). Returns the token count after."""
+                  pending_estimate=0, clear_cancel=True):
+            """Compact when the prompt passes the threshold (or always with force). Returns the token count after.
+            clear_cancel: a run started by the player resets the cancel flag once it holds the lock; the idle run
+            leaves it alone, so a message sent meanwhile still stops it."""
             maxc = self.llm.max_context()
             if not maxc:
                 return 0
@@ -3974,6 +3995,14 @@ def _(TXT, re, threading, time):
             used = self.measure(chat_id, tools) + pending_estimate
             if not force and used < threshold * maxc:
                 return used
+            with self.lock:
+                if clear_cancel:
+                    self.cancel.clear()
+                elif self.cancel.is_set():
+                    return used
+                return self._compact(chat_id, tools, toolbox, phase, force, maxc, pending_estimate, used)
+
+        def _compact(self, chat_id, tools, toolbox, phase, force, maxc, pending_estimate, used):
             path = self.store.path(chat_id)
             ids = [m["id"] for m in path]
             users = [i for i, m in enumerate(path) if m["role"] == "user" and not m["ooc"]]
@@ -3996,16 +4025,22 @@ def _(TXT, re, threading, time):
             cutoff = users_after[-self.KEEP_USER_TURNS] - 1
             if cutoff <= done_pos:
                 return used
-            self.cancel.clear()
-            phase(f"Menyimpan memory sebelum memadatkan pesan {done_pos + 2}–{cutoff + 1}…")
-            self.flush(chat_id, path[:cutoff + 1], toolbox, done_pos + 2, cutoff + 1)
+            label = f"Menyimpan memory sebelum memadatkan pesan {done_pos + 2}–{cutoff + 1}…"
+            phase(label)
+            self.flush(chat_id, path[:cutoff + 1], toolbox, done_pos + 2, cutoff + 1, self.progress(phase, label))
+            if self.cancel.is_set():
+                return used
             budget = min(32768, max(4096, maxc // 16))
             think = 12000 if self.prompt.kwargs(self.prompt.ctx(chat_id)).get("enable_thinking", True) else 0
+            done_any = False
             for a, b in self.chunks(path, done_pos + 1, cutoff):
                 if self.cancel.is_set():
                     break
-                phase(f"Meringkas pesan {a + 1}–{b + 1}…")
-                text = self.summarize(chat_id, path, a, b, budget, think, tools)
+                label = f"Meringkas pesan {a + 1}–{b + 1}…"
+                phase(label)
+                text = self.summarize(chat_id, path, a, b, budget, think, tools, self.progress(phase, label, budget))
+                if text is None:  # cancelled: what is already summarized stays, this piece is redone next time
+                    break
                 if not text:
                     raise RuntimeError(f"Ringkasan pesan {a + 1}–{b + 1} kosong. Compaction dihentikan; tidak ada yang dihapus.")
                 text = self.entity_check(chat_id, path[a:b + 1], text)
@@ -4016,8 +4051,11 @@ def _(TXT, re, threading, time):
                     mctx = self.mem.ctx_of(chat_id)
                     self.mem.save(f"[Inti {chat['title']}, pesan {a + 1}–{b + 1}] {core}",
                                   "story" if mctx.get("story_id") else "chat", mctx, kind="summary_core")
-            self.condense(chat_id, ids, maxc, tools, phase)
-            self.prompt.new_epoch(chat_id)
+                done_any = True
+            if not self.cancel.is_set():
+                self.condense(chat_id, ids, maxc, tools, phase)
+            if done_any:
+                self.prompt.new_epoch(chat_id)
             return self.measure(chat_id, tools)
 
         def chunks(self, path, start, end):
@@ -4033,7 +4071,7 @@ def _(TXT, re, threading, time):
                 out.append((a, end))
             return out
 
-        def flush(self, chat_id, path, toolbox, a, b):
+        def flush(self, chat_id, path, toolbox, a, b, on_delta=None):
             msgs = self.prompt.side(chat_id, FLUSH_INSTRUCTION.format(a=a, b=b), path=path)
             c = self.prompt.ctx(chat_id)
             head = path[-1]["id"] if path else None
@@ -4041,7 +4079,9 @@ def _(TXT, re, threading, time):
             tools = [t for t in toolbox.specs(c) if t["function"]["name"] in allowed]
             for _ in range(4):
                 acc = self.llm.chat(msgs, tools=tools, kwargs=self.prompt.kwargs(c), sampling={"temperature": 0.6},
-                                    max_tokens=8000)
+                                    max_tokens=8000, stop=self.cancel, on_delta=on_delta)
+                if self.cancel.is_set():
+                    return
                 calls = [v for _, v in sorted(acc["calls"].items())]
                 if not calls:
                     self.store.side_log("memory_flush", {"range": [a, b], "answer": acc["content"],
@@ -4056,15 +4096,21 @@ def _(TXT, re, threading, time):
                     res, _, _ = toolbox.call(chat_id, head, cl["name"], cl["arguments"])
                     msgs.append({"role": "tool", "tool_call_id": cl["id"] or f"f{i}", "content": res})
 
-        def summarize(self, chat_id, path, a, b, budget, think, tools):
+        def summarize(self, chat_id, path, a, b, budget, think, tools, on_delta=None):
+            """The summary text; None when cancelled (a cut-off summary must never be stored as complete)."""
             anchors = "\n".join(f"{i + 1}: {path[i]['content'][:80].replace(chr(10), ' ')}"
                                 for i in range(a, b + 1) if path[i]["role"] == "user")
             instr = SUMMARY_INSTRUCTION.format(a=a + 1, b=b + 1, words=int(budget * 0.55), anchors=anchors[:6000])
             msgs = self.prompt.side(chat_id, instr, path=path[:b + 1])
             c = self.prompt.ctx(chat_id)
             acc = self.llm.complete(msgs, kwargs=self.prompt.kwargs(c), sampling={"temperature": 0.6, "top_p": 0.95},
-                                    max_tokens=budget + think, tools=tools, stop=self.cancel)
-            return (acc["content"] or "").strip()
+                                    max_tokens=budget + think, tools=tools, stop=self.cancel, on_delta=on_delta)
+            if acc["finish"] == "stopped" or self.cancel.is_set():
+                return None
+            text = (acc["content"] or "").strip()
+            if text and acc["finish"] == "length":
+                text += "\n\n(Ringkasan ini terpotong karena batas token; detail akhir potongan ada di summary_read/history_read.)"
+            return text
 
         @staticmethod
         def core_of(text):
@@ -4094,13 +4140,16 @@ def _(TXT, re, threading, time):
             if total <= self.CHRONICLE_SHARE * maxc or len(chunks) < 3:
                 return
             old = chunks[:max(2, len(chunks) // 2)]
-            phase(f"Memadatkan {len(old)} ringkasan lama menjadi satu era…")
+            label = f"Memadatkan {len(old)} ringkasan lama menjadi satu era…"
+            phase(label)
             msgs = self.prompt.side(chat_id, ERA_INSTRUCTION.format(texts="\n\n".join(s["text"] for s in old)))
             c = self.prompt.ctx(chat_id)
+            limit = min(32768, maxc // 16)
             acc = self.llm.complete(msgs, kwargs=self.prompt.kwargs(c), sampling={"temperature": 0.6},
-                                    max_tokens=min(32768, maxc // 16) + 12000, tools=tools)
+                                    max_tokens=limit + 12000, tools=tools, stop=self.cancel,
+                                    on_delta=self.progress(phase, label, limit))
             text = (acc["content"] or "").strip()
-            if not text:
+            if not text or acc["finish"] == "stopped" or self.cancel.is_set():
                 return
             self.store.x("INSERT INTO summaries (chat_id, node_id, from_id, level, text, core, created) VALUES (?, ?, ?, 'era', ?, ?, ?)",
                          (chat_id, old[-1]["node_id"], old[0]["from_id"], f"[Era]\n{text}", self.core_of(text), time.time()))
@@ -4870,6 +4919,7 @@ def _(
 
 
     class Engine(EngineView):
+        IDLE_COMPACT_AT = 0.75
         def __init__(self, emit=None):
             self.store, self.prompt, self.llm, self.tools = STORE, PROMPT, LLM_CLIENT, TOOLS
             self.compactor = Compactor(STORE, PROMPT, LLM_CLIENT, MEM)
@@ -5107,7 +5157,7 @@ def _(
                 self.emit("live", live)
 
             used = self.compactor.maybe(chat_id, tools, self.tools, phase, last_used=self.last_used.get(chat_id, 0),
-                                        pending_estimate=pending_estimate)
+                                        pending_estimate=pending_estimate, clear_cancel=not self.stop.is_set())
             if used:
                 self.last_used[chat_id] = used
             phase("")
@@ -5128,7 +5178,7 @@ def _(
                     if _round:
                         # Many rounds of tool results can fill the context: compact older history between rounds too.
                         used = self.compactor.maybe(chat_id, tools, self.tools, phase,
-                                                    last_used=self.last_used.get(chat_id, 0))
+                                                    last_used=self.last_used.get(chat_id, 0), clear_cancel=not self.stop.is_set())
                         if used:
                             self.last_used[chat_id] = used
                         phase("")
@@ -5638,11 +5688,19 @@ def _(
                 idle = time.time() - self.last_activity
                 maxc = self.llm.max_context()
                 used = self.last_used.get(chat_id, 0)
-                if maxc and used > 0.8 * maxc and idle > 60 and not self.busy:
-                    self.emit("status", "Compaction saat diam…")
+                if maxc and used > self.IDLE_COMPACT_AT * maxc and idle > 60 and not self.busy:
+                    # Runs while the player is away, so a turn rarely has to wait for it (a turn compacts at 90%).
+                    # Sending a message cancels it; finished pieces stay, the rest is done later.
+                    note = " (kirim pesan untuk membatalkan; bagian yang selesai tetap tersimpan)"
+                    # run() marks the engine busy before it sets the cancel flag: clear first, then look at busy.
+                    self.compactor.cancel.clear()
+                    if self.busy:
+                        return
+                    self.emit("status", "Compaction saat diam…" + note)
                     c = self.prompt.ctx(chat_id)
                     self.last_used[chat_id] = self.compactor.maybe(chat_id, self.tools.specs(c), self.tools,
-                                                                   lambda m: self.emit("status", m), force=False, threshold=0.8)
+                                                                   lambda m: self.emit("status", m + note), force=False,
+                                                                   threshold=self.IDLE_COMPACT_AT, clear_cancel=False)
                     self.emit("status", "")
                     self.emit("history", chat_id)
                 if chat["kind"] in ("rp", "group"):

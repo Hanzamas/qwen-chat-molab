@@ -367,3 +367,43 @@ def test_scenario_card_from_studio_is_readable(engine, nb):
     assert nb["WORLD"].start_time({"scenario": card}).strftime("%Y-%m-%d %H:%M") == "2026-11-01 07:30"
     drafts = nb["STORE"].chat(chat)["settings"]["studio"]["drafts"]
     assert drafts["scenario"] == sid
+
+
+def test_compaction_progress_and_clean_cancel(engine, nb, fake):
+    import threading as _th
+    eng = engine
+    chat, _ = _story(nb, eng)
+    for i in range(5):
+        eng.send(chat, f"giliran {i}")
+        wait_idle(eng)
+    comp, S = eng.compactor, nb["STORE"]
+    path = S.path(chat)
+    tools = nb["TOOLS"].specs(nb["PROMPT"].ctx(chat))
+    comp.cancel.clear()  # every send sets it (it stops a running idle compaction)
+    # progress lines while the model writes
+    seen = []
+    text = comp.summarize(chat, path, 0, len(path) - 1, 4096, 0, tools, comp.progress(seen.append, "Meringkas…", 4096))
+    assert text and "## Inti" in text
+    cb = comp.progress(seen.append, "Meringkas…", 4096)
+    cb({"reasoning": "x" * 700, "content": "y" * 3500})
+    assert seen[-1] == "Meringkas… mikir ≈200 · tulis ≈1.000 / 4.096 token"
+    # a cancelled summary is never stored as if it were complete
+    comp.cancel.set()
+    try:
+        assert comp.summarize(chat, path, 0, len(path) - 1, 4096, 0, tools) is None
+    finally:
+        comp.cancel.clear()
+    # compaction runs one at a time
+    assert comp.lock.acquire(timeout=1)
+    got = []
+    t = _th.Thread(target=lambda: got.append(comp.maybe(chat, tools, nb["TOOLS"], force=True, clear_cancel=False)))
+    t.start()
+    t.join(0.5)
+    assert t.is_alive() and not got  # waits for the lock
+    comp.cancel.set()  # the waiting run starts after the lock is freed and stops right away when cancelled
+    comp.lock.release()
+    t.join(30)
+    assert not t.is_alive()
+    comp.cancel.clear()
+    before = S.q("SELECT COUNT(*) AS n FROM summaries WHERE chat_id = ?", (chat,))[0]["n"]
+    assert before == 0  # nothing half-written was stored
