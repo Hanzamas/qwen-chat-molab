@@ -20,7 +20,8 @@ di giliran ini:
 - perubahan status pemain dan tokoh: makan/minum/tidur (statistik), luka, barang berpindah tangan, lokasi, pakaian,
   keadaan (status_update);
 - apa yang disaksikan atau didengar tokoh yang hadir, termasuk tokoh pemain (knowledge_add), dan apa yang diceritakan
-  antar tokoh (tell).
+  antar tokoh (tell);
+- janji, janji temu, utang, atau misteri baru (thread_open), dan benang yang selesai (thread_close).
 Sudah tercatat di giliran ini:
 {done}
 Jangan mengulang yang sudah tercatat dan jangan menebak hal yang tidak ada di narasi. Kalau tidak ada yang perlu dicatat,
@@ -676,7 +677,7 @@ class Engine(EngineView):
                     fn = tc.get("function") or {}
                     done_lines.append(f"- {fn.get('name')}: {(fn.get('arguments') or '')[:300]}")
                     advanced = advanced or fn.get("name") == "world_advance"
-        names = {"world_advance", "status_update", "knowledge_add", "tell", "world_event"}
+        names = {"world_advance", "status_update", "knowledge_add", "tell", "world_event", "thread_open", "thread_close"}
         tools = [t for t in self.tools.specs(c) if t["function"]["name"] in names]
         kw = {k: v for k, v in self.prompt.kwargs(c).items() if k != "reasoning_effort"}
         kw["enable_thinking"] = False
@@ -1060,10 +1061,14 @@ class Engine(EngineView):
 
     def _tick(self, chat_id, t0, minutes, why, head=None, stop=None):
         c = self.prompt.ctx(chat_id)
-        allowed = {"world_event", "status_update", "roll", "tell", "knowledge_add"}
+        allowed = {"world_event", "status_update", "roll", "tell", "knowledge_add", "thread_close", "thread_open"}
         tools = [t for t in self.tools.specs(c) if t["function"]["name"] in allowed]
         t1 = t0 + timedelta(minutes=minutes)
         instr = TICK_INSTRUCTION.format(span=World.fmt_span(minutes), t0=World.fmt_time(t0), t1=World.fmt_time(t1), why=why)
+        due = [r for r in THREADS.list(chat_id, now=t1) if r["overdue"]]
+        if due:
+            instr += ("\nBenang cerita yang lewat tenggat selama itu (tentukan akibatnya dengan world_event; thread_close kalau "
+                      "sudah berakhir):\n" + "\n".join(THREADS.line(r) for r in due[:8]))
         msgs = self.prompt.side(chat_id, instr)
         head = head or self.store.chat(chat_id)["head_id"]
         for _ in range(3):

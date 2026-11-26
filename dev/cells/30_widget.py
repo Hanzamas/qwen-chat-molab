@@ -536,6 +536,26 @@ class ChatApp:
         KNOW.forget(int(kid))
         self.c_knowledge(holder)
 
+    # story threads
+    def c_threads(self):
+        cid = self._cur()
+        if not cid:
+            return
+        st = WORLD.state(cid, STORE.path_ids(cid))
+        rows = THREADS.list(cid, now=st["time"], include_closed=True)
+        self.w.aux = {"n": time.time(), "kind": "threads", "data": {"rows": rows, "kinds": list(Threads.KINDS)}}
+
+    def c_thread_add(self, kind, title, due="", who=""):
+        cid = self._cur()
+        st = WORLD.state(cid, STORE.path_ids(cid))
+        THREADS.open(cid, STORE.chat(cid)["head_id"], kind, title, "", who, due, st["time_text"])
+        self.c_threads()
+
+    def c_thread_close(self, tid, status):
+        cid = self._cur()
+        THREADS.close(cid, STORE.chat(cid)["head_id"], int(tid), status)
+        self.c_threads()
+
     # story
     def c_canon(self, section, text):
         sid = (self.w.story or {}).get("id")

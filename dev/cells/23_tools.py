@@ -49,6 +49,12 @@ TOOL_RP = [
          "kind": {"type": "string", "enum": list(Knowledge.KINDS)},
          "source": {"type": "string", "enum": list(Knowledge.SOURCES)}, "from": _S,
          "truth": {"type": "string", "enum": list(Knowledge.TRUTH)}, "importance": _N}, ["who", "text"]),
+    _fn("thread_open", "Open a story thread to keep track of: a promise, an appointment (with due time), a mystery, a clue, a "
+        "debt, a grudge, a plan. due: 'YYYY-MM-DD HH:MM' world time, optional.",
+        {"kind": {"type": "string", "enum": list(Threads.KINDS)}, "title": _S, "text": _S,
+         "who": {"type": "array", "items": _S}, "due": _S}, ["kind", "title"]),
+    _fn("thread_close", "Close a story thread when it is resolved, failed or dropped.",
+        {"id": _I, "status": {"type": "string", "enum": list(Threads.CLOSED)}, "note": _S}, ["id", "status"]),
     _fn("tell", "A character tells others something (true or a lie). It lands in the listeners' memory.",
         {"from": _S, "to": {"type": "array", "items": _S}, "text": _S, "truthful": _B}, ["from", "to", "text"]),
     _fn("canon_set", "Write a section of the story book (what is true now in this story). Empty text removes it.",
@@ -301,6 +307,17 @@ class ToolBox:
         ids = KNOW.add(chat_id, mid, holders, text, kind, source, kw.get("from") or kw.get("start") or "", truth, importance,
                        st["time_text"])
         return {"saved": ids, "who": holders}
+
+    def t_thread_open(self, chat_id, mid, kind, title, text="", who=None, due=""):
+        st = self.world.state(chat_id, self.store.path_ids(chat_id))
+        tid = THREADS.open(chat_id, mid, kind, title, text, self._holders(chat_id, who or []) or (who or ""), due, st["time_text"])
+        return {"opened": tid}
+
+    def t_thread_close(self, chat_id, mid, id, status="selesai", note=""):
+        if not any(r["id"] == int(id) for r in THREADS.list(chat_id, include_closed=True)):
+            return {"error": f"benang #{id} tidak ada di cerita ini"}
+        THREADS.close(chat_id, mid, int(id), status, note)
+        return {"closed": int(id), "status": status}
 
     def t_tell(self, chat_id, mid, text, to, truthful=True, **kw):
         speaker = self._holder(chat_id, kw.get("from") or kw.get("start") or "")

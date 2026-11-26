@@ -792,3 +792,36 @@ def test_continuity_check_flags_and_strict_rewrites(engine, nb, fake):
     wait_idle(engine, 60)
     last = engine.display(chat)["items"][-1]
     assert last["content"].startswith("Lotte menatapmu") and last["swipe"] == [2, 2]
+
+
+def test_story_threads_with_deadlines(engine, nb, fake):
+    chat, _ = _story(nb, engine)
+    S, T, P, TH = nb["STORE"], nb["TOOLS"], nb["PROMPT"], nb["THREADS"]
+    engine.send(chat, "Halo.")
+    wait_idle(engine)
+    head = S.chat(chat)["head_id"]
+    res, failed, _ = T.call(chat, head, "thread_open", json.dumps(
+        {"kind": "janji temu", "title": "Bertemu Lotte di Odeonsplatz", "who": ["Lotte"], "due": "19 Desember 2026, 21:30"}))
+    assert not failed, res
+    tid = json.loads(res)["opened"]
+    T.call(chat, head, "thread_open", json.dumps({"kind": "utang", "title": "Utang 20 euro ke Otto"}))
+    note, _ = P.ephemeral(chat, S.path(chat), "Aku menunggu.")
+    assert "Benang cerita terbuka" in note and "Bertemu Lotte di Odeonsplatz" in note and "Lotte Braun" in note
+    nb["WORLD"].advance(chat, head, 120, "uji")
+    rows = TH.list(chat, now=nb["WORLD"].state(chat, S.path_ids(chat))["time"])
+    assert rows[0]["id"] == tid and rows[0]["overdue"]
+    note, _ = P.ephemeral(chat, S.path(chat), "Aku menunggu.")
+    assert "LEWAT TENGGAT" in note
+    res, failed, _ = T.call(chat, head, "thread_close", json.dumps({"id": tid, "status": "gagal", "note": "tidak datang"}))
+    assert not failed
+    assert all(r["id"] != tid for r in TH.list(chat))
+    # the world tick sees overdue threads
+    tid2 = TH.open(chat, head, "janji temu", "Makan malam dengan Otto", due="2026-12-19 22:00")
+    n0 = len(fake["log"])
+    t0 = nb["WORLD"].state(chat, S.path_ids(chat))["time"]
+    engine._tick(chat, t0, 240, "uji")
+    sent = json.dumps(fake["log"][n0]["messages"][-1], ensure_ascii=False)
+    assert "Makan malam dengan Otto" in sent and "lewat tenggat" in sent
+    # another branch does not have these threads
+    S.set_head(chat, S.path(chat)[0]["id"])
+    assert all(r["id"] not in (tid, tid2) for r in TH.list(chat, include_closed=True))

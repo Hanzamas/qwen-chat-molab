@@ -535,6 +535,20 @@ function render({ model, el }) {
       <textarea data-system rows="5" placeholder="Biasanya kosong; prompt dirakit dari kartu.">${esc(c.system || "")}</textarea>
       <button class="qr-btn qr-sm" data-act="save-system">Simpan</button></details>`;
   }
+  function threadsHTML() {
+    const t = state.threads;
+    if (!t) { send("threads"); return '<div class="qr-muted">Memuat…</div>'; }
+    const row = (r) => `<div class="qr-memrow" data-tid="${r.id}"><span class="qr-badge">${esc(r.kind)}</span>${r.overdue ? '<span class="qr-badge warn">lewat tenggat</span>' : r.due_soon ? '<span class="qr-badge">sebentar lagi</span>' : ""}
+      <span><b>${esc(r.title)}</b>${r.who ? ` <span class="qr-muted">${esc(r.who)}</span>` : ""}${r.due ? ` <span class="qr-muted">· tenggat ${esc(r.due)}</span>` : ""}${r.text ? `<br><span class="qr-muted">${esc(r.text)}</span>` : ""}</span>
+      ${r.status === "terbuka" ? `<button class="qr-btn qr-sm" data-act="thread-close" data-status="selesai">Selesai</button><button class="qr-btn qr-sm" data-act="thread-close" data-status="batal">Batal</button>`
+        : `<span class="qr-muted">${esc(r.status)}</span>`}</div>`;
+    const open = t.rows.filter((r) => r.status === "terbuka"), closed = t.rows.filter((r) => r.status !== "terbuka");
+    return `${open.map(row).join("") || '<div class="qr-muted">Tidak ada benang terbuka.</div>'}
+      ${closed.length ? `<details><summary class="qr-muted">Sudah ditutup (${closed.length})</summary>${closed.map(row).join("")}</details>` : ""}
+      <div class="qr-row"><select class="qr-thread-kind">${t.kinds.map((k) => `<option>${esc(k)}</option>`).join("")}</select>
+        <input class="qr-thread-title" placeholder="Benang baru"><input class="qr-thread-due" placeholder="tenggat YYYY-MM-DD HH:MM (opsional)">
+        <button class="qr-btn qr-sm" data-act="thread-add">${icon("plus")}Tambah</button></div>`;
+  }
   function knowHTML() {
     const k = state.know;
     if (!k) { send("knowledge", { holder: "" }); return '<div class="qr-muted">Memuat…</div>'; }
@@ -565,6 +579,7 @@ function render({ model, el }) {
       <section><h4>Buku cerita</h4>${Object.entries(st.canon || {}).map(([k, v]) => `<div class="qr-canon" data-sec="${esc(k)}"><b>${esc(k)}</b><textarea rows="3">${esc(v)}</textarea>
         <button class="qr-btn qr-sm" data-act="canon-save">Simpan</button></div>`).join("")}
         <div class="qr-canon" data-sec=""><input class="qr-canon-new" placeholder="Bagian baru, misalnya: Alur terbuka"><textarea rows="2"></textarea><button class="qr-btn qr-sm" data-act="canon-save">${icon("plus")}Tambah</button></div></section>
+      <section><h4>Benang cerita</h4><div class="qr-threads">${threadsHTML()}</div></section>
       <section><h4>Ingatan tokoh</h4><div class="qr-help">Yang diketahui atau diyakini tiap tokoh di chat ini (cabang aktif). Tokoh hanya bertindak berdasarkan ini.</div>
         <div class="qr-know">${knowHTML()}</div></section>
       <section><h4>Jangan pernah lupa</h4><textarea class="qr-nf" rows="4" placeholder="Satu fakta per baris">${esc((st.never_forget || []).join("\n"))}</textarea>
@@ -866,6 +881,9 @@ function render({ model, el }) {
       case "attach-card": { const cid = dbody.querySelector(".qr-attach-card").value; if (cid) send("story_attach", { card_id: Number(cid), role: dbody.querySelector(".qr-attach-role").value }); break; }
       case "detach": send("story_detach", { card_id: id, role: btn.dataset.role }); break;
       case "canon-save": { const box = btn.closest(".qr-canon"); const sec = box.dataset.sec || box.querySelector(".qr-canon-new").value.trim(); if (sec) send("canon", { section: sec, text: box.querySelector("textarea").value }); break; }
+      case "thread-add": { const box = btn.closest(".qr-threads"), title = box.querySelector(".qr-thread-title").value.trim();
+        if (title) send("thread_add", { kind: box.querySelector(".qr-thread-kind").value, title, due: box.querySelector(".qr-thread-due").value.trim() }); break; }
+      case "thread-close": send("thread_close", { tid: Number(btn.closest("[data-tid]").dataset.tid), status: btn.dataset.status }); break;
       case "know-add": { const box = btn.closest(".qr-know"), t = box.querySelector(".qr-know-new").value.trim();
         if (t) send("knowledge_add", { holder: state.know.holder, text: t, kind: box.querySelector(".qr-know-kind").value }); break; }
       case "know-save": { const row = btn.closest("[data-kid]");
@@ -909,7 +927,12 @@ function render({ model, el }) {
     const a = model.get("aux") || {};
     if (!a.kind) return;
     const d = a.data;
-    if (a.kind === "knowledge") {
+    if (a.kind === "threads") {
+      state.threads = d;
+      const box = dbody.querySelector(".qr-threads"), f = rootActive();
+      if (state.tab === "story" && box && !(f && box.contains(f) && f.tagName === "INPUT")) box.innerHTML = threadsHTML();
+    }
+    else if (a.kind === "knowledge") {
       state.know = d;
       const box = dbody.querySelector(".qr-know"), f = rootActive();
       if (state.tab === "story" && box && !(f && box.contains(f) && f.tagName === "INPUT")) box.innerHTML = knowHTML();
@@ -975,7 +998,7 @@ function render({ model, el }) {
     const c = get("chat");
     const learn = !!((c.settings || {}).learn);
     if (learn !== state.learn) { state.learn = learn; el.classList.toggle("learn", learn); els.clear(); list.innerHTML = ""; }
-    if (state.lastChat !== c.id) { state.lastChat = c.id; state.studioCard = null; state.imageIntent = false; state.know = null; els.clear(); list.innerHTML = ""; fol.jump(); }
+    if (state.lastChat !== c.id) { state.lastChat = c.id; state.studioCard = null; state.imageIntent = false; state.know = null; state.threads = null; els.clear(); list.innerHTML = ""; fol.jump(); }
     renderTop(); renderChats(); renderStudio(); renderDrawer(); renderHistory();
   };
   const onCard = () => {
@@ -1017,6 +1040,7 @@ function render({ model, el }) {
       if (drawer.hidden) return;
       if (state.tab === "memory") send("memory", { q: (state.memory || {}).q || "" });
       if (state.tab === "story" && state.know) send("knowledge", { holder: state.know.holder });
+      if (state.tab === "story" && state.threads) send("threads");
     },
     "change:aux": onAux, "change:notice": onNotice, "change:export": onExport, "change:compose": onCompose, "change:boot": renderDrawer,
   };

@@ -157,6 +157,17 @@ CREATE TABLE IF NOT EXISTS canon_log (
     text TEXT NOT NULL DEFAULT '', created REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS canon_log_story ON canon_log (story_id);
+CREATE TABLE IF NOT EXISTS threads (
+    id INTEGER PRIMARY KEY, story_id INTEGER, chat_id INTEGER NOT NULL, message_id INTEGER, kind TEXT NOT NULL DEFAULT 'misteri',
+    title TEXT NOT NULL, text TEXT NOT NULL DEFAULT '', who TEXT NOT NULL DEFAULT '', due TEXT NOT NULL DEFAULT '',
+    opened_at TEXT NOT NULL DEFAULT '', created REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS threads_chat ON threads (chat_id);
+CREATE TABLE IF NOT EXISTS thread_events (
+    id INTEGER PRIMARY KEY, thread_id INTEGER NOT NULL, chat_id INTEGER, message_id INTEGER, status TEXT NOT NULL,
+    note TEXT NOT NULL DEFAULT '', created REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS thread_events_thread ON thread_events (thread_id);
 CREATE TABLE IF NOT EXISTS knowledge (
     id INTEGER PRIMARY KEY, chat_id INTEGER NOT NULL, message_id INTEGER, holder TEXT NOT NULL, text TEXT NOT NULL,
     kind TEXT NOT NULL DEFAULT 'fakta', source TEXT NOT NULL DEFAULT 'lihat sendiri', source_who TEXT NOT NULL DEFAULT '',

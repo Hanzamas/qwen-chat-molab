@@ -1107,6 +1107,17 @@ def _(CFG, Path, json, os, sqlite3, threading, time):
         text TEXT NOT NULL DEFAULT '', created REAL NOT NULL
     );
     CREATE INDEX IF NOT EXISTS canon_log_story ON canon_log (story_id);
+    CREATE TABLE IF NOT EXISTS threads (
+        id INTEGER PRIMARY KEY, story_id INTEGER, chat_id INTEGER NOT NULL, message_id INTEGER, kind TEXT NOT NULL DEFAULT 'misteri',
+        title TEXT NOT NULL, text TEXT NOT NULL DEFAULT '', who TEXT NOT NULL DEFAULT '', due TEXT NOT NULL DEFAULT '',
+        opened_at TEXT NOT NULL DEFAULT '', created REAL NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS threads_chat ON threads (chat_id);
+    CREATE TABLE IF NOT EXISTS thread_events (
+        id INTEGER PRIMARY KEY, thread_id INTEGER NOT NULL, chat_id INTEGER, message_id INTEGER, status TEXT NOT NULL,
+        note TEXT NOT NULL DEFAULT '', created REAL NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS thread_events_thread ON thread_events (thread_id);
     CREATE TABLE IF NOT EXISTS knowledge (
         id INTEGER PRIMARY KEY, chat_id INTEGER NOT NULL, message_id INTEGER, holder TEXT NOT NULL, text TEXT NOT NULL,
         kind TEXT NOT NULL DEFAULT 'fakta', source TEXT NOT NULL DEFAULT 'lihat sendiri', source_who TEXT NOT NULL DEFAULT '',
@@ -3031,8 +3042,73 @@ def _(
                              [int(message_id) if message_id and int(message_id) != 1 else 2] + list(ids))
 
 
+    class Threads:
+        """Open story threads on the active branch: promises, mysteries, clues, debts, grudges, appointments.
+        A thread can have a deadline on the world clock; overdue ones are pointed out to the GM and the world tick."""
+
+        KINDS = ("janji", "janji temu", "misteri", "petunjuk", "utang", "dendam", "rencana", "lain")
+        CLOSED = ("selesai", "gagal", "batal")
+
+        def __init__(self, store):
+            self.store = store
+
+        def open(self, chat_id, message_id, kind, title, text="", who="", due="", opened_at=""):
+            title = (title or "").strip()
+            if not title:
+                raise ValueError("judul kosong")
+            kind = kind if kind in self.KINDS else "lain"
+            due_dt = TXT.parse_datetime(due) if due else None
+            if due and not due_dt:
+                raise ValueError("tenggat harus YYYY-MM-DD HH:MM")
+            chat = self.store.chat(chat_id) or {}
+            who = ", ".join(who) if isinstance(who, list) else str(who or "")
+            return self.store.x("INSERT INTO threads (story_id, chat_id, message_id, kind, title, text, who, due, opened_at, created) "
+                                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                                (chat.get("story_id"), chat_id, message_id, kind, title[:200], (text or "")[:1500], who[:300],
+                                 due_dt.strftime("%Y-%m-%d %H:%M") if due_dt else "", str(opened_at or ""), time.time()))
+
+        def close(self, chat_id, message_id, thread_id, status="selesai", note=""):
+            status = status if status in self.CLOSED + ("terbuka",) else "selesai"
+            self.store.x("INSERT INTO thread_events (thread_id, chat_id, message_id, status, note, created) VALUES (?, ?, ?, ?, ?, ?)",
+                         (int(thread_id), chat_id, message_id, status, (note or "")[:500], time.time()))
+
+        def list(self, chat_id, now=None, include_closed=False):
+            """Threads visible on this branch with their current status; overdue ones flagged and first."""
+            chats = self.store.lineage(chat_id)
+            if not chats:
+                return []
+            vis = self.store.visible_ids(chat_id)
+            marks = ",".join("?" * len(chats))
+            rows = [r for r in self.store.q(f"SELECT * FROM threads WHERE chat_id IN ({marks}) ORDER BY id", list(chats))
+                    if not r["message_id"] or r["message_id"] in vis]
+            events = {}
+            for e in self.store.q(f"SELECT * FROM thread_events WHERE chat_id IN ({marks}) ORDER BY id", list(chats)):
+                if not e["message_id"] or e["message_id"] in vis:
+                    events[e["thread_id"]] = e
+            out = []
+            for r in rows:
+                e = events.get(r["id"])
+                r["status"] = e["status"] if e else "terbuka"
+                r["note"] = e["note"] if e else ""
+                due = TXT.parse_datetime(r["due"]) if r["due"] else None
+                r["overdue"] = bool(due and now and due <= now and r["status"] == "terbuka")
+                r["due_soon"] = bool(due and now and not r["overdue"] and (due - now).total_seconds() <= 3600)
+                if include_closed or r["status"] == "terbuka":
+                    out.append(r)
+            return sorted(out, key=lambda r: (not r["overdue"], not r["due_soon"], r["due"] or "9999", -r["id"]))
+
+        @staticmethod
+        def line(r):
+            bits = [r["who"]] if r["who"] else []
+            if r["due"]:
+                bits.append("tenggat " + r["due"] + (" (LEWAT TENGGAT)" if r["overdue"] else " (sebentar lagi)" if r["due_soon"] else ""))
+            return f"- #{r['id']} [{r['kind']}] {r['title']}{' (' + '; '.join(bits) + ')' if bits else ''}" + (
+                f": {r['text'][:200]}" if r["text"] else "")
+
+
+    THREADS = Threads(STORE)
     WORLD = World(STORE, CARDS, STORIES)
-    return WORLD, World
+    return THREADS, Threads, WORLD, World
 
 
 @app.cell(hide_code=True)
@@ -3983,6 +4059,7 @@ def _(
     STORIES,
     STUDIO_EPHEMERAL,
     STUDIO_SYSTEM,
+    THREADS,
     TXT,
     WORLD,
     base64,
@@ -4010,6 +4087,8 @@ def _(
     - Tiap tokoh (termasuk tokoh pemain) hanya tahu isi ingatannya di catatan sistem. Memory, buku cerita, dan lore adalah
       pengetahuan narator; jangan biarkan tokoh memakainya kalau tidak ada di ingatannya. Ingatan bertanda KELIRU dipercaya
       tokoh itu walaupun salah. Catat yang baru diketahui tokoh dengan knowledge_add atau tell.
+    - Benang cerita: catat janji, janji temu (dengan tenggat), misteri, petunjuk, utang, dendam, dan rencana dengan thread_open;
+      tutup dengan thread_close. Benang yang lewat tenggat harus punya akibat di dunia (orang menunggu, kesal, pergi).
     - Pesan pemain yang diawali [OOC] adalah percakapan di luar cerita: jawab di luar cerita, singkat, tanpa memerankan tokoh.
     - Bagian "Catatan sistem" di akhir pesan pemain dibuat sistem, bukan tulisan pemain. Pakai sebagai acuan, jangan dikutip.
     - Fakta dunia nyata yang spesifik dan tidak pasti: cek fact_lookup, lalu wiki_search/web_search. Simpan temuan dengan fact_save.
@@ -4256,6 +4335,9 @@ def _(
             if news:
                 lines.append("Kejadian yang kini bisa diketahui pemain:\n" + "\n".join(f"- [{e['world_time']}] {e['text']}" for e in news))
                 used["events"] = [e["id"] for e in news]
+            threads = THREADS.list(chat_id, now=st["time"])
+            if threads:
+                lines.append("Benang cerita terbuka:\n" + "\n".join(THREADS.line(r) for r in threads[:10]))
             pend = self.stories.pending_list((c["story"] or {}).get("id"), chat_id)
             if pend:
                 lines.append("Perubahan sejak prompt dibekukan (berlaku sekarang):\n" + "\n".join(f"- {p['text']}" for p in pend))
@@ -4431,7 +4513,8 @@ def _(TXT, re, threading, time):
     FLUSH_INSTRUCTION = """Pesan {a} sampai {b} akan dipadatkan menjadi ringkasan. Sebelum itu, simpan yang masih perlu diingat:
     perbarui buku cerita (canon_set), simpan atau perbarui memory penting (memory_save / memory_update, lingkup yang tepat), catat
     status tokoh yang belum tercatat (status_update), dan catat siapa tahu apa yang belum tercatat: apa yang disaksikan, diceritakan,
-    atau disalahpahami tiap tokoh (knowledge_add / tell). Panggil tool yang perlu, lalu jawab "selesai". Jangan menulis cerita."""
+    atau disalahpahami tiap tokoh (knowledge_add / tell), serta janji, utang, misteri, dan janji temu yang masih terbuka
+    (thread_open; thread_close untuk yang sudah selesai). Panggil tool yang perlu, lalu jawab "selesai". Jangan menulis cerita."""
 
     ERA_INSTRUCTION = """Padatkan ringkasan-ringkasan kronik lama berikut menjadi SATU ringkasan era, sekitar sepertiga panjangnya.
     Pertahankan format (## Inti, ## Tujuan dan preferensi, ## Tokoh dan status, ## Kronologi, ## Fakta, angka, nama,
@@ -4571,7 +4654,7 @@ def _(TXT, re, threading, time):
             c = self.prompt.ctx(chat_id)
             head = path[-1]["id"] if path else None
             allowed = {"canon_set", "memory_save", "memory_update", "memory_forget", "status_update", "fact_save", "world_event",
-                       "knowledge_add", "tell"}
+                       "knowledge_add", "tell", "thread_open", "thread_close"}
             tools = [t for t in toolbox.specs(c) if t["function"]["name"] in allowed]
             for _ in range(4):
                 acc = self.llm.chat(msgs, tools=tools, kwargs=self.prompt.kwargs(c), sampling={"temperature": 0.6},
@@ -4665,7 +4748,9 @@ def _(
     Memory,
     STORE,
     STORIES,
+    THREADS,
     TXT,
+    Threads,
     WEB,
     WORLD,
     World,
@@ -4723,6 +4808,12 @@ def _(
              "kind": {"type": "string", "enum": list(Knowledge.KINDS)},
              "source": {"type": "string", "enum": list(Knowledge.SOURCES)}, "from": _S,
              "truth": {"type": "string", "enum": list(Knowledge.TRUTH)}, "importance": _N}, ["who", "text"]),
+        _fn("thread_open", "Open a story thread to keep track of: a promise, an appointment (with due time), a mystery, a clue, a "
+            "debt, a grudge, a plan. due: 'YYYY-MM-DD HH:MM' world time, optional.",
+            {"kind": {"type": "string", "enum": list(Threads.KINDS)}, "title": _S, "text": _S,
+             "who": {"type": "array", "items": _S}, "due": _S}, ["kind", "title"]),
+        _fn("thread_close", "Close a story thread when it is resolved, failed or dropped.",
+            {"id": _I, "status": {"type": "string", "enum": list(Threads.CLOSED)}, "note": _S}, ["id", "status"]),
         _fn("tell", "A character tells others something (true or a lie). It lands in the listeners' memory.",
             {"from": _S, "to": {"type": "array", "items": _S}, "text": _S, "truthful": _B}, ["from", "to", "text"]),
         _fn("canon_set", "Write a section of the story book (what is true now in this story). Empty text removes it.",
@@ -4975,6 +5066,17 @@ def _(
             ids = KNOW.add(chat_id, mid, holders, text, kind, source, kw.get("from") or kw.get("start") or "", truth, importance,
                            st["time_text"])
             return {"saved": ids, "who": holders}
+
+        def t_thread_open(self, chat_id, mid, kind, title, text="", who=None, due=""):
+            st = self.world.state(chat_id, self.store.path_ids(chat_id))
+            tid = THREADS.open(chat_id, mid, kind, title, text, self._holders(chat_id, who or []) or (who or ""), due, st["time_text"])
+            return {"opened": tid}
+
+        def t_thread_close(self, chat_id, mid, id, status="selesai", note=""):
+            if not any(r["id"] == int(id) for r in THREADS.list(chat_id, include_closed=True)):
+                return {"error": f"benang #{id} tidak ada di cerita ini"}
+            THREADS.close(chat_id, mid, int(id), status, note)
+            return {"closed": int(id), "status": status}
 
         def t_tell(self, chat_id, mid, text, to, truthful=True, **kw):
             speaker = self._holder(chat_id, kw.get("from") or kw.get("start") or "")
@@ -5485,6 +5587,7 @@ def _(
     STORE,
     STORIES,
     SimpleNamespace,
+    THREADS,
     TOOLS,
     TOOL_CARD_EDIT,
     TXT,
@@ -5523,7 +5626,8 @@ def _(
     - perubahan status pemain dan tokoh: makan/minum/tidur (statistik), luka, barang berpindah tangan, lokasi, pakaian,
       keadaan (status_update);
     - apa yang disaksikan atau didengar tokoh yang hadir, termasuk tokoh pemain (knowledge_add), dan apa yang diceritakan
-      antar tokoh (tell).
+      antar tokoh (tell);
+    - janji, janji temu, utang, atau misteri baru (thread_open), dan benang yang selesai (thread_close).
     Sudah tercatat di giliran ini:
     {done}
     Jangan mengulang yang sudah tercatat dan jangan menebak hal yang tidak ada di narasi. Kalau tidak ada yang perlu dicatat,
@@ -6179,7 +6283,7 @@ def _(
                         fn = tc.get("function") or {}
                         done_lines.append(f"- {fn.get('name')}: {(fn.get('arguments') or '')[:300]}")
                         advanced = advanced or fn.get("name") == "world_advance"
-            names = {"world_advance", "status_update", "knowledge_add", "tell", "world_event"}
+            names = {"world_advance", "status_update", "knowledge_add", "tell", "world_event", "thread_open", "thread_close"}
             tools = [t for t in self.tools.specs(c) if t["function"]["name"] in names]
             kw = {k: v for k, v in self.prompt.kwargs(c).items() if k != "reasoning_effort"}
             kw["enable_thinking"] = False
@@ -6563,10 +6667,14 @@ def _(
 
         def _tick(self, chat_id, t0, minutes, why, head=None, stop=None):
             c = self.prompt.ctx(chat_id)
-            allowed = {"world_event", "status_update", "roll", "tell", "knowledge_add"}
+            allowed = {"world_event", "status_update", "roll", "tell", "knowledge_add", "thread_close", "thread_open"}
             tools = [t for t in self.tools.specs(c) if t["function"]["name"] in allowed]
             t1 = t0 + timedelta(minutes=minutes)
             instr = TICK_INSTRUCTION.format(span=World.fmt_span(minutes), t0=World.fmt_time(t0), t1=World.fmt_time(t1), why=why)
+            due = [r for r in THREADS.list(chat_id, now=t1) if r["overdue"]]
+            if due:
+                instr += ("\nBenang cerita yang lewat tenggat selama itu (tentukan akibatnya dengan world_event; thread_close kalau "
+                          "sudah berakhir):\n" + "\n".join(THREADS.line(r) for r in due[:8]))
             msgs = self.prompt.side(chat_id, instr)
             head = head or self.store.chat(chat_id)["head_id"]
             for _ in range(3):
@@ -7530,6 +7638,20 @@ def _():
           <textarea data-system rows="5" placeholder="Biasanya kosong; prompt dirakit dari kartu.">${esc(c.system || "")}</textarea>
           <button class="qr-btn qr-sm" data-act="save-system">Simpan</button></details>`;
       }
+      function threadsHTML() {
+        const t = state.threads;
+        if (!t) { send("threads"); return '<div class="qr-muted">Memuat…</div>'; }
+        const row = (r) => `<div class="qr-memrow" data-tid="${r.id}"><span class="qr-badge">${esc(r.kind)}</span>${r.overdue ? '<span class="qr-badge warn">lewat tenggat</span>' : r.due_soon ? '<span class="qr-badge">sebentar lagi</span>' : ""}
+          <span><b>${esc(r.title)}</b>${r.who ? ` <span class="qr-muted">${esc(r.who)}</span>` : ""}${r.due ? ` <span class="qr-muted">· tenggat ${esc(r.due)}</span>` : ""}${r.text ? `<br><span class="qr-muted">${esc(r.text)}</span>` : ""}</span>
+          ${r.status === "terbuka" ? `<button class="qr-btn qr-sm" data-act="thread-close" data-status="selesai">Selesai</button><button class="qr-btn qr-sm" data-act="thread-close" data-status="batal">Batal</button>`
+            : `<span class="qr-muted">${esc(r.status)}</span>`}</div>`;
+        const open = t.rows.filter((r) => r.status === "terbuka"), closed = t.rows.filter((r) => r.status !== "terbuka");
+        return `${open.map(row).join("") || '<div class="qr-muted">Tidak ada benang terbuka.</div>'}
+          ${closed.length ? `<details><summary class="qr-muted">Sudah ditutup (${closed.length})</summary>${closed.map(row).join("")}</details>` : ""}
+          <div class="qr-row"><select class="qr-thread-kind">${t.kinds.map((k) => `<option>${esc(k)}</option>`).join("")}</select>
+            <input class="qr-thread-title" placeholder="Benang baru"><input class="qr-thread-due" placeholder="tenggat YYYY-MM-DD HH:MM (opsional)">
+            <button class="qr-btn qr-sm" data-act="thread-add">${icon("plus")}Tambah</button></div>`;
+      }
       function knowHTML() {
         const k = state.know;
         if (!k) { send("knowledge", { holder: "" }); return '<div class="qr-muted">Memuat…</div>'; }
@@ -7560,6 +7682,7 @@ def _():
           <section><h4>Buku cerita</h4>${Object.entries(st.canon || {}).map(([k, v]) => `<div class="qr-canon" data-sec="${esc(k)}"><b>${esc(k)}</b><textarea rows="3">${esc(v)}</textarea>
             <button class="qr-btn qr-sm" data-act="canon-save">Simpan</button></div>`).join("")}
             <div class="qr-canon" data-sec=""><input class="qr-canon-new" placeholder="Bagian baru, misalnya: Alur terbuka"><textarea rows="2"></textarea><button class="qr-btn qr-sm" data-act="canon-save">${icon("plus")}Tambah</button></div></section>
+          <section><h4>Benang cerita</h4><div class="qr-threads">${threadsHTML()}</div></section>
           <section><h4>Ingatan tokoh</h4><div class="qr-help">Yang diketahui atau diyakini tiap tokoh di chat ini (cabang aktif). Tokoh hanya bertindak berdasarkan ini.</div>
             <div class="qr-know">${knowHTML()}</div></section>
           <section><h4>Jangan pernah lupa</h4><textarea class="qr-nf" rows="4" placeholder="Satu fakta per baris">${esc((st.never_forget || []).join("\n"))}</textarea>
@@ -7861,6 +7984,9 @@ def _():
           case "attach-card": { const cid = dbody.querySelector(".qr-attach-card").value; if (cid) send("story_attach", { card_id: Number(cid), role: dbody.querySelector(".qr-attach-role").value }); break; }
           case "detach": send("story_detach", { card_id: id, role: btn.dataset.role }); break;
           case "canon-save": { const box = btn.closest(".qr-canon"); const sec = box.dataset.sec || box.querySelector(".qr-canon-new").value.trim(); if (sec) send("canon", { section: sec, text: box.querySelector("textarea").value }); break; }
+          case "thread-add": { const box = btn.closest(".qr-threads"), title = box.querySelector(".qr-thread-title").value.trim();
+            if (title) send("thread_add", { kind: box.querySelector(".qr-thread-kind").value, title, due: box.querySelector(".qr-thread-due").value.trim() }); break; }
+          case "thread-close": send("thread_close", { tid: Number(btn.closest("[data-tid]").dataset.tid), status: btn.dataset.status }); break;
           case "know-add": { const box = btn.closest(".qr-know"), t = box.querySelector(".qr-know-new").value.trim();
             if (t) send("knowledge_add", { holder: state.know.holder, text: t, kind: box.querySelector(".qr-know-kind").value }); break; }
           case "know-save": { const row = btn.closest("[data-kid]");
@@ -7904,7 +8030,12 @@ def _():
         const a = model.get("aux") || {};
         if (!a.kind) return;
         const d = a.data;
-        if (a.kind === "knowledge") {
+        if (a.kind === "threads") {
+          state.threads = d;
+          const box = dbody.querySelector(".qr-threads"), f = rootActive();
+          if (state.tab === "story" && box && !(f && box.contains(f) && f.tagName === "INPUT")) box.innerHTML = threadsHTML();
+        }
+        else if (a.kind === "knowledge") {
           state.know = d;
           const box = dbody.querySelector(".qr-know"), f = rootActive();
           if (state.tab === "story" && box && !(f && box.contains(f) && f.tagName === "INPUT")) box.innerHTML = knowHTML();
@@ -7970,7 +8101,7 @@ def _():
         const c = get("chat");
         const learn = !!((c.settings || {}).learn);
         if (learn !== state.learn) { state.learn = learn; el.classList.toggle("learn", learn); els.clear(); list.innerHTML = ""; }
-        if (state.lastChat !== c.id) { state.lastChat = c.id; state.studioCard = null; state.imageIntent = false; state.know = null; els.clear(); list.innerHTML = ""; fol.jump(); }
+        if (state.lastChat !== c.id) { state.lastChat = c.id; state.studioCard = null; state.imageIntent = false; state.know = null; state.threads = null; els.clear(); list.innerHTML = ""; fol.jump(); }
         renderTop(); renderChats(); renderStudio(); renderDrawer(); renderHistory();
       };
       const onCard = () => {
@@ -8012,6 +8143,7 @@ def _():
           if (drawer.hidden) return;
           if (state.tab === "memory") send("memory", { q: (state.memory || {}).q || "" });
           if (state.tab === "story" && state.know) send("knowledge", { holder: state.know.holder });
+          if (state.tab === "story" && state.threads) send("threads");
         },
         "change:aux": onAux, "change:notice": onNotice, "change:export": onExport, "change:compose": onCompose, "change:boot": renderDrawer,
       };
@@ -8365,10 +8497,13 @@ def _(
     SimpleNamespace,
     Stories,
     Sys,
+    THREADS,
     TOOLS,
     TXT,
+    Threads,
     UI_CSS,
     UI_ESM,
+    WORLD,
     World,
     base64,
     json,
@@ -8915,6 +9050,26 @@ def _(
         def c_knowledge_delete(self, kid, holder):
             KNOW.forget(int(kid))
             self.c_knowledge(holder)
+
+        # story threads
+        def c_threads(self):
+            cid = self._cur()
+            if not cid:
+                return
+            st = WORLD.state(cid, STORE.path_ids(cid))
+            rows = THREADS.list(cid, now=st["time"], include_closed=True)
+            self.w.aux = {"n": time.time(), "kind": "threads", "data": {"rows": rows, "kinds": list(Threads.KINDS)}}
+
+        def c_thread_add(self, kind, title, due="", who=""):
+            cid = self._cur()
+            st = WORLD.state(cid, STORE.path_ids(cid))
+            THREADS.open(cid, STORE.chat(cid)["head_id"], kind, title, "", who, due, st["time_text"])
+            self.c_threads()
+
+        def c_thread_close(self, tid, status):
+            cid = self._cur()
+            THREADS.close(cid, STORE.chat(cid)["head_id"], int(tid), status)
+            self.c_threads()
 
         # story
         def c_canon(self, section, text):

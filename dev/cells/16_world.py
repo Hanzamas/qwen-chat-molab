@@ -270,4 +270,69 @@ class World:
                          [int(message_id) if message_id and int(message_id) != 1 else 2] + list(ids))
 
 
+class Threads:
+    """Open story threads on the active branch: promises, mysteries, clues, debts, grudges, appointments.
+    A thread can have a deadline on the world clock; overdue ones are pointed out to the GM and the world tick."""
+
+    KINDS = ("janji", "janji temu", "misteri", "petunjuk", "utang", "dendam", "rencana", "lain")
+    CLOSED = ("selesai", "gagal", "batal")
+
+    def __init__(self, store):
+        self.store = store
+
+    def open(self, chat_id, message_id, kind, title, text="", who="", due="", opened_at=""):
+        title = (title or "").strip()
+        if not title:
+            raise ValueError("judul kosong")
+        kind = kind if kind in self.KINDS else "lain"
+        due_dt = TXT.parse_datetime(due) if due else None
+        if due and not due_dt:
+            raise ValueError("tenggat harus YYYY-MM-DD HH:MM")
+        chat = self.store.chat(chat_id) or {}
+        who = ", ".join(who) if isinstance(who, list) else str(who or "")
+        return self.store.x("INSERT INTO threads (story_id, chat_id, message_id, kind, title, text, who, due, opened_at, created) "
+                            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            (chat.get("story_id"), chat_id, message_id, kind, title[:200], (text or "")[:1500], who[:300],
+                             due_dt.strftime("%Y-%m-%d %H:%M") if due_dt else "", str(opened_at or ""), time.time()))
+
+    def close(self, chat_id, message_id, thread_id, status="selesai", note=""):
+        status = status if status in self.CLOSED + ("terbuka",) else "selesai"
+        self.store.x("INSERT INTO thread_events (thread_id, chat_id, message_id, status, note, created) VALUES (?, ?, ?, ?, ?, ?)",
+                     (int(thread_id), chat_id, message_id, status, (note or "")[:500], time.time()))
+
+    def list(self, chat_id, now=None, include_closed=False):
+        """Threads visible on this branch with their current status; overdue ones flagged and first."""
+        chats = self.store.lineage(chat_id)
+        if not chats:
+            return []
+        vis = self.store.visible_ids(chat_id)
+        marks = ",".join("?" * len(chats))
+        rows = [r for r in self.store.q(f"SELECT * FROM threads WHERE chat_id IN ({marks}) ORDER BY id", list(chats))
+                if not r["message_id"] or r["message_id"] in vis]
+        events = {}
+        for e in self.store.q(f"SELECT * FROM thread_events WHERE chat_id IN ({marks}) ORDER BY id", list(chats)):
+            if not e["message_id"] or e["message_id"] in vis:
+                events[e["thread_id"]] = e
+        out = []
+        for r in rows:
+            e = events.get(r["id"])
+            r["status"] = e["status"] if e else "terbuka"
+            r["note"] = e["note"] if e else ""
+            due = TXT.parse_datetime(r["due"]) if r["due"] else None
+            r["overdue"] = bool(due and now and due <= now and r["status"] == "terbuka")
+            r["due_soon"] = bool(due and now and not r["overdue"] and (due - now).total_seconds() <= 3600)
+            if include_closed or r["status"] == "terbuka":
+                out.append(r)
+        return sorted(out, key=lambda r: (not r["overdue"], not r["due_soon"], r["due"] or "9999", -r["id"]))
+
+    @staticmethod
+    def line(r):
+        bits = [r["who"]] if r["who"] else []
+        if r["due"]:
+            bits.append("tenggat " + r["due"] + (" (LEWAT TENGGAT)" if r["overdue"] else " (sebentar lagi)" if r["due_soon"] else ""))
+        return f"- #{r['id']} [{r['kind']}] {r['title']}{' (' + '; '.join(bits) + ')' if bits else ''}" + (
+            f": {r['text'][:200]}" if r["text"] else "")
+
+
+THREADS = Threads(STORE)
 WORLD = World(STORE, CARDS, STORIES)

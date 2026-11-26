@@ -16,6 +16,8 @@ Aturan tetap:
 - Tiap tokoh (termasuk tokoh pemain) hanya tahu isi ingatannya di catatan sistem. Memory, buku cerita, dan lore adalah
   pengetahuan narator; jangan biarkan tokoh memakainya kalau tidak ada di ingatannya. Ingatan bertanda KELIRU dipercaya
   tokoh itu walaupun salah. Catat yang baru diketahui tokoh dengan knowledge_add atau tell.
+- Benang cerita: catat janji, janji temu (dengan tenggat), misteri, petunjuk, utang, dendam, dan rencana dengan thread_open;
+  tutup dengan thread_close. Benang yang lewat tenggat harus punya akibat di dunia (orang menunggu, kesal, pergi).
 - Pesan pemain yang diawali [OOC] adalah percakapan di luar cerita: jawab di luar cerita, singkat, tanpa memerankan tokoh.
 - Bagian "Catatan sistem" di akhir pesan pemain dibuat sistem, bukan tulisan pemain. Pakai sebagai acuan, jangan dikutip.
 - Fakta dunia nyata yang spesifik dan tidak pasti: cek fact_lookup, lalu wiki_search/web_search. Simpan temuan dengan fact_save.
@@ -262,6 +264,9 @@ class Prompt:
         if news:
             lines.append("Kejadian yang kini bisa diketahui pemain:\n" + "\n".join(f"- [{e['world_time']}] {e['text']}" for e in news))
             used["events"] = [e["id"] for e in news]
+        threads = THREADS.list(chat_id, now=st["time"])
+        if threads:
+            lines.append("Benang cerita terbuka:\n" + "\n".join(THREADS.line(r) for r in threads[:10]))
         pend = self.stories.pending_list((c["story"] or {}).get("id"), chat_id)
         if pend:
             lines.append("Perubahan sejak prompt dibekukan (berlaku sekarang):\n" + "\n".join(f"- {p['text']}" for p in pend))
