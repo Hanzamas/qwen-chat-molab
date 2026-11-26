@@ -425,14 +425,19 @@ def _(PORT, Path, mo):
     # tanpa repetition penalty/DRY karena melawan "suara" StyleTune di lm_head).
     _DG_SAMPLING = {"temperature": 0.9, "top_p": 0.95, "top_k": 0, "min_p": 0.05,
                     "repetition_penalty": 1.0, "frequency_penalty": 0, "presence_penalty": 0}
-    # gguf = "repo:quant". mmproj None = teks saja (Dark-Gemistry tidak punya mmproj).
+    # Dark-Gemistry adalah merge Gemma4ForConditionalGeneration dan masih membawa vision tower (356 tensor),
+    # tapi repo GGUF-nya tidak menyertakan mmproj. Pakai mmproj Gemma 4 31B resmi dari ggml-org
+    # (backbone merge-nya heretic-ara, turunan langsung Gemma 4 31B-it).
+    _G4_MMPROJ = ("https://huggingface.co/ggml-org/gemma-4-31B-it-GGUF"
+                  "/resolve/main/mmproj-gemma-4-31B-it-BF16.gguf")
+    # gguf = "repo:quant". mmproj None = teks saja.
     # mtp = draft MTP (khusus Qwen3.8). max_ctx = konteks native; yarn = boleh diperpanjang dengan YaRN.
     LLAMA_MODELS = {
         "Dark-Gemistry 31B HB16-Q8_0 (36.8GB, kualitas tertinggi)": {
-            "gguf": "ReadyArt/Nimbz_Gemma-4-Dark-Gemistry-31B-GGUF:HB16-Q8_0", "mmproj": None, "mtp": False,
+            "gguf": "ReadyArt/Nimbz_Gemma-4-Dark-Gemistry-31B-GGUF:HB16-Q8_0", "mmproj": _G4_MMPROJ, "mtp": False,
             "max_ctx": 262144, "yarn": False, "sampling": _DG_SAMPLING},
         "Dark-Gemistry 31B HB16-Q6_K (29.7GB, lebih cepat)": {
-            "gguf": "ReadyArt/Nimbz_Gemma-4-Dark-Gemistry-31B-GGUF:HB16-Q6_K", "mmproj": None, "mtp": False,
+            "gguf": "ReadyArt/Nimbz_Gemma-4-Dark-Gemistry-31B-GGUF:HB16-Q6_K", "mmproj": _G4_MMPROJ, "mtp": False,
             "max_ctx": 262144, "yarn": False, "sampling": _DG_SAMPLING},
         "Qwen3.8 40B Heretic Build2 i1-Q6_K (lama)": {
             "gguf": "mradermacher/Qwen3.8-40B-Ultimate-Heretic-Uncensored-Build2-i1-GGUF:Q6_K", "mmproj": _QWEN40_MMPROJ,
@@ -554,7 +559,7 @@ def _(
               and f.lower().rsplit("/", 1)[-1].endswith((f"-{_q}.gguf", f".{_q}.gguf", f"_{_q}.gguf"))]
     _gguf = min(_cands, key=len) if _cands else None
     mo.stop(_gguf is None, mo.callout(mo.md(f"Quant `{_quant}` nggak ditemukan di `{_repo}`."), kind="danger"))
-    # mmproj: dari preset (Qwen 40B), atau file mmproj di repo yang sama, atau tidak ada (teks saja)
+    # mmproj: dari preset (Qwen 40B / Gemma 4 resmi), atau file mmproj di repo yang sama, atau tidak ada (teks saja)
     if _m["mmproj"] and not llama_gguf.value.strip():
         _mm_repo, _mm_file = _m["mmproj"].split("huggingface.co/", 1)[1].split("/resolve/main/", 1)
     else:
