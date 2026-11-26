@@ -256,6 +256,7 @@ class ServerManager:
                "--kv-cache-dtype", p.get("kv_dtype") or ("fp8" if yarn else "auto")]
         if p.get("quantization"):
             cmd += ["--quantization", p["quantization"]]
+        cmd += list(p.get("vllm_args") or [])
         if yarn and p["family"] == "qwen":
             # YaRN override from the Qwen3.8 model card: factor 4.0 for 1M, 2.0 for ~524K.
             rope = {"mrope_interleaved": True, "mrope_section": [11, 11, 10], "rope_type": "yarn",
@@ -333,8 +334,10 @@ class ServerManager:
     @staticmethod
     def hint(log_tail, p):
         if "NVRTCCompiler failed" in log_tail or "humming" in log_tail:
-            return ("\n\nSaran: kernel JIT vLLM untuk bobot ini gagal di-compile di GPU/driver ini. Pakai preset llama.cpp "
-                    "(Dark-Gemistry HB16-Q8_0) atau 'BF16 → FP8 saat dimuat', lalu kirim log compiler di atas.")
+            return ("\n\nPenyebab: kernel Humming vLLM meng-compile kernel saat jalan (NVRTC) dan gagal di GPU/driver ini. "
+                    "Paksa kernel lain lewat preset: vllm_args=['--kernel-config', "
+                    "'{\"linear_backend_per_quant\":{\"<kunci kuantisasi>\":\"marlin\"}}'] (kunci: w8a16_fp8, mixed_precision, "
+                    "mxfp4, nvfp4_w4a16, ...). Log compiler ada di atas.")
         if "out of memory" in log_tail.lower():
             return "\n\nSaran: VRAM tidak cukup. Kecilkan konteks atau matikan embedder."
         return ""
@@ -347,15 +350,10 @@ class ServerManager:
             proc = self.procs.get(backend)
             if proc is not None and proc.poll() is not None:
                 log_tail = Sys.tail(self.logf[backend], 400)
-                # Retry without MTP only when the failure is in the speculative/draft part; any other error would
-                # just happen again, and the message would blame MTP for something else.
-                if self.state.get("mtp") and self.SPEC_ERROR.search(log_tail):
-                    with self.lock:
-                        self.state["warnings"].append("Server gagal di bagian MTP/drafter; dijalankan ulang tanpa MTP.")
-                        (CFG.LOG_DIR / f"{backend}-mtp-failed.log").write_text(log_tail)
-                        self._launch(p, files, ctx, False)
-                    continue
+                # MTP is required: no silent restart without it. Show the real cause instead.
                 error = Sys.log_errors(self.logf[backend]) or "server berhenti"
+                if self.state.get("mtp") and self.SPEC_ERROR.search(log_tail):
+                    error = "Gagal di bagian MTP/drafter (MTP wajib, server tidak dijalankan ulang tanpa MTP).\n" + error
                 self.state.update(phase="failed", error=error + self.jit_logs(log_tail) + self.hint(log_tail, p))
                 self._save()
                 return

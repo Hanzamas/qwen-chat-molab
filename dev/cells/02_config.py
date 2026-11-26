@@ -66,6 +66,9 @@ PRESETS = {
     "Dark-Gemistry 31B FP8 (W8A16) · vLLM": dict(
         backend="vllm", family="gemma", repo="hoborific/Gemma-4-Dark-Gemistry-31B-W8A16-FP8",
         revision="6fe96dfdda65559562944624cd954ba21caaef3f", size_gb=33, mtp="draft", draft_hf=_G4_DRAFT_HF,
+        # vLLM 0.32.0 picks the Humming kernel first for FP8 W8A16; its JIT compile (NVRTC, humming-kernels 0.1.17)
+        # fails on molab. Marlin ships prebuilt in the vLLM wheel.
+        vllm_args=["--kernel-config", json.dumps({"linear_backend_per_quant": {"w8a16_fp8": "marlin"}})],
         max_ctx=262144, yarn_max=262144, yarn_exp=False, reasoning_parser="gemma4", tool_parser="gemma4",
         sampling=_DG_SAMPLING, thinking=("off", "on"), vision=True, kv_dtype="fp8"),
     "Dark-Gemistry 31B BF16 → FP8 saat dimuat · vLLM": dict(

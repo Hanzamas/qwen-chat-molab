@@ -163,5 +163,17 @@ def test_server_failure_diagnosis(nb, tmp_path):
     (tmp_path / "compile.log").write_text("error: identifier __nv_fp8_e4m3 is undefined")
     assert not SM.SPEC_ERROR.search(humming)
     assert "__nv_fp8_e4m3" in SM.jit_logs(humming)
-    assert "llama.cpp" in SM.hint(humming, {})
+    assert "linear_backend_per_quant" in SM.hint(humming, {})
     assert SM.SPEC_ERROR.search("ValueError: speculative config for draft model is invalid")
+
+
+def test_dark_gemistry_vllm_cmd_uses_marlin_and_mtp(nb):
+    SM, P = nb["SERVERS"], nb["PRESETS"]
+    p = P["Dark-Gemistry 31B FP8 (W8A16) · vLLM"]
+    SM.state["embed"] = False
+    cmd = SM._vllm_cmd(p, {"model": "/m", "draft": "/d"}, 262144, True)
+    i = cmd.index("--kernel-config")
+    assert json.loads(cmd[i + 1]) == {"linear_backend_per_quant": {"w8a16_fp8": "marlin"}}
+    spec = json.loads(cmd[cmd.index("--speculative-config") + 1])
+    assert spec["model"] == "/d" and spec["num_speculative_tokens"] == 3
+    assert "--tool-call-parser" in cmd and cmd[cmd.index("--tool-call-parser") + 1] == "gemma4"
