@@ -707,3 +707,32 @@ def test_secret_lore_is_labelled(engine, nb):
     C.lore_save(world, "Identitas Lotte", "Lotte sebenarnya agen", "agen", "rahasia", known_to="Lotte, Otto")
     note, _ = P.ephemeral(chat, S.path(chat), "Apa kamu agen?")
     assert "RAHASIA, hanya diketahui: Lotte, Otto" in note
+
+
+def test_state_check_fills_in_what_the_model_forgot(engine, nb, fake, monkeypatch):
+    monkeypatch.setenv("QCHAT_STATE_CHECK", "1")
+    chat, _ = _story(nb, engine)
+    S, W, K = nb["STORE"], nb["WORLD"], nb["KNOW"]
+    S.chat_settings(chat, length="pendek")  # no paragraph fill-in request between the turn and the check
+    t0 = W.state(chat, S.path_ids(chat))["time"]
+    fake["script"] += [
+        {"content": "Lotte menyodorkan roti. Kamu makan dengan lahap, lalu Lotte berbisik bahwa kunci gudang hilang."},
+        {"tool_calls": [{"name": "status_update", "arguments": json.dumps({"subject": "player", "changes": {"lapar": -30}})},
+                        {"name": "knowledge_add", "arguments": json.dumps({"who": ["player"], "text": "Kunci gudang hilang",
+                                                                           "source": "diberi tahu", "from": "Lotte"})}]},
+        {"content": "selesai"}]
+    engine.send(chat, "Aku duduk di meja.")
+    wait_idle(engine, 60)
+    st = W.state(chat, S.path_ids(chat))
+    assert next(s for s in st["stats"] if s["key"] == "lapar")["value"] < 20  # 20 start, minus 30, clamped at 0
+    assert any("Kunci gudang" in r["text"] for r in K.of(chat, "player"))
+    assert st["time"] > t0  # no world_advance in the turn: time moved by an estimate
+    log = S.side_logs(chat, "state_check")[0]["data"]
+    assert any(r.startswith("world_advance: perkiraan") for r in log["recorded"])
+
+
+def test_schema_v2_fields(nb):
+    C = nb["CARDS"]
+    keys = lambda t: {f["key"] for f in C.schema(t)["fields"]}
+    assert {"schedule", "skill_levels"} <= keys("character") and "skill_levels" in keys("persona")
+    assert "locations" in keys("world") and {"state_check", "continuity_check"} <= keys("gm") and "keadaan" in keys("status")

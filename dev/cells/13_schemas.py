@@ -5,7 +5,7 @@ def _f(key, label, section, type_="text", core=True, visibility="model", **extra
 # Default schemas. They are data: stored in card_schemas, editable in the schema editor, exported with cards.
 # Nothing here is tied to a genre; examples in `help` are only hints.
 DEFAULT_SCHEMAS = {
-    "character": {"type": "character", "label": "Tokoh", "version": 1, "fields": [
+    "character": {"type": "character", "label": "Tokoh", "version": 2, "fields": [
         _f("name", "Nama", "Identitas"),
         _f("aliases", "Nama lain / panggilan", "Identitas", "tags"),
         _f("age", "Umur", "Identitas"),
@@ -22,6 +22,10 @@ DEFAULT_SCHEMAS = {
         _f("goals", "Tujuan", "Agenda", "list"),
         _f("plan", "Rencana saat ini (awal)", "Agenda", "longtext", core=False),
         _f("routine", "Rutinitas", "Agenda", "longtext", core=False),
+        _f("schedule", "Jadwal (lokasi menurut jam dunia)", "Agenda", "table", core=False, columns=["jam", "lokasi", "kegiatan"],
+           help="Jam 0-23 atau rentang seperti 08-12. Dipakai untuk tahu di mana tokoh berada saat tidak terlihat"),
+        _f("skill_levels", "Nilai kemampuan", "Kemampuan", "table", core=False, columns=["kemampuan", "nilai 0-100"],
+           help="Dipakai sistem untuk menghitung peluang dadu"),
         _f("fears", "Ketakutan", "Agenda", "list", core=False),
         _f("secrets", "Rahasia", "Agenda", "list", visibility="secret"),
         _f("backstory", "Riwayat", "Riwayat", "longtext", core=False),
@@ -33,7 +37,7 @@ DEFAULT_SCHEMAS = {
         _f("tags", "Tag", "Lainnya", "tags", visibility="ui"),
         _f("notes", "Catatan untukmu", "Lainnya", "longtext", visibility="ui"),
     ]},
-    "persona": {"type": "persona", "label": "Persona", "version": 1, "fields": [
+    "persona": {"type": "persona", "label": "Persona", "version": 2, "fields": [
         _f("name", "Nama", "Identitas"),
         _f("age", "Umur", "Identitas"),
         _f("role", "Peran", "Identitas"),
@@ -41,12 +45,14 @@ DEFAULT_SCHEMAS = {
         _f("background", "Latar belakang", "Identitas", "longtext"),
         _f("personality", "Kepribadian", "Identitas", "longtext"),
         _f("skills", "Kemampuan", "Kemampuan", "list"),
+        _f("skill_levels", "Nilai kemampuan", "Kemampuan", "table", core=False, columns=["kemampuan", "nilai 0-100"],
+           help="Dipakai sistem untuk menghitung peluang dadu, misalnya: Bahasa Jerman, 55"),
         _f("model_may_decide", "Yang boleh diputuskan model untukmu", "Aturan", "longtext",
            help="Misalnya: gerakan kecil dan reaksi refleks boleh; ucapan dan keputusan tidak"),
         _f("limits", "Batasan", "Aturan", "longtext"),
         _f("notes", "Catatan untukmu", "Lainnya", "longtext", visibility="ui"),
     ]},
-    "world": {"type": "world", "label": "Dunia", "version": 1, "fields": [
+    "world": {"type": "world", "label": "Dunia", "version": 2, "fields": [
         _f("name", "Nama dunia", "Inti"),
         _f("era", "Zaman", "Inti"),
         _f("setting", "Tempat dan latar", "Inti", "longtext"),
@@ -64,6 +70,8 @@ DEFAULT_SCHEMAS = {
         _f("stats", "Statistik pemain", "Mekanik", "table", core=False, visibility="ui",
            columns=["key", "label", "min", "max", "awal", "laju per jam"],
            help="Contoh: lapar, Lapar, 0, 100, 20, 4 (naik 4 per jam). Laju kosong = tidak berubah sendiri"),
+        _f("locations", "Waktu tempuh antar tempat", "Mekanik", "table", core=False, columns=["dari", "ke", "menit"],
+           help="Jam dunia maju sesuai perjalanan kalau tokohmu pindah tempat"),
         _f("wiki_lang", "Bahasa Wikipedia untuk riset", "Mekanik", visibility="ui", help="Misalnya: de,en"),
         _f("notes", "Catatan untukmu", "Lainnya", "longtext", visibility="ui"),
     ]},
@@ -96,7 +104,7 @@ DEFAULT_SCHEMAS = {
         _f("banned", "Frasa terlarang", "Larangan", "list"),
         _f("rules", "Aturan tambahan", "Larangan", "list"),
     ]},
-    "gm": {"type": "gm", "label": "GM", "version": 1, "fields": [
+    "gm": {"type": "gm", "label": "GM", "version": 2, "fields": [
         _f("format", "Format", "Format", "select", options=["prosa", "game"], visibility="ui"),
         _f("realism", "Tingkat realisme", "Dunia", "select", options=["santai", "membumi", "keras"]),
         _f("lethality", "Kekejaman", "Dunia", "select", options=["rendah", "sedang", "tinggi"]),
@@ -115,9 +123,15 @@ DEFAULT_SCHEMAS = {
         _f("afk_scale", "Skala waktu saat AFK", "Waktu", visibility="ui",
            help="Jam cerita per jam nyata. 0 = dunia berhenti, 1 = sama dengan waktu nyata"),
         _f("tick_minutes", "World tick tiap (menit diam)", "Waktu", visibility="ui"),
+        _f("state_check", "Pemeriksa keadaan setelah tiap giliran", "Kontinuitas", "select", options=["ya", "tidak"],
+           visibility="ui", help="Mengisi waktu, status, dan ingatan tokoh yang lupa dicatat model"),
+        _f("continuity_check", "Cek kontinuitas", "Kontinuitas", "select", options=["latar", "ketat", "mati"], visibility="ui",
+           help="Menandai tokoh yang tahu hal di luar ingatannya, salah lokasi, sudah mati, atau tidak mengikuti dadu. "
+                "Ketat: jawaban ditulis ulang"),
     ]},
-    "status": {"type": "status", "label": "Status tokoh", "version": 1, "fields": [
+    "status": {"type": "status", "label": "Status tokoh", "version": 2, "fields": [
         _f("location", "Lokasi", "Status"),
+        _f("keadaan", "Keadaan", "Status", "select", options=["hidup", "terluka parah", "pingsan", "ditahan", "pergi", "mati"]),
         _f("outfit", "Pakaian", "Status"),
         _f("mood", "Mood", "Status"),
         _f("injuries", "Luka", "Status", "list"),

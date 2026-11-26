@@ -1918,7 +1918,7 @@ def _():
     # Default schemas. They are data: stored in card_schemas, editable in the schema editor, exported with cards.
     # Nothing here is tied to a genre; examples in `help` are only hints.
     DEFAULT_SCHEMAS = {
-        "character": {"type": "character", "label": "Tokoh", "version": 1, "fields": [
+        "character": {"type": "character", "label": "Tokoh", "version": 2, "fields": [
             _f("name", "Nama", "Identitas"),
             _f("aliases", "Nama lain / panggilan", "Identitas", "tags"),
             _f("age", "Umur", "Identitas"),
@@ -1935,6 +1935,10 @@ def _():
             _f("goals", "Tujuan", "Agenda", "list"),
             _f("plan", "Rencana saat ini (awal)", "Agenda", "longtext", core=False),
             _f("routine", "Rutinitas", "Agenda", "longtext", core=False),
+            _f("schedule", "Jadwal (lokasi menurut jam dunia)", "Agenda", "table", core=False, columns=["jam", "lokasi", "kegiatan"],
+               help="Jam 0-23 atau rentang seperti 08-12. Dipakai untuk tahu di mana tokoh berada saat tidak terlihat"),
+            _f("skill_levels", "Nilai kemampuan", "Kemampuan", "table", core=False, columns=["kemampuan", "nilai 0-100"],
+               help="Dipakai sistem untuk menghitung peluang dadu"),
             _f("fears", "Ketakutan", "Agenda", "list", core=False),
             _f("secrets", "Rahasia", "Agenda", "list", visibility="secret"),
             _f("backstory", "Riwayat", "Riwayat", "longtext", core=False),
@@ -1946,7 +1950,7 @@ def _():
             _f("tags", "Tag", "Lainnya", "tags", visibility="ui"),
             _f("notes", "Catatan untukmu", "Lainnya", "longtext", visibility="ui"),
         ]},
-        "persona": {"type": "persona", "label": "Persona", "version": 1, "fields": [
+        "persona": {"type": "persona", "label": "Persona", "version": 2, "fields": [
             _f("name", "Nama", "Identitas"),
             _f("age", "Umur", "Identitas"),
             _f("role", "Peran", "Identitas"),
@@ -1954,12 +1958,14 @@ def _():
             _f("background", "Latar belakang", "Identitas", "longtext"),
             _f("personality", "Kepribadian", "Identitas", "longtext"),
             _f("skills", "Kemampuan", "Kemampuan", "list"),
+            _f("skill_levels", "Nilai kemampuan", "Kemampuan", "table", core=False, columns=["kemampuan", "nilai 0-100"],
+               help="Dipakai sistem untuk menghitung peluang dadu, misalnya: Bahasa Jerman, 55"),
             _f("model_may_decide", "Yang boleh diputuskan model untukmu", "Aturan", "longtext",
                help="Misalnya: gerakan kecil dan reaksi refleks boleh; ucapan dan keputusan tidak"),
             _f("limits", "Batasan", "Aturan", "longtext"),
             _f("notes", "Catatan untukmu", "Lainnya", "longtext", visibility="ui"),
         ]},
-        "world": {"type": "world", "label": "Dunia", "version": 1, "fields": [
+        "world": {"type": "world", "label": "Dunia", "version": 2, "fields": [
             _f("name", "Nama dunia", "Inti"),
             _f("era", "Zaman", "Inti"),
             _f("setting", "Tempat dan latar", "Inti", "longtext"),
@@ -1977,6 +1983,8 @@ def _():
             _f("stats", "Statistik pemain", "Mekanik", "table", core=False, visibility="ui",
                columns=["key", "label", "min", "max", "awal", "laju per jam"],
                help="Contoh: lapar, Lapar, 0, 100, 20, 4 (naik 4 per jam). Laju kosong = tidak berubah sendiri"),
+            _f("locations", "Waktu tempuh antar tempat", "Mekanik", "table", core=False, columns=["dari", "ke", "menit"],
+               help="Jam dunia maju sesuai perjalanan kalau tokohmu pindah tempat"),
             _f("wiki_lang", "Bahasa Wikipedia untuk riset", "Mekanik", visibility="ui", help="Misalnya: de,en"),
             _f("notes", "Catatan untukmu", "Lainnya", "longtext", visibility="ui"),
         ]},
@@ -2009,7 +2017,7 @@ def _():
             _f("banned", "Frasa terlarang", "Larangan", "list"),
             _f("rules", "Aturan tambahan", "Larangan", "list"),
         ]},
-        "gm": {"type": "gm", "label": "GM", "version": 1, "fields": [
+        "gm": {"type": "gm", "label": "GM", "version": 2, "fields": [
             _f("format", "Format", "Format", "select", options=["prosa", "game"], visibility="ui"),
             _f("realism", "Tingkat realisme", "Dunia", "select", options=["santai", "membumi", "keras"]),
             _f("lethality", "Kekejaman", "Dunia", "select", options=["rendah", "sedang", "tinggi"]),
@@ -2028,9 +2036,15 @@ def _():
             _f("afk_scale", "Skala waktu saat AFK", "Waktu", visibility="ui",
                help="Jam cerita per jam nyata. 0 = dunia berhenti, 1 = sama dengan waktu nyata"),
             _f("tick_minutes", "World tick tiap (menit diam)", "Waktu", visibility="ui"),
+            _f("state_check", "Pemeriksa keadaan setelah tiap giliran", "Kontinuitas", "select", options=["ya", "tidak"],
+               visibility="ui", help="Mengisi waktu, status, dan ingatan tokoh yang lupa dicatat model"),
+            _f("continuity_check", "Cek kontinuitas", "Kontinuitas", "select", options=["latar", "ketat", "mati"], visibility="ui",
+               help="Menandai tokoh yang tahu hal di luar ingatannya, salah lokasi, sudah mati, atau tidak mengikuti dadu. "
+                    "Ketat: jawaban ditulis ulang"),
         ]},
-        "status": {"type": "status", "label": "Status tokoh", "version": 1, "fields": [
+        "status": {"type": "status", "label": "Status tokoh", "version": 2, "fields": [
             _f("location", "Lokasi", "Status"),
+            _f("keadaan", "Keadaan", "Status", "select", options=["hidup", "terluka parah", "pingsan", "ditahan", "pergi", "mati"]),
             _f("outfit", "Pakaian", "Status"),
             _f("mood", "Mood", "Status"),
             _f("injuries", "Luka", "Status", "list"),
@@ -5481,6 +5495,18 @@ def _(
     status_update. Tokoh yang berada di tempat yang sama bisa saling bercerita atau bergosip: catat dengan tell (isinya bisa
     melenceng atau bohong; truthful=false). Jangan menulis narasi. Setelah selesai jawab "selesai"."""
 
+    STATE_CHECK = """Pemeriksa keadaan. Baca narasi jawaban terakhir. Catat HANYA yang terjadi di narasi tetapi belum tercatat
+    di giliran ini:
+    - waktu yang berlalu (world_advance), kalau belum dicatat atau jelas kurang;
+    - perubahan status pemain dan tokoh: makan/minum/tidur (statistik), luka, barang berpindah tangan, lokasi, pakaian,
+      keadaan (status_update);
+    - apa yang disaksikan atau didengar tokoh yang hadir, termasuk tokoh pemain (knowledge_add), dan apa yang diceritakan
+      antar tokoh (tell).
+    Sudah tercatat di giliran ini:
+    {done}
+    Jangan mengulang yang sudah tercatat dan jangan menebak hal yang tidak ada di narasi. Kalau tidak ada yang perlu dicatat,
+    jawab "selesai" tanpa memanggil tool."""
+
     FACTCHECK_CLAIMS = """Periksa jawaban terakhir. Daftarkan klaim fakta {kind} yang spesifik di dalamnya (tanggal, angka, nama
     satuan, senjata, pangkat, tempat, prosedur), bukan hal fiksi cerita. Maksimal 6. Jawab HANYA JSON: {{"claims": ["..."]}}"""
 
@@ -6011,6 +6037,15 @@ def _(
                     self.emit("live", {})
                 paras, sents = TXT.shape(full)
                 m["meta"]["shape"] = {"target": tgt, "paragraphs": paras, "sentences": sents}
+            # state: fill in what the model forgot to record (time, status, who saw what)
+            if (self.prompt.gm(c).get("state_check") or "ya") == "ya" and os.environ.get("QCHAT_STATE_CHECK", "1") != "0" \
+                    and not self.stop.is_set():
+                self.emit("live", {"active": True, "content": m["content"], "phase": "Memeriksa keadaan…", "reasoning": "",
+                                   "tools": [], "chat_id": chat_id})
+                try:
+                    m["meta"]["state_check"] = self._state_check(chat_id, mid, c, self.store.path(chat_id, head=mid), full)
+                finally:
+                    self.emit("live", {})
             # quality checks over the whole turn
             prev = before[-4:]
             rep = TXT.repeated_phrases(full, prev)
@@ -6072,6 +6107,48 @@ def _(
                             self._rewriting = False
             elif mode == "latar":
                 self.fact_jobs.append((chat_id, mid))
+
+        def _state_check(self, chat_id, mid, c, path, full):
+            """Side task after a turn: record what the narration shows but no tool recorded. Thinking off, few tokens.
+            If time still did not move, it moves by an estimate from the length of the scene."""
+            ids = [x["id"] for x in path]
+            start = ids.index(mid) if mid in ids else len(path) - 1
+            while start > 0 and path[start - 1]["role"] != "user":
+                start -= 1
+            done_lines, advanced = [], False
+            for x in path[start:]:
+                if x["role"] == "assistant" and x["tool_calls"]:
+                    for tc in json.loads(x["tool_calls"]):
+                        fn = tc.get("function") or {}
+                        done_lines.append(f"- {fn.get('name')}: {(fn.get('arguments') or '')[:300]}")
+                        advanced = advanced or fn.get("name") == "world_advance"
+            names = {"world_advance", "status_update", "knowledge_add", "tell", "world_event"}
+            tools = [t for t in self.tools.specs(c) if t["function"]["name"] in names]
+            kw = {k: v for k, v in self.prompt.kwargs(c).items() if k != "reasoning_effort"}
+            kw["enable_thinking"] = False
+            msgs = self.prompt.side(chat_id, STATE_CHECK.format(done="\n".join(done_lines) or "- (belum ada)"), path=path)
+            recorded = []
+            for _ in range(3):
+                acc = self.llm.chat(msgs, tools=tools, kwargs=kw, sampling={"temperature": 0.3}, max_tokens=3000, stop=self.stop)
+                got = [v for _, v in sorted(acc["calls"].items())]
+                if not got or self.stop.is_set() or acc["finish"] == "stopped":
+                    break
+                msgs.append({"role": "assistant", "content": acc["content"], "tool_calls": [
+                    {"id": cl["id"] or f"k{i}", "type": "function", "function": {"name": cl["name"], "arguments": cl["arguments"] or "{}"}}
+                    for i, cl in enumerate(got)]})
+                for i, cl in enumerate(got):
+                    res, failed, _ = self.tools.call(chat_id, mid, cl["name"], cl["arguments"], allowed=names)
+                    msgs.append({"role": "tool", "tool_call_id": cl["id"] or f"k{i}", "content": res})
+                    if not failed:
+                        recorded.append(f"{cl['name']}: {(cl['arguments'] or '')[:200]}")
+                        advanced = advanced or cl["name"] == "world_advance"
+            if not advanced and not self.stop.is_set():
+                minutes = max(2, min(30, round(len(full.split()) / 90)))
+                self.world.advance(chat_id, mid, minutes, "perkiraan dari panjang adegan (world_advance tidak dipanggil)")
+                recorded.append(f"world_advance: perkiraan {minutes} menit")
+            self.store.side_log("state_check", {"recorded": recorded,
+                                                "transcript": [x for x in msgs if x["role"] in ("assistant", "tool")]}, chat_id, mid)
+            return recorded
 
         @staticmethod
         def _range(text, default):
