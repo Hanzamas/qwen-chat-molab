@@ -54,6 +54,7 @@ function render({ model, el }) {
     <div class="qr-world" hidden></div>
     <div class="qr-composer">
       <div class="qr-notice" hidden></div>
+      <div class="qr-speaker-bar" hidden></div>
       <div class="qr-pending" hidden></div>
       <div class="qr-statusline" hidden></div>
       <form class="qr-form">
@@ -247,17 +248,40 @@ function render({ model, el }) {
     if (st.stopped) bits.push("dihentikan");
     return bits.length ? `<div class="qr-stats-line" title="${esc(st.model || "")}">${bits.join(" · ")}</div>` : "";
   }
+  // Avatars go into one <style> per story (a class per character), not into every speaker paragraph.
+  const avStyle = document.createElement("style");
+  el.appendChild(avStyle);
+  function syncAvatars() {
+    const map = {}, css = [];
+    (get("story").cards || []).filter((x) => x.role === "character").forEach((x, i) => {
+      map[x.name.toLowerCase()] = { cls: x.avatar ? `qr-av-${i}` : "", name: x.name };
+      if (x.avatar) css.push(`.qr .qr-av-${i}{background-image:url(data:image/png;base64,${x.avatar});background-size:cover;background-position:center}`);
+    });
+    const text = css.join("\n");
+    if (avStyle.textContent !== text) avStyle.textContent = text;
+    state.avMap = map;
+  }
   function speakers(html) {
     const c = get("chat");
     if (c.kind !== "group") return html;
-    const av = {};
-    for (const x of (get("story").cards || [])) if (x.role === "character") av[x.name.toLowerCase()] = x.avatar;
+    const av = state.avMap || {};
     return html.replace(/<p><strong>([^<]{1,60})<\/strong>/g, (m, name) => {
       const key = name.replace(/[:：]$/, "").trim().toLowerCase();
       if (!(key in av)) return m;
-      const img = av[key] ? `<img class="qr-avatar sm" src="data:image/png;base64,${av[key]}" alt="">` : `<span class="qr-avatar sm qr-noav">${icon("card")}</span>`;
+      const img = av[key].cls ? `<span class="qr-avatar sm ${av[key].cls}"></span>` : `<span class="qr-avatar sm qr-noav">${icon("card")}</span>`;
       return `<p class="qr-speaker">${img}<strong>${name}</strong>`;
     });
+  }
+  function renderSpeakerBar() {
+    const c = get("chat"), bar = $(".qr-speaker-bar");
+    const chars = Object.values(state.avMap || {});
+    bar.hidden = c.kind !== "group" || !chars.length;
+    if (bar.hidden) return;
+    const cur = ((c.settings || {}).speaker || "").toLowerCase(), single = (c.settings || {}).group_mode === "single";
+    bar.innerHTML = `<span class="qr-muted">Berikutnya:</span>
+      <button class="qr-chip ${cur ? "" : "on"}" data-act="speaker" data-name="">${icon("users")}${single ? "Model memilih" : "GM (semua)"}</button>
+      ${chars.map((x) => `<button class="qr-chip ${cur === x.name.toLowerCase() ? "on" : ""}" data-act="speaker" data-name="${esc(x.name)}">${x.cls ? `<span class="qr-avatar sm ${x.cls}"></span>` : ""}${esc(x.name)}</button>`).join("")}
+      <label class="qr-check"><input type="checkbox" class="qr-single" ${single ? "checked" : ""}> satu tokoh per balasan</label>`;
   }
   function itemHTML(it) {
     const chap = it.chapter ? `<div class="qr-chapter">${icon("bookmark")}${esc(it.chapter)}</div>` : "";
@@ -767,6 +791,9 @@ function render({ model, el }) {
     }
   });
   $(".qr-file-att").addEventListener("cancel", () => { state.imageIntent = false; });
+  $(".qr-speaker-bar").addEventListener("change", (e) => {
+    if (e.target.classList.contains("qr-single")) send("settings", { group_mode: e.target.checked ? "single" : null });
+  });
   $(".qr-file-card").addEventListener("change", async (e) => { const f = e.target.files?.[0]; e.target.value = ""; if (f) send("card_import", { b64: await readB64(f), name: f.name }); });
   $(".qr-file-avatar").addEventListener("change", async (e) => {
     const f = e.target.files?.[0]; e.target.value = "";
@@ -911,6 +938,7 @@ function render({ model, el }) {
       case "canon-save": { const box = btn.closest(".qr-canon"); const sec = box.dataset.sec || box.querySelector(".qr-canon-new").value.trim(); if (sec) send("canon", { section: sec, text: box.querySelector("textarea").value }); break; }
       case "toc": { const h = model.get("history") || {}, cid = get("chat").id;
         openModal("Daftar bab", (h.chapters || []).map((c) => `<button class="qr-libitem" data-act="jump-to" data-chat="${cid}" data-id="${c.id}">${icon("bookmark")}<b>${esc(c.title)}</b><span class="qr-muted">pesan ${c.n}</span></button>`).join("") || "Belum ada bab. Tandai dengan /bab atau tombol bab di balasan."); break; }
+      case "speaker": send("settings", { speaker: btn.dataset.name || null }); break;
       case "props-make": send("proposals_make"); toast("Menyusun usulan…"); break;
       case "prop-yes": case "prop-no": send("proposal", { pid: Number(btn.closest("[data-pid]").dataset.pid), accept: act === "prop-yes" }); break;
       case "thread-add": { const box = btn.closest(".qr-threads"), title = box.querySelector(".qr-thread-title").value.trim();
@@ -1036,6 +1064,7 @@ function render({ model, el }) {
     const learn = !!((c.settings || {}).learn);
     if (learn !== state.learn) { state.learn = learn; el.classList.toggle("learn", learn); els.clear(); list.innerHTML = ""; }
     if (state.lastChat !== c.id) { state.lastChat = c.id; state.studioCard = null; state.imageIntent = false; state.know = null; state.threads = null; state.props = null; els.clear(); list.innerHTML = ""; fol.jump(); }
+    syncAvatars(); renderSpeakerBar();
     renderTop(); renderChats(); renderStudio(); renderDrawer(); renderHistory();
   };
   const onCard = () => {
@@ -1072,7 +1101,7 @@ function render({ model, el }) {
       if (g) g.textContent = s.gpu ? `GPU ${s.gpu.util.toFixed(0)}% · VRAM ${s.gpu.used_gb.toFixed(1)} / ${s.gpu.total_gb.toFixed(0)} GB` : "";
     }, "change:backup": renderBackup,
     "change:library": () => { if (state.tab === "cards" || state.tab === "story") renderDrawer(); renderWizard(); },
-    "change:card": onCard, "change:story": () => { renderStudio(); if (state.tab === "story") renderDrawer(); },
+    "change:card": onCard, "change:story": () => { syncAvatars(); renderSpeakerBar(); renderStudio(); if (state.tab === "story") renderDrawer(); },
     "change:rev": () => {
       if (drawer.hidden) return;
       if (state.tab === "memory") send("memory", { q: (state.memory || {}).q || "" });

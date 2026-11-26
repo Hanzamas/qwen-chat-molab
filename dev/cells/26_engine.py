@@ -46,6 +46,10 @@ terbongkar, umur. Bukan keadaan sesaat (itu status). Maksimal 6 usulan. Jawab HA
 {{"proposals": [{{"card": "nama tokoh", "field": "kunci field di skema", "value": "isi baru lengkap", "reason": "kenapa"}}]}}
 Skema kartu tokoh: {fields}"""
 
+NEXT_SPEAKER = """Siapa tokoh yang paling wajar bereaksi berikutnya terhadap giliran ini, sesuai agenda, posisi, dan apa yang
+ia tahu? Pilihan: {names}. Sudah bereaksi di giliran ini: {spoken}. Kalau sebaiknya giliran kembali ke pemain, jawab null.
+Jawab HANYA JSON: {{"next": "nama" atau null}}"""
+
 FACTCHECK_CLAIMS = """Periksa jawaban terakhir. Daftarkan klaim fakta {kind} yang spesifik di dalamnya (tanggal, angka, nama
 satuan, senjata, pangkat, tempat, prosedur), bukan hal fiksi cerita. Maksimal 6. Jawab HANYA JSON: {{"claims": ["..."]}}"""
 
@@ -317,7 +321,7 @@ class Engine(EngineView):
             if self.stop.is_set():
                 return
         pending = len(full) // 3 + 1500 * len(media)
-        self._turn(chat_id, extra=extra, pending_estimate=pending)
+        self._respond(chat_id, extra=extra, pending_estimate=pending)
 
     def _catch_up(self, chat_id, uid):
         """AFK: advance the world clock by the real time that passed (GM scale) and let the world act."""
@@ -349,7 +353,7 @@ class Engine(EngineView):
 
     # ---------- the turn ----------
 
-    def _turn(self, chat_id, extra=None, pending_estimate=0, length_override=None):
+    def _turn(self, chat_id, extra=None, pending_estimate=0, length_override=None, group_note=True):
         if not self.servers.ready():
             raise RuntimeError("Server model belum READY. Klik Start dan tunggu status READY.")
         c = self.prompt.ctx(chat_id)
@@ -374,7 +378,7 @@ class Engine(EngineView):
         totals = {"tokens": 0, "think_s": 0.0, "tools": 0, "gen_s": 0.0}
         usage, final_id, used_info = {}, None, {}
         extra = list(extra or [])
-        if c["kind"] == "group":
+        if c["kind"] == "group" and group_note:
             extra.append(self._group_note(chat_id, c))
         avoid = c["settings"].get("avoid") or []
         if avoid:
@@ -985,7 +989,50 @@ class Engine(EngineView):
         """Answer from a given message (reroll, a stopped turn, a failed turn)."""
         self.store.set_head(chat_id, head)
         self.emit("history", chat_id)
-        self._turn(chat_id)
+        self._respond(chat_id)
+
+    def _respond(self, chat_id, extra=None, pending_estimate=0):
+        chat = self.store.chat(chat_id) or {}
+        if chat.get("kind") == "group" and (chat.get("settings") or {}).get("group_mode") == "single":
+            return self._group_round(chat_id, extra, pending_estimate)
+        return self._turn(chat_id, extra=extra, pending_estimate=pending_estimate)
+
+    MAX_SPEAKERS = 3
+
+    def _group_round(self, chat_id, extra=None, pending_estimate=0):
+        """One character per reply: the model picks who reacts next, that character's reply is generated on its own;
+        up to MAX_SPEAKERS per turn, or until it hands the turn back to the player."""
+        c = self.prompt.ctx(chat_id)
+        names = [ch["name"] for ch in c["cards"]["character"]]
+        forced = c["settings"].get("speaker")
+        spoken = []
+        for k in range(min(self.MAX_SPEAKERS, max(1, len(names)))):
+            if self.stop.is_set():
+                break
+            if k == 0 and forced:
+                who = next((n for n in names if n.lower() == str(forced).lower()), forced)
+                self.store.chat_settings(chat_id, speaker=None)
+            else:
+                who = self._next_speaker(chat_id, c, names, spoken)
+                if not who:
+                    break
+            note = (f"Giliran ini hanya {who} yang bicara dan bertindak. Awali dengan **{who}**. Jangan menulis tokoh lain "
+                    f"atau tindakan pemain.")
+            self._turn(chat_id, extra=list(extra or []) + [note] if k == 0 else [note],
+                       pending_estimate=pending_estimate if k == 0 else 0, group_note=False)
+            spoken.append(who)
+
+    def _next_speaker(self, chat_id, c, names, spoken):
+        kw = {k: v for k, v in self.prompt.kwargs(c).items() if k != "reasoning_effort"}
+        kw["enable_thinking"] = False
+        acc = self.llm.complete(self.prompt.side(chat_id, NEXT_SPEAKER.format(names=", ".join(names),
+                                                                            spoken=", ".join(spoken) or "-")),
+                                kwargs=kw, sampling={"temperature": 0.4}, max_tokens=200, tools=self.tools.specs(c),
+                                stop=self.stop)
+        who = (self._json(acc["content"]) or {}).get("next")
+        if not who:
+            return None
+        return next((n for n in names if n.lower() == str(who).strip().lower() and n not in spoken), None)
 
     def swipe(self, chat_id, mid, direction):
         m = self.store.msg(mid)
@@ -1032,7 +1079,7 @@ class Engine(EngineView):
         meta["typed"] = text
         self.store.add_message(chat_id, m["parent_id"], "user", text + tail, meta=meta, ooc=bool(m["ooc"]), media=media)
         self.emit("history", chat_id)
-        self._turn(chat_id)
+        self._respond(chat_id)
 
     def continue_msg(self, chat_id, mid):
         m = self.store.msg(mid)

@@ -4660,6 +4660,8 @@ def _(
                 if ui is not None:
                     um = next((m for m in path if m["id"] == msgs[ui].get("_id")), None)
                     note = ((um or {}).get("meta") or {}).get("ephemeral") or ""
+                    if extra:  # e.g. the next speaker in a group turn
+                        note = "\n\n".join([note] + [x for x in extra if x]).strip()
                     target = msgs[ui]
             if note and target is not None:
                 persona = (((self.ctx(chat_id).get("cards") or {}).get("persona")) or {}).get("name") or "kamu"
@@ -6035,6 +6037,10 @@ def _(
     {{"proposals": [{{"card": "nama tokoh", "field": "kunci field di skema", "value": "isi baru lengkap", "reason": "kenapa"}}]}}
     Skema kartu tokoh: {fields}"""
 
+    NEXT_SPEAKER = """Siapa tokoh yang paling wajar bereaksi berikutnya terhadap giliran ini, sesuai agenda, posisi, dan apa yang
+    ia tahu? Pilihan: {names}. Sudah bereaksi di giliran ini: {spoken}. Kalau sebaiknya giliran kembali ke pemain, jawab null.
+    Jawab HANYA JSON: {{"next": "nama" atau null}}"""
+
     FACTCHECK_CLAIMS = """Periksa jawaban terakhir. Daftarkan klaim fakta {kind} yang spesifik di dalamnya (tanggal, angka, nama
     satuan, senjata, pangkat, tempat, prosedur), bukan hal fiksi cerita. Maksimal 6. Jawab HANYA JSON: {{"claims": ["..."]}}"""
 
@@ -6306,7 +6312,7 @@ def _(
                 if self.stop.is_set():
                     return
             pending = len(full) // 3 + 1500 * len(media)
-            self._turn(chat_id, extra=extra, pending_estimate=pending)
+            self._respond(chat_id, extra=extra, pending_estimate=pending)
 
         def _catch_up(self, chat_id, uid):
             """AFK: advance the world clock by the real time that passed (GM scale) and let the world act."""
@@ -6338,7 +6344,7 @@ def _(
 
         # ---------- the turn ----------
 
-        def _turn(self, chat_id, extra=None, pending_estimate=0, length_override=None):
+        def _turn(self, chat_id, extra=None, pending_estimate=0, length_override=None, group_note=True):
             if not self.servers.ready():
                 raise RuntimeError("Server model belum READY. Klik Start dan tunggu status READY.")
             c = self.prompt.ctx(chat_id)
@@ -6363,7 +6369,7 @@ def _(
             totals = {"tokens": 0, "think_s": 0.0, "tools": 0, "gen_s": 0.0}
             usage, final_id, used_info = {}, None, {}
             extra = list(extra or [])
-            if c["kind"] == "group":
+            if c["kind"] == "group" and group_note:
                 extra.append(self._group_note(chat_id, c))
             avoid = c["settings"].get("avoid") or []
             if avoid:
@@ -6974,7 +6980,50 @@ def _(
             """Answer from a given message (reroll, a stopped turn, a failed turn)."""
             self.store.set_head(chat_id, head)
             self.emit("history", chat_id)
-            self._turn(chat_id)
+            self._respond(chat_id)
+
+        def _respond(self, chat_id, extra=None, pending_estimate=0):
+            chat = self.store.chat(chat_id) or {}
+            if chat.get("kind") == "group" and (chat.get("settings") or {}).get("group_mode") == "single":
+                return self._group_round(chat_id, extra, pending_estimate)
+            return self._turn(chat_id, extra=extra, pending_estimate=pending_estimate)
+
+        MAX_SPEAKERS = 3
+
+        def _group_round(self, chat_id, extra=None, pending_estimate=0):
+            """One character per reply: the model picks who reacts next, that character's reply is generated on its own;
+            up to MAX_SPEAKERS per turn, or until it hands the turn back to the player."""
+            c = self.prompt.ctx(chat_id)
+            names = [ch["name"] for ch in c["cards"]["character"]]
+            forced = c["settings"].get("speaker")
+            spoken = []
+            for k in range(min(self.MAX_SPEAKERS, max(1, len(names)))):
+                if self.stop.is_set():
+                    break
+                if k == 0 and forced:
+                    who = next((n for n in names if n.lower() == str(forced).lower()), forced)
+                    self.store.chat_settings(chat_id, speaker=None)
+                else:
+                    who = self._next_speaker(chat_id, c, names, spoken)
+                    if not who:
+                        break
+                note = (f"Giliran ini hanya {who} yang bicara dan bertindak. Awali dengan **{who}**. Jangan menulis tokoh lain "
+                        f"atau tindakan pemain.")
+                self._turn(chat_id, extra=list(extra or []) + [note] if k == 0 else [note],
+                           pending_estimate=pending_estimate if k == 0 else 0, group_note=False)
+                spoken.append(who)
+
+        def _next_speaker(self, chat_id, c, names, spoken):
+            kw = {k: v for k, v in self.prompt.kwargs(c).items() if k != "reasoning_effort"}
+            kw["enable_thinking"] = False
+            acc = self.llm.complete(self.prompt.side(chat_id, NEXT_SPEAKER.format(names=", ".join(names),
+                                                                                spoken=", ".join(spoken) or "-")),
+                                    kwargs=kw, sampling={"temperature": 0.4}, max_tokens=200, tools=self.tools.specs(c),
+                                    stop=self.stop)
+            who = (self._json(acc["content"]) or {}).get("next")
+            if not who:
+                return None
+            return next((n for n in names if n.lower() == str(who).strip().lower() and n not in spoken), None)
 
         def swipe(self, chat_id, mid, direction):
             m = self.store.msg(mid)
@@ -7021,7 +7070,7 @@ def _(
             meta["typed"] = text
             self.store.add_message(chat_id, m["parent_id"], "user", text + tail, meta=meta, ooc=bool(m["ooc"]), media=media)
             self.emit("history", chat_id)
-            self._turn(chat_id)
+            self._respond(chat_id)
 
         def continue_msg(self, chat_id, mid):
             m = self.store.msg(mid)
@@ -7627,6 +7676,7 @@ def _():
         <div class="qr-world" hidden></div>
         <div class="qr-composer">
           <div class="qr-notice" hidden></div>
+          <div class="qr-speaker-bar" hidden></div>
           <div class="qr-pending" hidden></div>
           <div class="qr-statusline" hidden></div>
           <form class="qr-form">
@@ -7820,17 +7870,40 @@ def _():
         if (st.stopped) bits.push("dihentikan");
         return bits.length ? `<div class="qr-stats-line" title="${esc(st.model || "")}">${bits.join(" · ")}</div>` : "";
       }
+      // Avatars go into one <style> per story (a class per character), not into every speaker paragraph.
+      const avStyle = document.createElement("style");
+      el.appendChild(avStyle);
+      function syncAvatars() {
+        const map = {}, css = [];
+        (get("story").cards || []).filter((x) => x.role === "character").forEach((x, i) => {
+          map[x.name.toLowerCase()] = { cls: x.avatar ? `qr-av-${i}` : "", name: x.name };
+          if (x.avatar) css.push(`.qr .qr-av-${i}{background-image:url(data:image/png;base64,${x.avatar});background-size:cover;background-position:center}`);
+        });
+        const text = css.join("\n");
+        if (avStyle.textContent !== text) avStyle.textContent = text;
+        state.avMap = map;
+      }
       function speakers(html) {
         const c = get("chat");
         if (c.kind !== "group") return html;
-        const av = {};
-        for (const x of (get("story").cards || [])) if (x.role === "character") av[x.name.toLowerCase()] = x.avatar;
+        const av = state.avMap || {};
         return html.replace(/<p><strong>([^<]{1,60})<\/strong>/g, (m, name) => {
           const key = name.replace(/[:：]$/, "").trim().toLowerCase();
           if (!(key in av)) return m;
-          const img = av[key] ? `<img class="qr-avatar sm" src="data:image/png;base64,${av[key]}" alt="">` : `<span class="qr-avatar sm qr-noav">${icon("card")}</span>`;
+          const img = av[key].cls ? `<span class="qr-avatar sm ${av[key].cls}"></span>` : `<span class="qr-avatar sm qr-noav">${icon("card")}</span>`;
           return `<p class="qr-speaker">${img}<strong>${name}</strong>`;
         });
+      }
+      function renderSpeakerBar() {
+        const c = get("chat"), bar = $(".qr-speaker-bar");
+        const chars = Object.values(state.avMap || {});
+        bar.hidden = c.kind !== "group" || !chars.length;
+        if (bar.hidden) return;
+        const cur = ((c.settings || {}).speaker || "").toLowerCase(), single = (c.settings || {}).group_mode === "single";
+        bar.innerHTML = `<span class="qr-muted">Berikutnya:</span>
+          <button class="qr-chip ${cur ? "" : "on"}" data-act="speaker" data-name="">${icon("users")}${single ? "Model memilih" : "GM (semua)"}</button>
+          ${chars.map((x) => `<button class="qr-chip ${cur === x.name.toLowerCase() ? "on" : ""}" data-act="speaker" data-name="${esc(x.name)}">${x.cls ? `<span class="qr-avatar sm ${x.cls}"></span>` : ""}${esc(x.name)}</button>`).join("")}
+          <label class="qr-check"><input type="checkbox" class="qr-single" ${single ? "checked" : ""}> satu tokoh per balasan</label>`;
       }
       function itemHTML(it) {
         const chap = it.chapter ? `<div class="qr-chapter">${icon("bookmark")}${esc(it.chapter)}</div>` : "";
@@ -8340,6 +8413,9 @@ def _():
         }
       });
       $(".qr-file-att").addEventListener("cancel", () => { state.imageIntent = false; });
+      $(".qr-speaker-bar").addEventListener("change", (e) => {
+        if (e.target.classList.contains("qr-single")) send("settings", { group_mode: e.target.checked ? "single" : null });
+      });
       $(".qr-file-card").addEventListener("change", async (e) => { const f = e.target.files?.[0]; e.target.value = ""; if (f) send("card_import", { b64: await readB64(f), name: f.name }); });
       $(".qr-file-avatar").addEventListener("change", async (e) => {
         const f = e.target.files?.[0]; e.target.value = "";
@@ -8484,6 +8560,7 @@ def _():
           case "canon-save": { const box = btn.closest(".qr-canon"); const sec = box.dataset.sec || box.querySelector(".qr-canon-new").value.trim(); if (sec) send("canon", { section: sec, text: box.querySelector("textarea").value }); break; }
           case "toc": { const h = model.get("history") || {}, cid = get("chat").id;
             openModal("Daftar bab", (h.chapters || []).map((c) => `<button class="qr-libitem" data-act="jump-to" data-chat="${cid}" data-id="${c.id}">${icon("bookmark")}<b>${esc(c.title)}</b><span class="qr-muted">pesan ${c.n}</span></button>`).join("") || "Belum ada bab. Tandai dengan /bab atau tombol bab di balasan."); break; }
+          case "speaker": send("settings", { speaker: btn.dataset.name || null }); break;
           case "props-make": send("proposals_make"); toast("Menyusun usulan…"); break;
           case "prop-yes": case "prop-no": send("proposal", { pid: Number(btn.closest("[data-pid]").dataset.pid), accept: act === "prop-yes" }); break;
           case "thread-add": { const box = btn.closest(".qr-threads"), title = box.querySelector(".qr-thread-title").value.trim();
@@ -8609,6 +8686,7 @@ def _():
         const learn = !!((c.settings || {}).learn);
         if (learn !== state.learn) { state.learn = learn; el.classList.toggle("learn", learn); els.clear(); list.innerHTML = ""; }
         if (state.lastChat !== c.id) { state.lastChat = c.id; state.studioCard = null; state.imageIntent = false; state.know = null; state.threads = null; state.props = null; els.clear(); list.innerHTML = ""; fol.jump(); }
+        syncAvatars(); renderSpeakerBar();
         renderTop(); renderChats(); renderStudio(); renderDrawer(); renderHistory();
       };
       const onCard = () => {
@@ -8645,7 +8723,7 @@ def _():
           if (g) g.textContent = s.gpu ? `GPU ${s.gpu.util.toFixed(0)}% · VRAM ${s.gpu.used_gb.toFixed(1)} / ${s.gpu.total_gb.toFixed(0)} GB` : "";
         }, "change:backup": renderBackup,
         "change:library": () => { if (state.tab === "cards" || state.tab === "story") renderDrawer(); renderWizard(); },
-        "change:card": onCard, "change:story": () => { renderStudio(); if (state.tab === "story") renderDrawer(); },
+        "change:card": onCard, "change:story": () => { syncAvatars(); renderSpeakerBar(); renderStudio(); if (state.tab === "story") renderDrawer(); },
         "change:rev": () => {
           if (drawer.hidden) return;
           if (state.tab === "memory") send("memory", { q: (state.memory || {}).q || "" });
@@ -8866,6 +8944,9 @@ def _(UI_APP_JS, UI_BASE_JS):
     .qr-notice { max-width:800px; margin:0 auto 6px; display:flex; align-items:flex-start; gap:8px; font-size:13.5px; background:var(--panel);
       border:1px solid var(--line); border-radius:12px; padding:8px 10px; }
     .qr-notice span { flex:1; }
+    .qr-speaker-bar { display:flex; flex-wrap:wrap; align-items:center; gap:6px; max-width:800px; margin:0 auto 6px; font-size:13px; }
+    .qr-speaker-bar .qr-chip { display:inline-flex; align-items:center; gap:6px; }
+    .qr-speaker-bar .qr-chip.on { outline:1px solid var(--text); }
     .qr-stale { display:flex; align-items:center; gap:8px; font-size:13px; color:var(--warn); background:var(--panel);
       border:1px solid var(--line); border-radius:10px; padding:8px 10px; margin-bottom:10px; }
     .qr-stale span { flex:1; }

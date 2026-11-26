@@ -1011,3 +1011,32 @@ def test_embedder_model_switch_rebuilds_vectors(nb):
     finally:
         SV.state["embed_model"] = old
         S.meta_set("embed_model", old or "0.6B")
+
+
+def test_group_one_character_per_reply(engine, nb, fake):
+    C, S = nb["CARDS"], nb["STORE"]
+    lotte = C.save(None, "character", {"name": "Lotte Braun"})
+    otto = C.save(None, "character", {"name": "Otto Kranz"})
+    chat = engine.start_story({"character": [lotte, otto]})
+    S.chat_settings(chat, group_mode="single", length="pendek")
+    fake["script"] += [{"content": json.dumps({"next": "Lotte Braun"})}, {"content": "**Lotte Braun** Halo, kamu datang."},
+                       {"content": json.dumps({"next": "Otto Kranz"})}, {"content": "**Otto Kranz** Hm. Telat."}]
+    # with two characters the round ends after both spoke (each at most once): no third "who next" request
+    n0 = len(fake["log"])
+    engine.send(chat, "Aku masuk ke ruangan.")
+    wait_idle(engine, 60)
+    path = S.path(chat)
+    bots = [m for m in path if m["role"] == "assistant"][-2:]
+    assert bots[0]["content"].startswith("**Lotte Braun**") and bots[1]["content"].startswith("**Otto Kranz**")
+    assert bots[1]["parent_id"] == bots[0]["id"]  # Otto answers after Lotte
+    second = [b for b in fake["log"][n0:] if "Giliran ini hanya Otto Kranz" in json.dumps(b["messages"], ensure_ascii=False)]
+    assert second, "the second speaker's instruction did not reach the model"
+    # a chosen speaker goes first
+    S.chat_settings(chat, speaker="Otto Kranz")
+    fake["script"] += [{"content": "**Otto Kranz** Aku duluan."}, {"content": json.dumps({"next": None})}]
+    n1 = len(fake["log"])
+    engine.send(chat, "Siapa yang bicara?")
+    wait_idle(engine, 60)
+    sent = [json.dumps(b["messages"][-1], ensure_ascii=False)[-160:] for b in fake["log"][n1:]]
+    assert [m for m in S.path(chat) if m["role"] == "assistant"][-1]["content"].startswith("**Otto Kranz** Aku duluan"), sent
+    assert not S.chat(chat)["settings"].get("speaker")

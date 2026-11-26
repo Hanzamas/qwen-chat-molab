@@ -350,6 +350,8 @@ class Prompt:
             if ui is not None:
                 um = next((m for m in path if m["id"] == msgs[ui].get("_id")), None)
                 note = ((um or {}).get("meta") or {}).get("ephemeral") or ""
+                if extra:  # e.g. the next speaker in a group turn
+                    note = "\n\n".join([note] + [x for x in extra if x]).strip()
                 target = msgs[ui]
         if note and target is not None:
             persona = (((self.ctx(chat_id).get("cards") or {}).get("persona")) or {}).get("name") or "kamu"
