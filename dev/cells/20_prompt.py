@@ -13,6 +13,9 @@ Ikuti kartu Gaya dan kartu GM di bawah. Pemain adalah tokoh di kartu Persona.
 Aturan tetap:
 - Jangan menulis ucapan, keputusan, atau tindakan pemain melebihi yang dia tulis. Berhenti di titik pemain harus merespons.
 - Dunia tidak berputar di sekitar pemain: tokoh lain punya agenda dan bertindak sendiri, hanya berdasarkan apa yang mereka tahu.
+- Tiap tokoh (termasuk tokoh pemain) hanya tahu isi ingatannya di catatan sistem. Memory, buku cerita, dan lore adalah
+  pengetahuan narator; jangan biarkan tokoh memakainya kalau tidak ada di ingatannya. Ingatan bertanda KELIRU dipercaya
+  tokoh itu walaupun salah. Catat yang baru diketahui tokoh dengan knowledge_add atau tell.
 - Pesan pemain yang diawali [OOC] adalah percakapan di luar cerita: jawab di luar cerita, singkat, tanpa memerankan tokoh.
 - Bagian "Catatan sistem" di akhir pesan pemain dibuat sistem, bukan tulisan pemain. Pakai sebagai acuan, jangan dikutip.
 - Fakta dunia nyata yang spesifik dan tidak pasti: cek fact_lookup, lalu wiki_search/web_search. Simpan temuan dengan fact_save.
@@ -187,15 +190,28 @@ class Prompt:
 
     # ---------- temporary block ----------
 
-    def present_characters(self, c, text):
+    def present_characters(self, c, text, status=None):
+        """Characters in the scene: at the player's location (from status), or named in the last messages when no
+        location is known. Characters marked dead or gone are left out."""
         chars = c["cards"]["character"]
         if not chars:
             return []
+        status = status or {}
+        norm = lambda s: re.sub(r"\s+", " ", str(s or "").strip().lower())
+        here = norm((status.get("player") or {}).get("location"))
         low = (text or "").lower()
-        out = [chars[0]]
-        for ch in chars[1:]:
+        out = []
+        for i, ch in enumerate(chars):
+            st = status.get(ch["name"]) or {}
+            if norm(st.get("keadaan")) in ("mati", "pergi", "tewas", "meninggal"):
+                continue
             names = [ch["name"]] + list(ch["data"].get("aliases") or [])
-            if any(n and n.lower() in low for n in names):
+            named = any(n and n.lower() in low for n in names)
+            loc = norm(st.get("location"))
+            if here and loc:
+                if loc == here or here in loc or loc in here:
+                    out.append(ch)
+            elif named or (i == 0 and not here):
                 out.append(ch)
         return out
 
@@ -254,13 +270,21 @@ class Prompt:
         if st["status"].get("player"):
             lines.append("Status pemain: " + json.dumps(st["status"]["player"], ensure_ascii=False))
         recent = user_text + "\n" + (path[-2]["content"] if len(path) > 1 else "")
-        for ch in self.present_characters(c, recent):
+        mine = KNOW.relevant(chat_id, "player", recent, limit=6)
+        if mine:
+            persona = (c["cards"].get("persona") or {}).get("name") or "pemain"
+            lines.append(f"Ingatan tokoh pemain ({persona}), yang ia tahu atau yakini:\n" + "\n".join(KNOW.line(r) for r in mine))
+        for ch in self.present_characters(c, recent, st["status"]):
             bits = []
             if st["status"].get(ch["name"]):
                 bits.append("status " + json.dumps(st["status"][ch["name"]], ensure_ascii=False))
-            known = self.world.world_events(chat_id, ids, who=ch["name"], limit=5)
-            if known:
-                bits.append("baru tahu: " + "; ".join(e["text"][:200] for e in known))
+            heads = KNOW.relevant(chat_id, ch["name"], recent, limit=6)
+            if heads:
+                bits.append("ingatan (yang ia tahu atau yakini):\n" + "\n".join(KNOW.line(r) for r in heads))
+            else:
+                known = self.world.world_events(chat_id, ids, who=ch["name"], limit=3)
+                if known:
+                    bits.append("baru tahu: " + "; ".join(e["text"][:200] for e in known))
             detail = self.cards.render(ch, mode="detail", limit=2500)
             if detail:
                 bits.append(detail)
@@ -268,7 +292,9 @@ class Prompt:
                 lines.append(f"Tokoh di adegan, {ch['name']}:\n" + "\n".join(bits))
         lore = self.mem.lore_triggered(c["mem"]["card_ids"], recent)
         if lore:
-            lines.append("Lore terkait:\n" + "\n".join(f"- {e['title']}: {e['text'][:600]}" for e in lore))
+            lines.append("Lore terkait:\n" + "\n".join(
+                f"- {e['title']}{' (RAHASIA, hanya diketahui: ' + e['known_to'] + ')' if e.get('known_to') else ''}: {e['text'][:600]}"
+                for e in lore))
         world = c["cards"].get("world")
         facts = self.mem.fact_lookup(user_text, world["id"] if world else None, limit=5)
         if facts:

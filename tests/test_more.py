@@ -664,3 +664,46 @@ def test_memory_forget_and_update_on_a_branch(engine, nb):
     assert not M.search("kunci gudang", M.ctx_of(chat))
     S.set_head(chat, a)
     assert M.search("kunci gudang", M.ctx_of(chat))
+
+
+def test_character_memory_tell_and_presence(engine, nb, fake):
+    chat, _ = _story(nb, engine)
+    S, T, K, P = nb["STORE"], nb["TOOLS"], nb["KNOW"], nb["PROMPT"]
+    C = nb["CARDS"]
+    sid = S.chat(chat)["story_id"]
+    otto = C.save(None, "character", {"name": "Otto Kranz", "aliases": ["Otto"]})
+    nb["STORIES"].attach(sid, otto, "character")
+    engine.send(chat, "Halo.")
+    wait_idle(engine)
+    head = S.chat(chat)["head_id"]
+    T.call(chat, head, "tell", json.dumps({"from": "Lotte", "to": ["Otto"], "text": "Pemilik flat akan menaikkan sewa",
+                                           "truthful": False}))
+    T.call(chat, head, "world_event", json.dumps({"text": "Lotte melihat pemain mengambil kunci", "known_to": ["Lotte", "player"]}))
+    T.call(chat, head, "knowledge_add", json.dumps({"who": ["Raka"], "text": "Lotte punya adik di Hamburg", "source": "diberi tahu",
+                                                   "from": "Lotte"}))
+    otto_k = K.of(chat, "Otto Kranz")
+    assert otto_k and otto_k[0]["truth"] == "keliru" and otto_k[0]["source_who"] == "Lotte Braun"
+    assert any("kunci" in r["text"] for r in K.of(chat, "Lotte Braun"))
+    assert any("Hamburg" in r["text"] for r in K.of(chat, "player"))  # the persona's name is the player
+    # presence comes from location, not from being named
+    W = nb["WORLD"]
+    W.status_update(chat, head, "player", {"location": "Dapur"})
+    W.status_update(chat, head, "Otto Kranz", {"location": "Dapur"})
+    W.status_update(chat, head, "Lotte Braun", {"location": "Kamar Lotte"})
+    path = S.path(chat)
+    note, _ = P.ephemeral(chat, path, "Aku membuka kulkas.")
+    assert "Tokoh di adegan, Otto Kranz" in note and "Tokoh di adegan, Lotte Braun" not in note
+    assert "KELIRU" in note and "menaikkan sewa" in note
+    assert "Ingatan tokoh pemain (Raka)" in note
+    # another branch knows none of it
+    S.set_head(chat, path[0]["id"])
+    assert not K.of(chat, "Otto Kranz")
+
+
+def test_secret_lore_is_labelled(engine, nb):
+    chat, _ = _story(nb, engine)
+    S, C, P = nb["STORE"], nb["CARDS"], nb["PROMPT"]
+    world = nb["STORIES"].cards_of(S.chat(chat)["story_id"])["world"]["id"]
+    C.lore_save(world, "Identitas Lotte", "Lotte sebenarnya agen", "agen", "rahasia", known_to="Lotte, Otto")
+    note, _ = P.ephemeral(chat, S.path(chat), "Apa kamu agen?")
+    assert "RAHASIA, hanya diketahui: Lotte, Otto" in note

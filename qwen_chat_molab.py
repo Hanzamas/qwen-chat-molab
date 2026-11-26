@@ -1099,6 +1099,7 @@ def _(CFG, Path, json, os, sqlite3, threading, time):
         ("memories", "forgotten_at", "INTEGER"),    # message that forgot it (hidden only where that message is on the path)
         ("memories", "importance", "REAL NOT NULL DEFAULT 0.5"),
         ("memory_log", "message_id", "INTEGER"),
+        ("lore_entries", "known_to", "TEXT NOT NULL DEFAULT ''"),  # empty: common knowledge; else who knows this lore
     ]
     _SCHEMA_V2 = """
     CREATE TABLE IF NOT EXISTS canon_log (
@@ -1106,6 +1107,24 @@ def _(CFG, Path, json, os, sqlite3, threading, time):
         text TEXT NOT NULL DEFAULT '', created REAL NOT NULL
     );
     CREATE INDEX IF NOT EXISTS canon_log_story ON canon_log (story_id);
+    CREATE TABLE IF NOT EXISTS knowledge (
+        id INTEGER PRIMARY KEY, chat_id INTEGER NOT NULL, message_id INTEGER, holder TEXT NOT NULL, text TEXT NOT NULL,
+        kind TEXT NOT NULL DEFAULT 'fakta', source TEXT NOT NULL DEFAULT 'lihat sendiri', source_who TEXT NOT NULL DEFAULT '',
+        truth TEXT NOT NULL DEFAULT 'benar', importance REAL NOT NULL DEFAULT 0.5, world_time TEXT NOT NULL DEFAULT '',
+        forgotten_at INTEGER, created REAL NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS knowledge_chat ON knowledge (chat_id, holder);
+    CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_fts USING fts5(text, content='knowledge', content_rowid='id');
+    CREATE TRIGGER IF NOT EXISTS knowledge_ai AFTER INSERT ON knowledge BEGIN
+        INSERT INTO knowledge_fts(rowid, text) VALUES (new.id, new.text);
+    END;
+    CREATE TRIGGER IF NOT EXISTS knowledge_ad AFTER DELETE ON knowledge BEGIN
+        INSERT INTO knowledge_fts(knowledge_fts, rowid, text) VALUES ('delete', old.id, old.text);
+    END;
+    CREATE TRIGGER IF NOT EXISTS knowledge_au AFTER UPDATE OF text ON knowledge BEGIN
+        INSERT INTO knowledge_fts(knowledge_fts, rowid, text) VALUES ('delete', old.id, old.text);
+        INSERT INTO knowledge_fts(rowid, text) VALUES (new.id, new.text);
+    END;
     """
 
 
@@ -1443,6 +1462,14 @@ def _(CFG, Path, json, os, sqlite3, threading, time):
                 out.append(cur)
                 cur = parents[cur]
             return out[::-1]
+
+        def lineage(self, chat_id):
+            """This chat and the chats it continues, oldest last."""
+            out, cur = [], chat_id
+            while cur and cur not in out and len(out) < 20:
+                out.append(cur)
+                cur = ((self.chat(cur) or {}).get("settings") or {}).get("continued_from")
+            return out
 
         def visible_ids(self, chat_id):
             """Messages whose effects (memories, story book changes) count in this chat: its active path, plus the path of
@@ -2391,13 +2418,16 @@ def _(DEFAULT_CARDS, DEFAULT_SCHEMAS, STORE, TXT, base64, json, re, time):
         def lore(self, card_id):
             return self.store.q("SELECT * FROM lore_entries WHERE card_id = ? ORDER BY kind, title", (card_id,))
 
-        def lore_save(self, card_id, title, text, keys="", kind="istilah", core=False, entry_id=None):
+        def lore_save(self, card_id, title, text, keys="", kind="istilah", core=False, entry_id=None, known_to=""):
+            """known_to: comma list of who knows this (empty: common knowledge)."""
+            known_to = ", ".join(x.strip() for x in str(known_to or "").split(",") if x.strip())
             if entry_id:
-                self.store.x("UPDATE lore_entries SET title = ?, text = ?, keys = ?, kind = ?, core = ?, updated = ? WHERE id = ?",
-                             (title, text, keys, kind, int(core), time.time(), entry_id))
+                self.store.x("UPDATE lore_entries SET title = ?, text = ?, keys = ?, kind = ?, core = ?, known_to = ?, updated = ? "
+                             "WHERE id = ?", (title, text, keys, kind, int(core), known_to, time.time(), entry_id))
             else:
-                entry_id = self.store.x("INSERT INTO lore_entries (card_id, kind, title, keys, text, core, updated) "
-                                        "VALUES (?, ?, ?, ?, ?, ?, ?)", (card_id, kind, title, keys, text, int(core), time.time()))
+                entry_id = self.store.x("INSERT INTO lore_entries (card_id, kind, title, keys, text, core, known_to, updated) "
+                                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (card_id, kind, title, keys, text, int(core), known_to,
+                                                                            time.time()))
             self._changed(card_id)
             return entry_id
 
@@ -2426,7 +2456,7 @@ def _(DEFAULT_CARDS, DEFAULT_SCHEMAS, STORE, TXT, base64, json, re, time):
             c = self.get(card_id)
             out = {"format": "qcard", "version": 1, "type": c["type"], "name": c["name"], "schema": self.schema(c["type"]),
                    "data": c["data"], "avatar": c["avatar"],
-                   "lore": [{k: e[k] for k in ("kind", "title", "keys", "text", "core")} for e in self.lore(card_id)],
+                   "lore": [{k: e.get(k, "") for k in ("kind", "title", "keys", "text", "core", "known_to")} for e in self.lore(card_id)],
                    "timeline": [{k: e[k] for k in ("at", "title", "text")} for e in self.timeline(card_id)]}
             if c["type"] == "world":
                 out["facts"] = self.store.q("SELECT claim, source_url, source_title, checked, confidence, status, tags "
@@ -2463,7 +2493,7 @@ def _(DEFAULT_CARDS, DEFAULT_SCHEMAS, STORE, TXT, base64, json, re, time):
             cid = self.save(None, type_, data, name=str(name) if name is not None else None, avatar=avatar)
             for e in obj.get("lore") or []:
                 self.lore_save(cid, e.get("title", ""), e.get("text", ""), e.get("keys", ""), e.get("kind", "istilah"),
-                               bool(e.get("core")))
+                               bool(e.get("core")), known_to=e.get("known_to", ""))
             for e in obj.get("timeline") or []:
                 self.timeline_save(cid, e.get("at", ""), e.get("title", ""), e.get("text", ""))
             for f in obj.get("facts") or []:
@@ -3404,9 +3434,100 @@ def _(
                                 f"ORDER BY kind, title", list(card_ids))
 
 
+    class Knowledge:
+        """What each character knows or believes in one chat (and the chats it continues), on the active branch.
+        The story book is the truth only the narrator sees; this is what is in each head, and it can be wrong."""
+
+        KINDS = ("fakta", "rahasia", "pendapat", "perasaan", "janji", "salah paham")
+        SOURCES = ("lihat sendiri", "diberi tahu", "gosip", "menduga")
+        TRUTH = ("benar", "keliru", "belum pasti")
+
+        def __init__(self, store):
+            self.store = store
+
+        def _rows(self, chat_id, sql="", args=()):
+            chats = self.store.lineage(chat_id)
+            vis = self.store.visible_ids(chat_id)
+            rows = self.store.q(f"SELECT * FROM knowledge WHERE chat_id IN ({','.join('?' * len(chats))}) {sql}",
+                                list(chats) + list(args)) if chats else []
+            return [r for r in rows if (not r["message_id"] or r["message_id"] in vis)
+                    and not (r["forgotten_at"] and r["forgotten_at"] in vis)]
+
+        def add(self, chat_id, message_id, holders, text, kind="fakta", source="lihat sendiri", source_who="", truth="benar",
+                importance=0.5, world_time=""):
+            text = (text or "").strip()
+            if not text:
+                raise ValueError("teks kosong")
+            kind = kind if kind in self.KINDS else "fakta"
+            source = source if source in self.SOURCES else "lihat sendiri"
+            truth = truth if truth in self.TRUTH else "benar"
+            try:
+                importance = min(max(float(importance), 0.0), 1.0)
+            except (TypeError, ValueError):
+                importance = 0.5
+            out = []
+            for h in dict.fromkeys(holders):
+                same = [r for r in self._rows(chat_id, "AND holder = ?", (h,)) if TXT.jaccard(text, r["text"]) >= 0.8]
+                if same:
+                    out.append(same[0]["id"])
+                    continue
+                out.append(self.store.x("INSERT INTO knowledge (chat_id, message_id, holder, text, kind, source, source_who, truth, "
+                                        "importance, world_time, created) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                                        (chat_id, message_id, h, text[:2000], kind, source, source_who or "", truth, importance,
+                                         str(world_time or ""), time.time())))
+            return out
+
+        def holders(self, chat_id):
+            return sorted({r["holder"] for r in self._rows(chat_id)})
+
+        def of(self, chat_id, holder, limit=200):
+            rows = self._rows(chat_id, "AND holder = ?", (holder,))
+            return sorted(rows, key=lambda r: -r["id"])[:limit]
+
+        def relevant(self, chat_id, holder, query, limit=6):
+            """The holder's knowledge most related to the scene: keyword match first, then importance, then recency."""
+            rows = self._rows(chat_id, "AND holder = ?", (holder,))
+            if not rows:
+                return []
+            q = TXT.fts_query(query or "")
+            hit = {}
+            if q:
+                ids = {r["id"] for r in rows}
+                for rank, r in enumerate(self.store.q("SELECT rowid AS id FROM knowledge_fts WHERE knowledge_fts MATCH ? "
+                                                      "ORDER BY bm25(knowledge_fts) LIMIT 200", (q,))):
+                    if r["id"] in ids:
+                        hit[r["id"]] = rank
+            newest = max(r["id"] for r in rows)
+            def score(r):
+                s = (3.0 - min(hit[r["id"]], 30) / 10) if r["id"] in hit else 0.0
+                return s + 2 * float(r["importance"] or 0.5) + (0.5 if r["id"] > newest - 20 else 0)
+            return sorted(rows, key=score, reverse=True)[:limit]
+
+        def forget(self, kid, chat_id=None, message_id=None):
+            if message_id:
+                self.store.x("UPDATE knowledge SET forgotten_at = ? WHERE id = ?", (message_id, kid))
+            else:
+                self.store.x("DELETE FROM knowledge WHERE id = ?", (kid,))
+
+        def edit(self, kid, **fields):
+            allowed = {k: v for k, v in fields.items() if k in ("text", "kind", "truth", "source", "source_who", "importance")}
+            if allowed:
+                sets = ", ".join(f"{k} = ?" for k in allowed)
+                self.store.x(f"UPDATE knowledge SET {sets} WHERE id = ?", (*allowed.values(), kid))
+
+        @staticmethod
+        def line(r):
+            tags = [r["kind"]] if r["kind"] != "fakta" else []
+            if r["truth"] != "benar":
+                tags.append(r["truth"].upper())
+            src = r["source"] + (f" dari {r['source_who']}" if r["source_who"] else "")
+            return f"- {r['text']} ({src}{'; ' + ', '.join(tags) if tags else ''})"
+
+
+    KNOW = Knowledge(STORE)
     EMB = Embedder(STORE, SERVERS)
     MEM = Memory(STORE, CARDS, STORIES, EMB)
-    return EMB, MEM, Memory
+    return EMB, KNOW, Knowledge, MEM, Memory
 
 
 @app.cell(hide_code=True)
@@ -3840,6 +3961,7 @@ def _(CFG, SERVERS, Sys, json, threading, time, urllib):
 @app.cell(hide_code=True)
 def _(
     CARDS,
+    KNOW,
     LLM_CLIENT,
     MEM,
     PRESETS,
@@ -3871,6 +3993,9 @@ def _(
     Aturan tetap:
     - Jangan menulis ucapan, keputusan, atau tindakan pemain melebihi yang dia tulis. Berhenti di titik pemain harus merespons.
     - Dunia tidak berputar di sekitar pemain: tokoh lain punya agenda dan bertindak sendiri, hanya berdasarkan apa yang mereka tahu.
+    - Tiap tokoh (termasuk tokoh pemain) hanya tahu isi ingatannya di catatan sistem. Memory, buku cerita, dan lore adalah
+      pengetahuan narator; jangan biarkan tokoh memakainya kalau tidak ada di ingatannya. Ingatan bertanda KELIRU dipercaya
+      tokoh itu walaupun salah. Catat yang baru diketahui tokoh dengan knowledge_add atau tell.
     - Pesan pemain yang diawali [OOC] adalah percakapan di luar cerita: jawab di luar cerita, singkat, tanpa memerankan tokoh.
     - Bagian "Catatan sistem" di akhir pesan pemain dibuat sistem, bukan tulisan pemain. Pakai sebagai acuan, jangan dikutip.
     - Fakta dunia nyata yang spesifik dan tidak pasti: cek fact_lookup, lalu wiki_search/web_search. Simpan temuan dengan fact_save.
@@ -4045,15 +4170,28 @@ def _(
 
         # ---------- temporary block ----------
 
-        def present_characters(self, c, text):
+        def present_characters(self, c, text, status=None):
+            """Characters in the scene: at the player's location (from status), or named in the last messages when no
+            location is known. Characters marked dead or gone are left out."""
             chars = c["cards"]["character"]
             if not chars:
                 return []
+            status = status or {}
+            norm = lambda s: re.sub(r"\s+", " ", str(s or "").strip().lower())
+            here = norm((status.get("player") or {}).get("location"))
             low = (text or "").lower()
-            out = [chars[0]]
-            for ch in chars[1:]:
+            out = []
+            for i, ch in enumerate(chars):
+                st = status.get(ch["name"]) or {}
+                if norm(st.get("keadaan")) in ("mati", "pergi", "tewas", "meninggal"):
+                    continue
                 names = [ch["name"]] + list(ch["data"].get("aliases") or [])
-                if any(n and n.lower() in low for n in names):
+                named = any(n and n.lower() in low for n in names)
+                loc = norm(st.get("location"))
+                if here and loc:
+                    if loc == here or here in loc or loc in here:
+                        out.append(ch)
+                elif named or (i == 0 and not here):
                     out.append(ch)
             return out
 
@@ -4112,13 +4250,21 @@ def _(
             if st["status"].get("player"):
                 lines.append("Status pemain: " + json.dumps(st["status"]["player"], ensure_ascii=False))
             recent = user_text + "\n" + (path[-2]["content"] if len(path) > 1 else "")
-            for ch in self.present_characters(c, recent):
+            mine = KNOW.relevant(chat_id, "player", recent, limit=6)
+            if mine:
+                persona = (c["cards"].get("persona") or {}).get("name") or "pemain"
+                lines.append(f"Ingatan tokoh pemain ({persona}), yang ia tahu atau yakini:\n" + "\n".join(KNOW.line(r) for r in mine))
+            for ch in self.present_characters(c, recent, st["status"]):
                 bits = []
                 if st["status"].get(ch["name"]):
                     bits.append("status " + json.dumps(st["status"][ch["name"]], ensure_ascii=False))
-                known = self.world.world_events(chat_id, ids, who=ch["name"], limit=5)
-                if known:
-                    bits.append("baru tahu: " + "; ".join(e["text"][:200] for e in known))
+                heads = KNOW.relevant(chat_id, ch["name"], recent, limit=6)
+                if heads:
+                    bits.append("ingatan (yang ia tahu atau yakini):\n" + "\n".join(KNOW.line(r) for r in heads))
+                else:
+                    known = self.world.world_events(chat_id, ids, who=ch["name"], limit=3)
+                    if known:
+                        bits.append("baru tahu: " + "; ".join(e["text"][:200] for e in known))
                 detail = self.cards.render(ch, mode="detail", limit=2500)
                 if detail:
                     bits.append(detail)
@@ -4126,7 +4272,9 @@ def _(
                     lines.append(f"Tokoh di adegan, {ch['name']}:\n" + "\n".join(bits))
             lore = self.mem.lore_triggered(c["mem"]["card_ids"], recent)
             if lore:
-                lines.append("Lore terkait:\n" + "\n".join(f"- {e['title']}: {e['text'][:600]}" for e in lore))
+                lines.append("Lore terkait:\n" + "\n".join(
+                    f"- {e['title']}{' (RAHASIA, hanya diketahui: ' + e['known_to'] + ')' if e.get('known_to') else ''}: {e['text'][:600]}"
+                    for e in lore))
             world = c["cards"].get("world")
             facts = self.mem.fact_lookup(user_text, world["id"] if world else None, limit=5)
             if facts:
@@ -4267,8 +4415,9 @@ def _(TXT, re, threading, time):
     {anchors}"""
 
     FLUSH_INSTRUCTION = """Pesan {a} sampai {b} akan dipadatkan menjadi ringkasan. Sebelum itu, simpan yang masih perlu diingat:
-    perbarui buku cerita (canon_set), simpan atau perbarui memory penting (memory_save / memory_update, lingkup yang tepat), dan catat
-    status tokoh yang belum tercatat (status_update). Panggil tool yang perlu, lalu jawab "selesai". Jangan menulis cerita."""
+    perbarui buku cerita (canon_set), simpan atau perbarui memory penting (memory_save / memory_update, lingkup yang tepat), catat
+    status tokoh yang belum tercatat (status_update), dan catat siapa tahu apa yang belum tercatat: apa yang disaksikan, diceritakan,
+    atau disalahpahami tiap tokoh (knowledge_add / tell). Panggil tool yang perlu, lalu jawab "selesai". Jangan menulis cerita."""
 
     ERA_INSTRUCTION = """Padatkan ringkasan-ringkasan kronik lama berikut menjadi SATU ringkasan era, sekitar sepertiga panjangnya.
     Pertahankan format (## Inti, ## Tujuan dan preferensi, ## Tokoh dan status, ## Kronologi, ## Fakta, angka, nama,
@@ -4407,7 +4556,8 @@ def _(TXT, re, threading, time):
             msgs = self.prompt.side(chat_id, FLUSH_INSTRUCTION.format(a=a, b=b), path=path)
             c = self.prompt.ctx(chat_id)
             head = path[-1]["id"] if path else None
-            allowed = {"canon_set", "memory_save", "memory_update", "memory_forget", "status_update", "fact_save", "world_event"}
+            allowed = {"canon_set", "memory_save", "memory_update", "memory_forget", "status_update", "fact_save", "world_event",
+                       "knowledge_add", "tell"}
             tools = [t for t in toolbox.specs(c) if t["function"]["name"] in allowed]
             for _ in range(4):
                 acc = self.llm.chat(msgs, tools=tools, kwargs=self.prompt.kwargs(c), sampling={"temperature": 0.6},
@@ -4495,6 +4645,8 @@ def _(TXT, re, threading, time):
 def _(
     CARDS,
     Cards,
+    KNOW,
+    Knowledge,
     MEM,
     Memory,
     STORE,
@@ -4547,8 +4699,18 @@ def _(
             {"subject": _S, "changes": {"type": "object"}, "reason": _S}, ["subject", "changes"]),
         _fn("roll", "Roll for an uncertain outcome. odds = chance of success 0..1 chosen for plausibility. "
             "The system's result is binding.", {"event": _S, "odds": _N}, ["event", "odds"]),
-        _fn("world_event", "Record an off-screen event. known_to: names who know it (use 'player' for the player).",
+        _fn("world_event", "Record an off-screen event. known_to: names who know it (use 'player' for the player). "
+            "Everyone in known_to also gets it in their memory.",
             {"text": _S, "known_to": {"type": "array", "items": _S}, "public": _B}, ["text"]),
+        _fn("knowledge_add", "Record what characters now know or believe (who: names; 'player' = the player's character). Use "
+            "it for what they witnessed, were told, overheard, guessed or misunderstood. truth: benar, keliru (they believe "
+            "something false: a lie, a wrong rumor), belum pasti. Characters act only on what is in their memory.",
+            {"who": {"type": "array", "items": _S}, "text": _S,
+             "kind": {"type": "string", "enum": list(Knowledge.KINDS)},
+             "source": {"type": "string", "enum": list(Knowledge.SOURCES)}, "from": _S,
+             "truth": {"type": "string", "enum": list(Knowledge.TRUTH)}, "importance": _N}, ["who", "text"]),
+        _fn("tell", "A character tells others something (true or a lie). It lands in the listeners' memory.",
+            {"from": _S, "to": {"type": "array", "items": _S}, "text": _S, "truthful": _B}, ["from", "to", "text"]),
         _fn("canon_set", "Write a section of the story book (what is true now in this story). Empty text removes it.",
             {"section": _S, "text": _S}, ["section", "text"]),
         _fn("card_read", "Read the full card of a character in this story.", {"name": _S}, ["name"]),
@@ -4762,10 +4924,53 @@ def _(
             verdict = "BERHASIL" if r["success"] else "GAGAL"
             return {**r, "result": f"{verdict} (peluang {r['odds']:.0%}). Hasil ini wajib diikuti."}
 
+        def _holder(self, chat_id, name):
+            """Card name for a character name or alias; 'player' for the player or the persona's name."""
+            n = str(name or "").strip()
+            if not n:
+                return ""
+            if n.lower() in ("player", "pemain", "kamu", "you"):
+                return "player"
+            _, cards = self._story(chat_id)
+            persona = cards.get("persona") if cards else None
+            if persona and n.lower() == persona["name"].lower():
+                return "player"
+            for ch in (cards or {}).get("character", []):
+                if n.lower() in [ch["name"].lower()] + [str(a).lower() for a in ch["data"].get("aliases") or []]:
+                    return ch["name"]
+            return n
+
+        def _holders(self, chat_id, names):
+            names = names if isinstance(names, list) else [x for x in re.split(r"[,;]", str(names or ""))]
+            return [h for h in (self._holder(chat_id, x) for x in names) if h]
+
         def t_world_event(self, chat_id, mid, text, known_to=None, public=False):
             st = self.world.state(chat_id, self.store.path_ids(chat_id))
             eid = self.world.add_world_event(chat_id, mid, st["time"], text, known_to or [], public)
+            holders = self._holders(chat_id, known_to or [])
+            if holders:
+                KNOW.add(chat_id, mid, holders, text, source="lihat sendiri", world_time=st["time_text"])
             return {"saved": eid}
+
+        def t_knowledge_add(self, chat_id, mid, who, text, kind="fakta", source="lihat sendiri", truth="benar",
+                            importance=0.5, **kw):
+            holders = self._holders(chat_id, who)
+            if not holders:
+                return {"error": "who kosong"}
+            st = self.world.state(chat_id, self.store.path_ids(chat_id))
+            ids = KNOW.add(chat_id, mid, holders, text, kind, source, kw.get("from") or kw.get("start") or "", truth, importance,
+                           st["time_text"])
+            return {"saved": ids, "who": holders}
+
+        def t_tell(self, chat_id, mid, text, to, truthful=True, **kw):
+            speaker = self._holder(chat_id, kw.get("from") or kw.get("start") or "")
+            holders = [h for h in self._holders(chat_id, to) if h != speaker]
+            if not holders:
+                return {"error": "to kosong"}
+            st = self.world.state(chat_id, self.store.path_ids(chat_id))
+            ids = KNOW.add(chat_id, mid, holders, text, "fakta", "diberi tahu", speaker,
+                           "benar" if truthful else "keliru", 0.5, st["time_text"])
+            return {"saved": ids, "to": holders}
 
         def t_canon_set(self, chat_id, mid, section, text):
             sid, _ = self._story(chat_id)
@@ -5273,7 +5478,8 @@ def _(
     Tentukan apa yang dilakukan tokoh lain di luar layar selama itu dan kejadian dunia yang masuk akal (0-4 kejadian,
     sesuai kartu GM; peristiwa garis waktu yang jatuh tempo wajib terjadi). Untuk setiap kejadian panggil world_event dengan
     known_to yang tepat ('player' hanya kalau pemain bisa mengetahuinya). Catat perubahan lokasi/rencana tokoh dengan
-    status_update. Jangan menulis narasi. Setelah selesai jawab "selesai"."""
+    status_update. Tokoh yang berada di tempat yang sama bisa saling bercerita atau bergosip: catat dengan tell (isinya bisa
+    melenceng atau bohong; truthful=false). Jangan menulis narasi. Setelah selesai jawab "selesai"."""
 
     FACTCHECK_CLAIMS = """Periksa jawaban terakhir. Daftarkan klaim fakta {kind} yang spesifik di dalamnya (tanggal, angka, nama
     satuan, senjata, pangkat, tempat, prosedur), bukan hal fiksi cerita. Maksimal 6. Jawab HANYA JSON: {{"claims": ["..."]}}"""
@@ -6157,7 +6363,7 @@ def _(
 
         def _tick(self, chat_id, t0, minutes, why, head=None, stop=None):
             c = self.prompt.ctx(chat_id)
-            allowed = {"world_event", "status_update", "roll"}
+            allowed = {"world_event", "status_update", "roll", "tell", "knowledge_add"}
             tools = [t for t in self.tools.specs(c) if t["function"]["name"] in allowed]
             t1 = t0 + timedelta(minutes=minutes)
             instr = TICK_INSTRUCTION.format(span=World.fmt_span(minutes), t0=World.fmt_time(t0), t1=World.fmt_time(t1), why=why)
@@ -7033,9 +7239,11 @@ def _():
           </div>
           ${lore && !compact ? `<fieldset><legend>Lore</legend>${(c.lore || []).map((e) => `<details class="qr-lore"><summary>${e.core ? '<span class="qr-badge">inti</span>' : ""}<b>${esc(e.title)}</b> <span class="qr-muted">${esc(e.kind)} · ${esc(e.keys)}</span></summary>
               <div class="qr-lore-edit" data-entry="${e.id}"><input class="le-title" value="${esc(e.title)}"><input class="le-keys" value="${esc(e.keys)}" placeholder="kata kunci, pisah koma">
+              <input class="le-known" value="${esc(e.known_to || "")}" placeholder="rahasia? diketahui oleh (pisah koma); kosong = umum">
               <input class="le-kind" value="${esc(e.kind)}"><label class="qr-check"><input type="checkbox" class="le-core" ${e.core ? "checked" : ""}> inti (selalu di prompt)</label>
               <textarea class="le-text" rows="3">${esc(e.text)}</textarea><div class="qr-row"><button class="qr-btn qr-sm" data-act="lore-save">Simpan</button><button class="qr-btn qr-sm qr-danger" data-act="lore-del">Hapus</button></div></div></details>`).join("")}
-            <div class="qr-lore-edit" data-entry=""><input class="le-title" placeholder="Judul lore baru"><input class="le-keys" placeholder="kata kunci, pisah koma"><input class="le-kind" placeholder="jenis: tempat, faksi, benda…">
+            <div class="qr-lore-edit" data-entry=""><input class="le-title" placeholder="Judul lore baru"><input class="le-keys" placeholder="kata kunci, pisah koma">
+              <input class="le-known" placeholder="rahasia? diketahui oleh (pisah koma); kosong = umum"><input class="le-kind" placeholder="jenis: tempat, faksi, benda…">
               <label class="qr-check"><input type="checkbox" class="le-core"> inti</label><textarea class="le-text" rows="2" placeholder="Isi"></textarea>
               <button class="qr-btn qr-sm" data-act="lore-save">${icon("plus")}Tambah lore</button></div></fieldset>` : ""}
           ${c.type === "world" && !compact ? `<fieldset><legend>Garis waktu</legend>${(c.timeline || []).map((e) => `<div class="qr-tl" data-entry="${e.id}"><input class="tl-at" value="${esc(e.at)}"><input class="tl-title" value="${esc(e.title)}">
@@ -7115,6 +7323,20 @@ def _():
           <textarea data-system rows="5" placeholder="Biasanya kosong; prompt dirakit dari kartu.">${esc(c.system || "")}</textarea>
           <button class="qr-btn qr-sm" data-act="save-system">Simpan</button></details>`;
       }
+      function knowHTML() {
+        const k = state.know;
+        if (!k) { send("knowledge", { holder: "" }); return '<div class="qr-muted">Memuat…</div>'; }
+        const label = (h) => h === "player" ? `Tokohmu${k.persona ? ` (${k.persona})` : ""}` : h;
+        const kinds = ["fakta", "rahasia", "pendapat", "perasaan", "janji", "salah paham"];
+        return `<select class="qr-know-holder">${k.holders.map((h) => `<option value="${esc(h)}" ${h === k.holder ? "selected" : ""}>${esc(label(h))}</option>`).join("")}</select>
+          ${k.rows.map((r) => `<div class="qr-memrow" data-kid="${r.id}"><span class="qr-badge">${esc(r.kind)}</span>${r.truth !== "benar" ? `<span class="qr-badge warn">${esc(r.truth)}</span>` : ""}
+            <span><input class="qr-know-text" value="${esc(r.text)}"><span class="qr-muted">${esc(r.source)}${r.source_who ? ` dari ${esc(r.source_who)}` : ""}${r.world_time ? ` · ${esc(r.world_time)}` : ""}</span></span>
+            <select class="qr-know-truth">${["benar", "keliru", "belum pasti"].map((t) => `<option ${t === r.truth ? "selected" : ""}>${t}</option>`).join("")}</select>
+            <button class="qr-icon qr-xs" data-act="know-save" title="Simpan">${icon("check")}</button>
+            <button class="qr-icon qr-xs" data-act="know-del" title="Hapus">${icon("trash")}</button></div>`).join("") || '<div class="qr-muted">Belum ada.</div>'}
+          <div class="qr-row"><input class="qr-know-new" placeholder="Tambah yang ia tahu atau yakini"><select class="qr-know-kind">${kinds.map((x) => `<option>${x}</option>`).join("")}</select>
+            <button class="qr-btn qr-sm" data-act="know-add">${icon("plus")}Tambah</button></div>`;
+      }
       function tabStory() {
         const st = get("story"), c = get("chat"), lib = get("library");
         if (!st.id) return c.kind === "studio" ? `<p class="qr-muted">Ini Studio. Kartu yang disusun ada di panel kanan.</p>`
@@ -7131,6 +7353,8 @@ def _():
           <section><h4>Buku cerita</h4>${Object.entries(st.canon || {}).map(([k, v]) => `<div class="qr-canon" data-sec="${esc(k)}"><b>${esc(k)}</b><textarea rows="3">${esc(v)}</textarea>
             <button class="qr-btn qr-sm" data-act="canon-save">Simpan</button></div>`).join("")}
             <div class="qr-canon" data-sec=""><input class="qr-canon-new" placeholder="Bagian baru, misalnya: Alur terbuka"><textarea rows="2"></textarea><button class="qr-btn qr-sm" data-act="canon-save">${icon("plus")}Tambah</button></div></section>
+          <section><h4>Ingatan tokoh</h4><div class="qr-help">Yang diketahui atau diyakini tiap tokoh di chat ini (cabang aktif). Tokoh hanya bertindak berdasarkan ini.</div>
+            <div class="qr-know">${knowHTML()}</div></section>
           <section><h4>Jangan pernah lupa</h4><textarea class="qr-nf" rows="4" placeholder="Satu fakta per baris">${esc((st.never_forget || []).join("\n"))}</textarea>
             <button class="qr-btn qr-sm" data-act="nf-save">Simpan</button></section>
           ${(st.pending || []).length ? `<section><h4>Menunggu epoch berikutnya</h4>${st.pending.map((p) => `<div class="qr-muted">• ${esc(p)}</div>`).join("")}
@@ -7306,6 +7530,7 @@ def _():
       listen("change", markDirty);
       dbody.addEventListener("change", (e) => {
         const t = e.target;
+        if (t.classList.contains("qr-know-holder")) send("knowledge", { holder: t.value });
         if (t.classList.contains("qr-ctx-sel")) state.modelCtx = Number(t.value);
         else if (t.classList.contains("qr-mtp")) state.modelMtp = t.checked;
         else if (t.classList.contains("qr-emb")) state.modelEmb = t.checked;
@@ -7419,13 +7644,19 @@ def _():
           case "row-del": state.formDirty = Number(btn.closest(".qr-card-form").dataset.card); btn.closest(".qr-trow").remove(); break;
           case "lore-save": { const box = btn.closest(".qr-lore-edit"), form = btn.closest(".qr-card-form"); const v = (c) => box.querySelector(c).value;
             if (!v(".le-title").trim()) { toast("Judul lore kosong.", "warn"); break; }
-            send("lore_save", { card_id: Number(form.dataset.card), title: v(".le-title"), text: v(".le-text"), keys: v(".le-keys"), kind: v(".le-kind") || "istilah", core: box.querySelector(".le-core").checked, entry_id: box.dataset.entry ? Number(box.dataset.entry) : null }); break; }
+            send("lore_save", { card_id: Number(form.dataset.card), title: v(".le-title"), text: v(".le-text"), keys: v(".le-keys"), kind: v(".le-kind") || "istilah", core: box.querySelector(".le-core").checked, entry_id: box.dataset.entry ? Number(box.dataset.entry) : null, known_to: v(".le-known") }); break; }
           case "lore-del": { const box = btn.closest(".qr-lore-edit"), form = btn.closest(".qr-card-form"); send("lore_delete", { card_id: Number(form.dataset.card), entry_id: Number(box.dataset.entry) }); break; }
           case "tl-save": { const r = btn.closest(".qr-tl"), form = btn.closest(".qr-card-form"); send("timeline_save", { card_id: Number(form.dataset.card), at: r.querySelector(".tl-at").value, title: r.querySelector(".tl-title").value, text: r.querySelector(".tl-text").value, entry_id: r.dataset.entry ? Number(r.dataset.entry) : null }); break; }
           case "tl-del": { const r = btn.closest(".qr-tl"), form = btn.closest(".qr-card-form"); send("timeline_delete", { card_id: Number(form.dataset.card), entry_id: Number(r.dataset.entry) }); break; }
           case "attach-card": { const cid = dbody.querySelector(".qr-attach-card").value; if (cid) send("story_attach", { card_id: Number(cid), role: dbody.querySelector(".qr-attach-role").value }); break; }
           case "detach": send("story_detach", { card_id: id, role: btn.dataset.role }); break;
           case "canon-save": { const box = btn.closest(".qr-canon"); const sec = box.dataset.sec || box.querySelector(".qr-canon-new").value.trim(); if (sec) send("canon", { section: sec, text: box.querySelector("textarea").value }); break; }
+          case "know-add": { const box = btn.closest(".qr-know"), t = box.querySelector(".qr-know-new").value.trim();
+            if (t) send("knowledge_add", { holder: state.know.holder, text: t, kind: box.querySelector(".qr-know-kind").value }); break; }
+          case "know-save": { const row = btn.closest("[data-kid]");
+            send("knowledge_edit", { kid: Number(row.dataset.kid), holder: state.know.holder, text: row.querySelector(".qr-know-text").value,
+              truth: row.querySelector(".qr-know-truth").value }); break; }
+          case "know-del": send("knowledge_delete", { kid: Number(btn.closest("[data-kid]").dataset.kid), holder: state.know.holder }); break;
           case "nf-save": send("never_forget", { items: dbody.querySelector(".qr-nf").value.split("\n") }); break;
           case "apply-now": send("apply_now"); break;
           case "continue-new": if (confirm("Lanjutkan cerita ini di chat baru (kronik dan adegan terakhir dibawa)?")) send("continue_new"); break;
@@ -7463,7 +7694,12 @@ def _():
         const a = model.get("aux") || {};
         if (!a.kind) return;
         const d = a.data;
-        if (a.kind === "memory") {
+        if (a.kind === "knowledge") {
+          state.know = d;
+          const box = dbody.querySelector(".qr-know"), f = rootActive();
+          if (state.tab === "story" && box && !(f && box.contains(f) && f.tagName === "INPUT")) box.innerHTML = knowHTML();
+        }
+        else if (a.kind === "memory") {
           state.memory = d;
           const f = rootActive();
           const typing = f && dbody.contains(f) && (f.tagName === "TEXTAREA" || (f.tagName === "INPUT" && !f.classList.contains("qr-mem-q")));
@@ -7524,7 +7760,7 @@ def _():
         const c = get("chat");
         const learn = !!((c.settings || {}).learn);
         if (learn !== state.learn) { state.learn = learn; el.classList.toggle("learn", learn); els.clear(); list.innerHTML = ""; }
-        if (state.lastChat !== c.id) { state.lastChat = c.id; state.studioCard = null; state.imageIntent = false; els.clear(); list.innerHTML = ""; fol.jump(); }
+        if (state.lastChat !== c.id) { state.lastChat = c.id; state.studioCard = null; state.imageIntent = false; state.know = null; els.clear(); list.innerHTML = ""; fol.jump(); }
         renderTop(); renderChats(); renderStudio(); renderDrawer(); renderHistory();
       };
       const onCard = () => {
@@ -7562,7 +7798,11 @@ def _():
         }, "change:backup": renderBackup,
         "change:library": () => { if (state.tab === "cards" || state.tab === "story") renderDrawer(); renderWizard(); },
         "change:card": onCard, "change:story": () => { renderStudio(); if (state.tab === "story") renderDrawer(); },
-        "change:rev": () => { if (state.tab === "memory" && !drawer.hidden) send("memory", { q: (state.memory || {}).q || "" }); },
+        "change:rev": () => {
+          if (drawer.hidden) return;
+          if (state.tab === "memory") send("memory", { q: (state.memory || {}).q || "" });
+          if (state.tab === "story" && state.know) send("knowledge", { holder: state.know.holder });
+        },
         "change:aux": onAux, "change:notice": onNotice, "change:export": onExport, "change:compose": onCompose, "change:boot": renderDrawer,
       };
       for (const [ev, fn] of Object.entries(handlers)) model.on(ev, fn);
@@ -7904,6 +8144,7 @@ def _(
     DEFAULT_CARDS,
     Engine,
     EngineView,
+    KNOW,
     LLM_CLIENT,
     MEM,
     PRESETS,
@@ -8434,11 +8675,39 @@ def _(
             MEM.forget(int(mid), MEM.ctx_of(self._cur()) if self._cur() else {})
             self.c_memory()
 
+        # characters' memory
+        def c_knowledge(self, holder=""):
+            cid = self._cur()
+            if not cid:
+                return
+            _, cards = TOOLS._story(cid)
+            names = ["player"] + [ch["name"] for ch in (cards or {}).get("character", [])]
+            names += [h for h in KNOW.holders(cid) if h not in names]
+            holder = holder or names[0]
+            self.w.aux = {"n": time.time(), "kind": "knowledge", "data": {
+                "holder": holder, "holders": names, "rows": KNOW.of(cid, holder),
+                "persona": ((cards or {}).get("persona") or {}).get("name", "")}}
+
+        def c_knowledge_add(self, holder, text, kind="fakta", truth="benar"):
+            cid = self._cur()
+            KNOW.add(cid, STORE.chat(cid)["head_id"], [holder], text, kind, "lihat sendiri", "", truth)
+            self.c_knowledge(holder)
+
+        def c_knowledge_edit(self, kid, holder, text=None, truth=None):
+            KNOW.edit(int(kid), **{k: v for k, v in (("text", text), ("truth", truth)) if v is not None})
+            self.c_knowledge(holder)
+
+        def c_knowledge_delete(self, kid, holder):
+            KNOW.forget(int(kid))
+            self.c_knowledge(holder)
+
         # story
         def c_canon(self, section, text):
             sid = (self.w.story or {}).get("id")
             if sid:
-                STORIES.canon_set(sid, section, text, self._cur())
+                # edited here: on this chat's branch (it is what this chat shows), not in the base of every chat
+                head = (STORE.chat(self._cur()) or {}).get("head_id")
+                STORIES.canon_set(sid, section, text, self._cur(), message_id=head)
                 self.w.story = self.story_info(STORE.chat(self._cur()))
 
         def c_never_forget(self, items):
@@ -8532,8 +8801,8 @@ def _(
             self.w.export = {"n": time.time(), "name": f"{safe}.{'st' if fmt == 'st' else 'qcard'}.json",
                              "b64": base64.b64encode(json.dumps(data, ensure_ascii=False, indent=1).encode()).decode()}
 
-        def c_lore_save(self, card_id, title, text, keys="", kind="istilah", core=False, entry_id=None):
-            CARDS.lore_save(int(card_id), title, text, keys, kind, bool(core), int(entry_id) if entry_id else None)
+        def c_lore_save(self, card_id, title, text, keys="", kind="istilah", core=False, entry_id=None, known_to=""):
+            CARDS.lore_save(int(card_id), title, text, keys, kind, bool(core), int(entry_id) if entry_id else None, known_to)
             self.w.card = self.card_info(int(card_id))
 
         def c_lore_delete(self, card_id, entry_id):

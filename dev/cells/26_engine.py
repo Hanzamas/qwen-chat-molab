@@ -11,7 +11,8 @@ TICK_INSTRUCTION = """Waktu dunia maju {span} (dari {t0} ke {t1}). {why}
 Tentukan apa yang dilakukan tokoh lain di luar layar selama itu dan kejadian dunia yang masuk akal (0-4 kejadian,
 sesuai kartu GM; peristiwa garis waktu yang jatuh tempo wajib terjadi). Untuk setiap kejadian panggil world_event dengan
 known_to yang tepat ('player' hanya kalau pemain bisa mengetahuinya). Catat perubahan lokasi/rencana tokoh dengan
-status_update. Jangan menulis narasi. Setelah selesai jawab "selesai"."""
+status_update. Tokoh yang berada di tempat yang sama bisa saling bercerita atau bergosip: catat dengan tell (isinya bisa
+melenceng atau bohong; truthful=false). Jangan menulis narasi. Setelah selesai jawab "selesai"."""
 
 FACTCHECK_CLAIMS = """Periksa jawaban terakhir. Daftarkan klaim fakta {kind} yang spesifik di dalamnya (tanggal, angka, nama
 satuan, senjata, pangkat, tempat, prosedur), bukan hal fiksi cerita. Maksimal 6. Jawab HANYA JSON: {{"claims": ["..."]}}"""
@@ -895,7 +896,7 @@ class Engine(EngineView):
 
     def _tick(self, chat_id, t0, minutes, why, head=None, stop=None):
         c = self.prompt.ctx(chat_id)
-        allowed = {"world_event", "status_update", "roll"}
+        allowed = {"world_event", "status_update", "roll", "tell", "knowledge_add"}
         tools = [t for t in self.tools.specs(c) if t["function"]["name"] in allowed]
         t1 = t0 + timedelta(minutes=minutes)
         instr = TICK_INSTRUCTION.format(span=World.fmt_span(minutes), t0=World.fmt_time(t0), t1=World.fmt_time(t1), why=why)

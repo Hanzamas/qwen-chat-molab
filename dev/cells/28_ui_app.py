@@ -448,9 +448,11 @@ function render({ model, el }) {
       </div>
       ${lore && !compact ? `<fieldset><legend>Lore</legend>${(c.lore || []).map((e) => `<details class="qr-lore"><summary>${e.core ? '<span class="qr-badge">inti</span>' : ""}<b>${esc(e.title)}</b> <span class="qr-muted">${esc(e.kind)} · ${esc(e.keys)}</span></summary>
           <div class="qr-lore-edit" data-entry="${e.id}"><input class="le-title" value="${esc(e.title)}"><input class="le-keys" value="${esc(e.keys)}" placeholder="kata kunci, pisah koma">
+          <input class="le-known" value="${esc(e.known_to || "")}" placeholder="rahasia? diketahui oleh (pisah koma); kosong = umum">
           <input class="le-kind" value="${esc(e.kind)}"><label class="qr-check"><input type="checkbox" class="le-core" ${e.core ? "checked" : ""}> inti (selalu di prompt)</label>
           <textarea class="le-text" rows="3">${esc(e.text)}</textarea><div class="qr-row"><button class="qr-btn qr-sm" data-act="lore-save">Simpan</button><button class="qr-btn qr-sm qr-danger" data-act="lore-del">Hapus</button></div></div></details>`).join("")}
-        <div class="qr-lore-edit" data-entry=""><input class="le-title" placeholder="Judul lore baru"><input class="le-keys" placeholder="kata kunci, pisah koma"><input class="le-kind" placeholder="jenis: tempat, faksi, benda…">
+        <div class="qr-lore-edit" data-entry=""><input class="le-title" placeholder="Judul lore baru"><input class="le-keys" placeholder="kata kunci, pisah koma">
+          <input class="le-known" placeholder="rahasia? diketahui oleh (pisah koma); kosong = umum"><input class="le-kind" placeholder="jenis: tempat, faksi, benda…">
           <label class="qr-check"><input type="checkbox" class="le-core"> inti</label><textarea class="le-text" rows="2" placeholder="Isi"></textarea>
           <button class="qr-btn qr-sm" data-act="lore-save">${icon("plus")}Tambah lore</button></div></fieldset>` : ""}
       ${c.type === "world" && !compact ? `<fieldset><legend>Garis waktu</legend>${(c.timeline || []).map((e) => `<div class="qr-tl" data-entry="${e.id}"><input class="tl-at" value="${esc(e.at)}"><input class="tl-title" value="${esc(e.title)}">
@@ -530,6 +532,20 @@ function render({ model, el }) {
       <textarea data-system rows="5" placeholder="Biasanya kosong; prompt dirakit dari kartu.">${esc(c.system || "")}</textarea>
       <button class="qr-btn qr-sm" data-act="save-system">Simpan</button></details>`;
   }
+  function knowHTML() {
+    const k = state.know;
+    if (!k) { send("knowledge", { holder: "" }); return '<div class="qr-muted">Memuat…</div>'; }
+    const label = (h) => h === "player" ? `Tokohmu${k.persona ? ` (${k.persona})` : ""}` : h;
+    const kinds = ["fakta", "rahasia", "pendapat", "perasaan", "janji", "salah paham"];
+    return `<select class="qr-know-holder">${k.holders.map((h) => `<option value="${esc(h)}" ${h === k.holder ? "selected" : ""}>${esc(label(h))}</option>`).join("")}</select>
+      ${k.rows.map((r) => `<div class="qr-memrow" data-kid="${r.id}"><span class="qr-badge">${esc(r.kind)}</span>${r.truth !== "benar" ? `<span class="qr-badge warn">${esc(r.truth)}</span>` : ""}
+        <span><input class="qr-know-text" value="${esc(r.text)}"><span class="qr-muted">${esc(r.source)}${r.source_who ? ` dari ${esc(r.source_who)}` : ""}${r.world_time ? ` · ${esc(r.world_time)}` : ""}</span></span>
+        <select class="qr-know-truth">${["benar", "keliru", "belum pasti"].map((t) => `<option ${t === r.truth ? "selected" : ""}>${t}</option>`).join("")}</select>
+        <button class="qr-icon qr-xs" data-act="know-save" title="Simpan">${icon("check")}</button>
+        <button class="qr-icon qr-xs" data-act="know-del" title="Hapus">${icon("trash")}</button></div>`).join("") || '<div class="qr-muted">Belum ada.</div>'}
+      <div class="qr-row"><input class="qr-know-new" placeholder="Tambah yang ia tahu atau yakini"><select class="qr-know-kind">${kinds.map((x) => `<option>${x}</option>`).join("")}</select>
+        <button class="qr-btn qr-sm" data-act="know-add">${icon("plus")}Tambah</button></div>`;
+  }
   function tabStory() {
     const st = get("story"), c = get("chat"), lib = get("library");
     if (!st.id) return c.kind === "studio" ? `<p class="qr-muted">Ini Studio. Kartu yang disusun ada di panel kanan.</p>`
@@ -546,6 +562,8 @@ function render({ model, el }) {
       <section><h4>Buku cerita</h4>${Object.entries(st.canon || {}).map(([k, v]) => `<div class="qr-canon" data-sec="${esc(k)}"><b>${esc(k)}</b><textarea rows="3">${esc(v)}</textarea>
         <button class="qr-btn qr-sm" data-act="canon-save">Simpan</button></div>`).join("")}
         <div class="qr-canon" data-sec=""><input class="qr-canon-new" placeholder="Bagian baru, misalnya: Alur terbuka"><textarea rows="2"></textarea><button class="qr-btn qr-sm" data-act="canon-save">${icon("plus")}Tambah</button></div></section>
+      <section><h4>Ingatan tokoh</h4><div class="qr-help">Yang diketahui atau diyakini tiap tokoh di chat ini (cabang aktif). Tokoh hanya bertindak berdasarkan ini.</div>
+        <div class="qr-know">${knowHTML()}</div></section>
       <section><h4>Jangan pernah lupa</h4><textarea class="qr-nf" rows="4" placeholder="Satu fakta per baris">${esc((st.never_forget || []).join("\n"))}</textarea>
         <button class="qr-btn qr-sm" data-act="nf-save">Simpan</button></section>
       ${(st.pending || []).length ? `<section><h4>Menunggu epoch berikutnya</h4>${st.pending.map((p) => `<div class="qr-muted">• ${esc(p)}</div>`).join("")}
@@ -721,6 +739,7 @@ function render({ model, el }) {
   listen("change", markDirty);
   dbody.addEventListener("change", (e) => {
     const t = e.target;
+    if (t.classList.contains("qr-know-holder")) send("knowledge", { holder: t.value });
     if (t.classList.contains("qr-ctx-sel")) state.modelCtx = Number(t.value);
     else if (t.classList.contains("qr-mtp")) state.modelMtp = t.checked;
     else if (t.classList.contains("qr-emb")) state.modelEmb = t.checked;
@@ -834,13 +853,19 @@ function render({ model, el }) {
       case "row-del": state.formDirty = Number(btn.closest(".qr-card-form").dataset.card); btn.closest(".qr-trow").remove(); break;
       case "lore-save": { const box = btn.closest(".qr-lore-edit"), form = btn.closest(".qr-card-form"); const v = (c) => box.querySelector(c).value;
         if (!v(".le-title").trim()) { toast("Judul lore kosong.", "warn"); break; }
-        send("lore_save", { card_id: Number(form.dataset.card), title: v(".le-title"), text: v(".le-text"), keys: v(".le-keys"), kind: v(".le-kind") || "istilah", core: box.querySelector(".le-core").checked, entry_id: box.dataset.entry ? Number(box.dataset.entry) : null }); break; }
+        send("lore_save", { card_id: Number(form.dataset.card), title: v(".le-title"), text: v(".le-text"), keys: v(".le-keys"), kind: v(".le-kind") || "istilah", core: box.querySelector(".le-core").checked, entry_id: box.dataset.entry ? Number(box.dataset.entry) : null, known_to: v(".le-known") }); break; }
       case "lore-del": { const box = btn.closest(".qr-lore-edit"), form = btn.closest(".qr-card-form"); send("lore_delete", { card_id: Number(form.dataset.card), entry_id: Number(box.dataset.entry) }); break; }
       case "tl-save": { const r = btn.closest(".qr-tl"), form = btn.closest(".qr-card-form"); send("timeline_save", { card_id: Number(form.dataset.card), at: r.querySelector(".tl-at").value, title: r.querySelector(".tl-title").value, text: r.querySelector(".tl-text").value, entry_id: r.dataset.entry ? Number(r.dataset.entry) : null }); break; }
       case "tl-del": { const r = btn.closest(".qr-tl"), form = btn.closest(".qr-card-form"); send("timeline_delete", { card_id: Number(form.dataset.card), entry_id: Number(r.dataset.entry) }); break; }
       case "attach-card": { const cid = dbody.querySelector(".qr-attach-card").value; if (cid) send("story_attach", { card_id: Number(cid), role: dbody.querySelector(".qr-attach-role").value }); break; }
       case "detach": send("story_detach", { card_id: id, role: btn.dataset.role }); break;
       case "canon-save": { const box = btn.closest(".qr-canon"); const sec = box.dataset.sec || box.querySelector(".qr-canon-new").value.trim(); if (sec) send("canon", { section: sec, text: box.querySelector("textarea").value }); break; }
+      case "know-add": { const box = btn.closest(".qr-know"), t = box.querySelector(".qr-know-new").value.trim();
+        if (t) send("knowledge_add", { holder: state.know.holder, text: t, kind: box.querySelector(".qr-know-kind").value }); break; }
+      case "know-save": { const row = btn.closest("[data-kid]");
+        send("knowledge_edit", { kid: Number(row.dataset.kid), holder: state.know.holder, text: row.querySelector(".qr-know-text").value,
+          truth: row.querySelector(".qr-know-truth").value }); break; }
+      case "know-del": send("knowledge_delete", { kid: Number(btn.closest("[data-kid]").dataset.kid), holder: state.know.holder }); break;
       case "nf-save": send("never_forget", { items: dbody.querySelector(".qr-nf").value.split("\n") }); break;
       case "apply-now": send("apply_now"); break;
       case "continue-new": if (confirm("Lanjutkan cerita ini di chat baru (kronik dan adegan terakhir dibawa)?")) send("continue_new"); break;
@@ -878,7 +903,12 @@ function render({ model, el }) {
     const a = model.get("aux") || {};
     if (!a.kind) return;
     const d = a.data;
-    if (a.kind === "memory") {
+    if (a.kind === "knowledge") {
+      state.know = d;
+      const box = dbody.querySelector(".qr-know"), f = rootActive();
+      if (state.tab === "story" && box && !(f && box.contains(f) && f.tagName === "INPUT")) box.innerHTML = knowHTML();
+    }
+    else if (a.kind === "memory") {
       state.memory = d;
       const f = rootActive();
       const typing = f && dbody.contains(f) && (f.tagName === "TEXTAREA" || (f.tagName === "INPUT" && !f.classList.contains("qr-mem-q")));
@@ -939,7 +969,7 @@ function render({ model, el }) {
     const c = get("chat");
     const learn = !!((c.settings || {}).learn);
     if (learn !== state.learn) { state.learn = learn; el.classList.toggle("learn", learn); els.clear(); list.innerHTML = ""; }
-    if (state.lastChat !== c.id) { state.lastChat = c.id; state.studioCard = null; state.imageIntent = false; els.clear(); list.innerHTML = ""; fol.jump(); }
+    if (state.lastChat !== c.id) { state.lastChat = c.id; state.studioCard = null; state.imageIntent = false; state.know = null; els.clear(); list.innerHTML = ""; fol.jump(); }
     renderTop(); renderChats(); renderStudio(); renderDrawer(); renderHistory();
   };
   const onCard = () => {
@@ -977,7 +1007,11 @@ function render({ model, el }) {
     }, "change:backup": renderBackup,
     "change:library": () => { if (state.tab === "cards" || state.tab === "story") renderDrawer(); renderWizard(); },
     "change:card": onCard, "change:story": () => { renderStudio(); if (state.tab === "story") renderDrawer(); },
-    "change:rev": () => { if (state.tab === "memory" && !drawer.hidden) send("memory", { q: (state.memory || {}).q || "" }); },
+    "change:rev": () => {
+      if (drawer.hidden) return;
+      if (state.tab === "memory") send("memory", { q: (state.memory || {}).q || "" });
+      if (state.tab === "story" && state.know) send("knowledge", { holder: state.know.holder });
+    },
     "change:aux": onAux, "change:notice": onNotice, "change:export": onExport, "change:compose": onCompose, "change:boot": renderDrawer,
   };
   for (const [ev, fn] of Object.entries(handlers)) model.on(ev, fn);

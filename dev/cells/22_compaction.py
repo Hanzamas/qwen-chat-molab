@@ -17,8 +17,9 @@ Penanda pesan pengguna di rentang ini (nomor: awal pesan):
 {anchors}"""
 
 FLUSH_INSTRUCTION = """Pesan {a} sampai {b} akan dipadatkan menjadi ringkasan. Sebelum itu, simpan yang masih perlu diingat:
-perbarui buku cerita (canon_set), simpan atau perbarui memory penting (memory_save / memory_update, lingkup yang tepat), dan catat
-status tokoh yang belum tercatat (status_update). Panggil tool yang perlu, lalu jawab "selesai". Jangan menulis cerita."""
+perbarui buku cerita (canon_set), simpan atau perbarui memory penting (memory_save / memory_update, lingkup yang tepat), catat
+status tokoh yang belum tercatat (status_update), dan catat siapa tahu apa yang belum tercatat: apa yang disaksikan, diceritakan,
+atau disalahpahami tiap tokoh (knowledge_add / tell). Panggil tool yang perlu, lalu jawab "selesai". Jangan menulis cerita."""
 
 ERA_INSTRUCTION = """Padatkan ringkasan-ringkasan kronik lama berikut menjadi SATU ringkasan era, sekitar sepertiga panjangnya.
 Pertahankan format (## Inti, ## Tujuan dan preferensi, ## Tokoh dan status, ## Kronologi, ## Fakta, angka, nama,
@@ -157,7 +158,8 @@ class Compactor:
         msgs = self.prompt.side(chat_id, FLUSH_INSTRUCTION.format(a=a, b=b), path=path)
         c = self.prompt.ctx(chat_id)
         head = path[-1]["id"] if path else None
-        allowed = {"canon_set", "memory_save", "memory_update", "memory_forget", "status_update", "fact_save", "world_event"}
+        allowed = {"canon_set", "memory_save", "memory_update", "memory_forget", "status_update", "fact_save", "world_event",
+                   "knowledge_add", "tell"}
         tools = [t for t in toolbox.specs(c) if t["function"]["name"] in allowed]
         for _ in range(4):
             acc = self.llm.chat(msgs, tools=tools, kwargs=self.prompt.kwargs(c), sampling={"temperature": 0.6},

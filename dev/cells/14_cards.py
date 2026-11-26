@@ -339,13 +339,16 @@ class Cards:
     def lore(self, card_id):
         return self.store.q("SELECT * FROM lore_entries WHERE card_id = ? ORDER BY kind, title", (card_id,))
 
-    def lore_save(self, card_id, title, text, keys="", kind="istilah", core=False, entry_id=None):
+    def lore_save(self, card_id, title, text, keys="", kind="istilah", core=False, entry_id=None, known_to=""):
+        """known_to: comma list of who knows this (empty: common knowledge)."""
+        known_to = ", ".join(x.strip() for x in str(known_to or "").split(",") if x.strip())
         if entry_id:
-            self.store.x("UPDATE lore_entries SET title = ?, text = ?, keys = ?, kind = ?, core = ?, updated = ? WHERE id = ?",
-                         (title, text, keys, kind, int(core), time.time(), entry_id))
+            self.store.x("UPDATE lore_entries SET title = ?, text = ?, keys = ?, kind = ?, core = ?, known_to = ?, updated = ? "
+                         "WHERE id = ?", (title, text, keys, kind, int(core), known_to, time.time(), entry_id))
         else:
-            entry_id = self.store.x("INSERT INTO lore_entries (card_id, kind, title, keys, text, core, updated) "
-                                    "VALUES (?, ?, ?, ?, ?, ?, ?)", (card_id, kind, title, keys, text, int(core), time.time()))
+            entry_id = self.store.x("INSERT INTO lore_entries (card_id, kind, title, keys, text, core, known_to, updated) "
+                                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (card_id, kind, title, keys, text, int(core), known_to,
+                                                                        time.time()))
         self._changed(card_id)
         return entry_id
 
@@ -374,7 +377,7 @@ class Cards:
         c = self.get(card_id)
         out = {"format": "qcard", "version": 1, "type": c["type"], "name": c["name"], "schema": self.schema(c["type"]),
                "data": c["data"], "avatar": c["avatar"],
-               "lore": [{k: e[k] for k in ("kind", "title", "keys", "text", "core")} for e in self.lore(card_id)],
+               "lore": [{k: e.get(k, "") for k in ("kind", "title", "keys", "text", "core", "known_to")} for e in self.lore(card_id)],
                "timeline": [{k: e[k] for k in ("at", "title", "text")} for e in self.timeline(card_id)]}
         if c["type"] == "world":
             out["facts"] = self.store.q("SELECT claim, source_url, source_title, checked, confidence, status, tags "
@@ -411,7 +414,7 @@ class Cards:
         cid = self.save(None, type_, data, name=str(name) if name is not None else None, avatar=avatar)
         for e in obj.get("lore") or []:
             self.lore_save(cid, e.get("title", ""), e.get("text", ""), e.get("keys", ""), e.get("kind", "istilah"),
-                           bool(e.get("core")))
+                           bool(e.get("core")), known_to=e.get("known_to", ""))
         for e in obj.get("timeline") or []:
             self.timeline_save(cid, e.get("at", ""), e.get("title", ""), e.get("text", ""))
         for f in obj.get("facts") or []:

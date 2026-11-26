@@ -39,8 +39,18 @@ TOOL_RP = [
         {"subject": _S, "changes": {"type": "object"}, "reason": _S}, ["subject", "changes"]),
     _fn("roll", "Roll for an uncertain outcome. odds = chance of success 0..1 chosen for plausibility. "
         "The system's result is binding.", {"event": _S, "odds": _N}, ["event", "odds"]),
-    _fn("world_event", "Record an off-screen event. known_to: names who know it (use 'player' for the player).",
+    _fn("world_event", "Record an off-screen event. known_to: names who know it (use 'player' for the player). "
+        "Everyone in known_to also gets it in their memory.",
         {"text": _S, "known_to": {"type": "array", "items": _S}, "public": _B}, ["text"]),
+    _fn("knowledge_add", "Record what characters now know or believe (who: names; 'player' = the player's character). Use "
+        "it for what they witnessed, were told, overheard, guessed or misunderstood. truth: benar, keliru (they believe "
+        "something false: a lie, a wrong rumor), belum pasti. Characters act only on what is in their memory.",
+        {"who": {"type": "array", "items": _S}, "text": _S,
+         "kind": {"type": "string", "enum": list(Knowledge.KINDS)},
+         "source": {"type": "string", "enum": list(Knowledge.SOURCES)}, "from": _S,
+         "truth": {"type": "string", "enum": list(Knowledge.TRUTH)}, "importance": _N}, ["who", "text"]),
+    _fn("tell", "A character tells others something (true or a lie). It lands in the listeners' memory.",
+        {"from": _S, "to": {"type": "array", "items": _S}, "text": _S, "truthful": _B}, ["from", "to", "text"]),
     _fn("canon_set", "Write a section of the story book (what is true now in this story). Empty text removes it.",
         {"section": _S, "text": _S}, ["section", "text"]),
     _fn("card_read", "Read the full card of a character in this story.", {"name": _S}, ["name"]),
@@ -254,10 +264,53 @@ class ToolBox:
         verdict = "BERHASIL" if r["success"] else "GAGAL"
         return {**r, "result": f"{verdict} (peluang {r['odds']:.0%}). Hasil ini wajib diikuti."}
 
+    def _holder(self, chat_id, name):
+        """Card name for a character name or alias; 'player' for the player or the persona's name."""
+        n = str(name or "").strip()
+        if not n:
+            return ""
+        if n.lower() in ("player", "pemain", "kamu", "you"):
+            return "player"
+        _, cards = self._story(chat_id)
+        persona = cards.get("persona") if cards else None
+        if persona and n.lower() == persona["name"].lower():
+            return "player"
+        for ch in (cards or {}).get("character", []):
+            if n.lower() in [ch["name"].lower()] + [str(a).lower() for a in ch["data"].get("aliases") or []]:
+                return ch["name"]
+        return n
+
+    def _holders(self, chat_id, names):
+        names = names if isinstance(names, list) else [x for x in re.split(r"[,;]", str(names or ""))]
+        return [h for h in (self._holder(chat_id, x) for x in names) if h]
+
     def t_world_event(self, chat_id, mid, text, known_to=None, public=False):
         st = self.world.state(chat_id, self.store.path_ids(chat_id))
         eid = self.world.add_world_event(chat_id, mid, st["time"], text, known_to or [], public)
+        holders = self._holders(chat_id, known_to or [])
+        if holders:
+            KNOW.add(chat_id, mid, holders, text, source="lihat sendiri", world_time=st["time_text"])
         return {"saved": eid}
+
+    def t_knowledge_add(self, chat_id, mid, who, text, kind="fakta", source="lihat sendiri", truth="benar",
+                        importance=0.5, **kw):
+        holders = self._holders(chat_id, who)
+        if not holders:
+            return {"error": "who kosong"}
+        st = self.world.state(chat_id, self.store.path_ids(chat_id))
+        ids = KNOW.add(chat_id, mid, holders, text, kind, source, kw.get("from") or kw.get("start") or "", truth, importance,
+                       st["time_text"])
+        return {"saved": ids, "who": holders}
+
+    def t_tell(self, chat_id, mid, text, to, truthful=True, **kw):
+        speaker = self._holder(chat_id, kw.get("from") or kw.get("start") or "")
+        holders = [h for h in self._holders(chat_id, to) if h != speaker]
+        if not holders:
+            return {"error": "to kosong"}
+        st = self.world.state(chat_id, self.store.path_ids(chat_id))
+        ids = KNOW.add(chat_id, mid, holders, text, "fakta", "diberi tahu", speaker,
+                       "benar" if truthful else "keliru", 0.5, st["time_text"])
+        return {"saved": ids, "to": holders}
 
     def t_canon_set(self, chat_id, mid, section, text):
         sid, _ = self._story(chat_id)

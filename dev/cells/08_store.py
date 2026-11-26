@@ -149,6 +149,7 @@ _COLUMNS_V2 = [
     ("memories", "forgotten_at", "INTEGER"),    # message that forgot it (hidden only where that message is on the path)
     ("memories", "importance", "REAL NOT NULL DEFAULT 0.5"),
     ("memory_log", "message_id", "INTEGER"),
+    ("lore_entries", "known_to", "TEXT NOT NULL DEFAULT ''"),  # empty: common knowledge; else who knows this lore
 ]
 _SCHEMA_V2 = """
 CREATE TABLE IF NOT EXISTS canon_log (
@@ -156,6 +157,24 @@ CREATE TABLE IF NOT EXISTS canon_log (
     text TEXT NOT NULL DEFAULT '', created REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS canon_log_story ON canon_log (story_id);
+CREATE TABLE IF NOT EXISTS knowledge (
+    id INTEGER PRIMARY KEY, chat_id INTEGER NOT NULL, message_id INTEGER, holder TEXT NOT NULL, text TEXT NOT NULL,
+    kind TEXT NOT NULL DEFAULT 'fakta', source TEXT NOT NULL DEFAULT 'lihat sendiri', source_who TEXT NOT NULL DEFAULT '',
+    truth TEXT NOT NULL DEFAULT 'benar', importance REAL NOT NULL DEFAULT 0.5, world_time TEXT NOT NULL DEFAULT '',
+    forgotten_at INTEGER, created REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS knowledge_chat ON knowledge (chat_id, holder);
+CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_fts USING fts5(text, content='knowledge', content_rowid='id');
+CREATE TRIGGER IF NOT EXISTS knowledge_ai AFTER INSERT ON knowledge BEGIN
+    INSERT INTO knowledge_fts(rowid, text) VALUES (new.id, new.text);
+END;
+CREATE TRIGGER IF NOT EXISTS knowledge_ad AFTER DELETE ON knowledge BEGIN
+    INSERT INTO knowledge_fts(knowledge_fts, rowid, text) VALUES ('delete', old.id, old.text);
+END;
+CREATE TRIGGER IF NOT EXISTS knowledge_au AFTER UPDATE OF text ON knowledge BEGIN
+    INSERT INTO knowledge_fts(knowledge_fts, rowid, text) VALUES ('delete', old.id, old.text);
+    INSERT INTO knowledge_fts(rowid, text) VALUES (new.id, new.text);
+END;
 """
 
 
@@ -493,6 +512,14 @@ class Store:
             out.append(cur)
             cur = parents[cur]
         return out[::-1]
+
+    def lineage(self, chat_id):
+        """This chat and the chats it continues, oldest last."""
+        out, cur = [], chat_id
+        while cur and cur not in out and len(out) < 20:
+            out.append(cur)
+            cur = ((self.chat(cur) or {}).get("settings") or {}).get("continued_from")
+        return out
 
     def visible_ids(self, chat_id):
         """Messages whose effects (memories, story book changes) count in this chat: its active path, plus the path of

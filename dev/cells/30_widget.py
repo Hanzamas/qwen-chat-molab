@@ -505,11 +505,39 @@ class ChatApp:
         MEM.forget(int(mid), MEM.ctx_of(self._cur()) if self._cur() else {})
         self.c_memory()
 
+    # characters' memory
+    def c_knowledge(self, holder=""):
+        cid = self._cur()
+        if not cid:
+            return
+        _, cards = TOOLS._story(cid)
+        names = ["player"] + [ch["name"] for ch in (cards or {}).get("character", [])]
+        names += [h for h in KNOW.holders(cid) if h not in names]
+        holder = holder or names[0]
+        self.w.aux = {"n": time.time(), "kind": "knowledge", "data": {
+            "holder": holder, "holders": names, "rows": KNOW.of(cid, holder),
+            "persona": ((cards or {}).get("persona") or {}).get("name", "")}}
+
+    def c_knowledge_add(self, holder, text, kind="fakta", truth="benar"):
+        cid = self._cur()
+        KNOW.add(cid, STORE.chat(cid)["head_id"], [holder], text, kind, "lihat sendiri", "", truth)
+        self.c_knowledge(holder)
+
+    def c_knowledge_edit(self, kid, holder, text=None, truth=None):
+        KNOW.edit(int(kid), **{k: v for k, v in (("text", text), ("truth", truth)) if v is not None})
+        self.c_knowledge(holder)
+
+    def c_knowledge_delete(self, kid, holder):
+        KNOW.forget(int(kid))
+        self.c_knowledge(holder)
+
     # story
     def c_canon(self, section, text):
         sid = (self.w.story or {}).get("id")
         if sid:
-            STORIES.canon_set(sid, section, text, self._cur())
+            # edited here: on this chat's branch (it is what this chat shows), not in the base of every chat
+            head = (STORE.chat(self._cur()) or {}).get("head_id")
+            STORIES.canon_set(sid, section, text, self._cur(), message_id=head)
             self.w.story = self.story_info(STORE.chat(self._cur()))
 
     def c_never_forget(self, items):
@@ -603,8 +631,8 @@ class ChatApp:
         self.w.export = {"n": time.time(), "name": f"{safe}.{'st' if fmt == 'st' else 'qcard'}.json",
                          "b64": base64.b64encode(json.dumps(data, ensure_ascii=False, indent=1).encode()).decode()}
 
-    def c_lore_save(self, card_id, title, text, keys="", kind="istilah", core=False, entry_id=None):
-        CARDS.lore_save(int(card_id), title, text, keys, kind, bool(core), int(entry_id) if entry_id else None)
+    def c_lore_save(self, card_id, title, text, keys="", kind="istilah", core=False, entry_id=None, known_to=""):
+        CARDS.lore_save(int(card_id), title, text, keys, kind, bool(core), int(entry_id) if entry_id else None, known_to)
         self.w.card = self.card_info(int(card_id))
 
     def c_lore_delete(self, card_id, entry_id):

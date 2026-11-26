@@ -396,5 +396,96 @@ class Memory:
                             f"ORDER BY kind, title", list(card_ids))
 
 
+class Knowledge:
+    """What each character knows or believes in one chat (and the chats it continues), on the active branch.
+    The story book is the truth only the narrator sees; this is what is in each head, and it can be wrong."""
+
+    KINDS = ("fakta", "rahasia", "pendapat", "perasaan", "janji", "salah paham")
+    SOURCES = ("lihat sendiri", "diberi tahu", "gosip", "menduga")
+    TRUTH = ("benar", "keliru", "belum pasti")
+
+    def __init__(self, store):
+        self.store = store
+
+    def _rows(self, chat_id, sql="", args=()):
+        chats = self.store.lineage(chat_id)
+        vis = self.store.visible_ids(chat_id)
+        rows = self.store.q(f"SELECT * FROM knowledge WHERE chat_id IN ({','.join('?' * len(chats))}) {sql}",
+                            list(chats) + list(args)) if chats else []
+        return [r for r in rows if (not r["message_id"] or r["message_id"] in vis)
+                and not (r["forgotten_at"] and r["forgotten_at"] in vis)]
+
+    def add(self, chat_id, message_id, holders, text, kind="fakta", source="lihat sendiri", source_who="", truth="benar",
+            importance=0.5, world_time=""):
+        text = (text or "").strip()
+        if not text:
+            raise ValueError("teks kosong")
+        kind = kind if kind in self.KINDS else "fakta"
+        source = source if source in self.SOURCES else "lihat sendiri"
+        truth = truth if truth in self.TRUTH else "benar"
+        try:
+            importance = min(max(float(importance), 0.0), 1.0)
+        except (TypeError, ValueError):
+            importance = 0.5
+        out = []
+        for h in dict.fromkeys(holders):
+            same = [r for r in self._rows(chat_id, "AND holder = ?", (h,)) if TXT.jaccard(text, r["text"]) >= 0.8]
+            if same:
+                out.append(same[0]["id"])
+                continue
+            out.append(self.store.x("INSERT INTO knowledge (chat_id, message_id, holder, text, kind, source, source_who, truth, "
+                                    "importance, world_time, created) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                                    (chat_id, message_id, h, text[:2000], kind, source, source_who or "", truth, importance,
+                                     str(world_time or ""), time.time())))
+        return out
+
+    def holders(self, chat_id):
+        return sorted({r["holder"] for r in self._rows(chat_id)})
+
+    def of(self, chat_id, holder, limit=200):
+        rows = self._rows(chat_id, "AND holder = ?", (holder,))
+        return sorted(rows, key=lambda r: -r["id"])[:limit]
+
+    def relevant(self, chat_id, holder, query, limit=6):
+        """The holder's knowledge most related to the scene: keyword match first, then importance, then recency."""
+        rows = self._rows(chat_id, "AND holder = ?", (holder,))
+        if not rows:
+            return []
+        q = TXT.fts_query(query or "")
+        hit = {}
+        if q:
+            ids = {r["id"] for r in rows}
+            for rank, r in enumerate(self.store.q("SELECT rowid AS id FROM knowledge_fts WHERE knowledge_fts MATCH ? "
+                                                  "ORDER BY bm25(knowledge_fts) LIMIT 200", (q,))):
+                if r["id"] in ids:
+                    hit[r["id"]] = rank
+        newest = max(r["id"] for r in rows)
+        def score(r):
+            s = (3.0 - min(hit[r["id"]], 30) / 10) if r["id"] in hit else 0.0
+            return s + 2 * float(r["importance"] or 0.5) + (0.5 if r["id"] > newest - 20 else 0)
+        return sorted(rows, key=score, reverse=True)[:limit]
+
+    def forget(self, kid, chat_id=None, message_id=None):
+        if message_id:
+            self.store.x("UPDATE knowledge SET forgotten_at = ? WHERE id = ?", (message_id, kid))
+        else:
+            self.store.x("DELETE FROM knowledge WHERE id = ?", (kid,))
+
+    def edit(self, kid, **fields):
+        allowed = {k: v for k, v in fields.items() if k in ("text", "kind", "truth", "source", "source_who", "importance")}
+        if allowed:
+            sets = ", ".join(f"{k} = ?" for k in allowed)
+            self.store.x(f"UPDATE knowledge SET {sets} WHERE id = ?", (*allowed.values(), kid))
+
+    @staticmethod
+    def line(r):
+        tags = [r["kind"]] if r["kind"] != "fakta" else []
+        if r["truth"] != "benar":
+            tags.append(r["truth"].upper())
+        src = r["source"] + (f" dari {r['source_who']}" if r["source_who"] else "")
+        return f"- {r['text']} ({src}{'; ' + ', '.join(tags) if tags else ''})"
+
+
+KNOW = Knowledge(STORE)
 EMB = Embedder(STORE, SERVERS)
 MEM = Memory(STORE, CARDS, STORIES, EMB)
