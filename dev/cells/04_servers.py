@@ -313,6 +313,32 @@ class ServerManager:
         self.proxy = _hs.ThreadingHTTPServer(("127.0.0.1", CFG.PORT), _make_proxy(f"http://127.0.0.1:{CFG.LLAMA_PORT}", ctx))
         threading.Thread(target=self.proxy.serve_forever, daemon=True).start()
 
+    SPEC_ERROR = re.compile(r"specul|draft[_ ]?model|drafter|\bmtp\b|eagle|gemma4_mtp|spec-type|spec_draft", re.I)
+
+    @staticmethod
+    def jit_logs(log_tail):
+        """vLLM's JIT kernels (humming / NVRTC) write their compiler output to a folder named in the error.
+        Show it, otherwise the real cause stays hidden."""
+        out = []
+        for path in dict.fromkeys(re.findall(r"compiler logs: (\S+)", log_tail)):
+            p = Path(path)
+            files = sorted(p.glob("*")) if p.is_dir() else [p] if p.exists() else []
+            for f in files:
+                if f.suffix in (".log", ".txt", ".err") or "log" in f.name.lower():
+                    out.append(f"--- {f} ---\n" + f.read_text(errors="replace")[-4000:])
+            if not out and files:
+                out.append(f"--- isi {p} ---\n" + "\n".join(f.name for f in files))
+        return ("\n\n" + "\n\n".join(out)) if out else ""
+
+    @staticmethod
+    def hint(log_tail, p):
+        if "NVRTCCompiler failed" in log_tail or "humming" in log_tail:
+            return ("\n\nSaran: kernel JIT vLLM untuk bobot ini gagal di-compile di GPU/driver ini. Pakai preset llama.cpp "
+                    "(Dark-Gemistry HB16-Q8_0) atau 'BF16 → FP8 saat dimuat', lalu kirim log compiler di atas.")
+        if "out of memory" in log_tail.lower():
+            return "\n\nSaran: VRAM tidak cukup. Kecilkan konteks atau matikan embedder."
+        return ""
+
     def _watch(self, p, files, ctx):
         backend = p["backend"]
         health = (f"http://127.0.0.1:{CFG.PORT}/health" if backend == "vllm"
@@ -320,13 +346,17 @@ class ServerManager:
         while self.state.get("preset") and PRESETS.get(self.state["preset"]) is p:
             proc = self.procs.get(backend)
             if proc is not None and proc.poll() is not None:
-                if self.state.get("mtp"):
+                log_tail = Sys.tail(self.logf[backend], 400)
+                # Retry without MTP only when the failure is in the speculative/draft part; any other error would
+                # just happen again, and the message would blame MTP for something else.
+                if self.state.get("mtp") and self.SPEC_ERROR.search(log_tail):
                     with self.lock:
-                        self.state["warnings"].append("Server mati dengan MTP/drafter; dijalankan ulang tanpa MTP.")
-                        (CFG.LOG_DIR / f"{backend}-mtp-failed.log").write_text(Sys.tail(self.logf[backend], 200))
+                        self.state["warnings"].append("Server gagal di bagian MTP/drafter; dijalankan ulang tanpa MTP.")
+                        (CFG.LOG_DIR / f"{backend}-mtp-failed.log").write_text(log_tail)
                         self._launch(p, files, ctx, False)
                     continue
-                self.state.update(phase="failed", error=Sys.log_errors(self.logf[backend]) or "server berhenti")
+                error = Sys.log_errors(self.logf[backend]) or "server berhenti"
+                self.state.update(phase="failed", error=error + self.jit_logs(log_tail) + self.hint(log_tail, p))
                 self._save()
                 return
             if Sys.http("GET", health, timeout=2)[0] == 200:

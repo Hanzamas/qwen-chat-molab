@@ -294,6 +294,7 @@ class Prompt:
         if ephemeral and msgs[-1]["role"] == "user":
             user_text = path[-1]["content"] if path else ""
             note, used = self.ephemeral(chat_id, path, user_text, extra)
+            used = {**used, "note": note}
             if note:
                 block = "\n\n[Catatan sistem untuk giliran ini, bukan tulisan pemain]\n" + note
                 last = msgs[-1]

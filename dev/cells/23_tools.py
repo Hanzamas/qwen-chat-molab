@@ -44,6 +44,12 @@ TOOL_RP = [
     _fn("card_read", "Read the full card of a character in this story.", {"name": _S}, ["name"]),
 ]
 
+TOOL_CARD_EDIT = [
+    _fn("card_update", "Change one field of a card used by this story (character, persona, world, scenario, style, gm). "
+        "Makes a new card version; it applies now through the system note and in the frozen prompt from the next epoch.",
+        {"card": _S, "field": _S, "value": {}}, ["card", "field", "value"]),
+]
+
 TOOL_STUDIO = [
     _fn("card_draft_update", "Create or edit a card in this Studio. type: world, persona, character, scenario, style, gm. "
         "Give card_id to edit an existing draft; without it a new card of that type is created. field = schema key.",
@@ -160,16 +166,34 @@ class ToolBox:
         return self.mem.forget(int(id), self.mem.ctx_of(chat_id))
 
     def t_history_search(self, chat_id, mid, query, scope="chat", limit=10):
+        """Hybrid: BM25 over the original messages plus vector search when the embedder runs (RRF)."""
         q = TXT.fts_query(query)
-        if not q:
+        rows = []
+        if q:
+            sql = ("SELECT m.id, m.chat_id, m.role, snippet(messages_fts, 0, '[', ']', '…', 16) AS snippet "
+                   "FROM messages_fts JOIN messages m ON m.id = messages_fts.rowid WHERE messages_fts MATCH ?")
+            args = [q]
+            if scope != "all":
+                sql += " AND m.chat_id = ?"
+                args.append(chat_id)
+            rows = self.store.q(sql + " ORDER BY bm25(messages_fts) LIMIT 40", args)
+        emb = self.mem.emb
+        if emb.ready():
+            ids_sql = "SELECT id FROM messages" + ("" if scope == "all" else " WHERE chat_id = ?")
+            allowed_msgs = {r["id"] for r in self.store.q(ids_sql, () if scope == "all" else (chat_id,))}
+            hits = emb.search("msg", query, limit=60, allowed={m * 100 + i for m in allowed_msgs for i in range(20)})
+            vec_ids = list(dict.fromkeys(ref // 100 for ref, s in hits if s > 0.35))
+            by_id = {r["id"]: r for r in rows}
+            for mid2 in vec_ids:
+                if mid2 not in by_id:
+                    m = self.store.msg(mid2)
+                    if m:
+                        by_id[mid2] = {"id": m["id"], "chat_id": m["chat_id"], "role": m["role"], "snippet": m["content"][:240]}
+            order = Memory.rrf([r["id"] for r in rows], vec_ids)
+            rows = [by_id[i] for i in order if i in by_id]
+        rows = rows[:int(limit)]
+        if not rows:
             return {"results": []}
-        sql = ("SELECT m.id, m.chat_id, m.role, snippet(messages_fts, 0, '[', ']', '…', 16) AS snippet "
-               "FROM messages_fts JOIN messages m ON m.id = messages_fts.rowid WHERE messages_fts MATCH ?")
-        args = [q]
-        if scope != "all":
-            sql += " AND m.chat_id = ?"
-            args.append(chat_id)
-        rows = self.store.q(sql + " ORDER BY bm25(messages_fts) LIMIT ?", args + [int(limit)])
         paths = {}
         for r in rows:
             if r["chat_id"] not in paths:
@@ -233,6 +257,27 @@ class ToolBox:
             if any(n and n.lower() == (name or "").lower() for n in names):
                 return self.cards.render(c, mode="all", limit=12000)
         return {"error": f"tidak ada kartu bernama {name} di cerita ini"}
+
+    def t_card_update(self, chat_id, mid, card, field, value):
+        sid, cards = self._story(chat_id)
+        if not sid:
+            return {"error": "chat ini tidak terhubung ke cerita"}
+        pool = cards["character"] + [cards[r] for r in ("persona", "world", "scenario", "style", "gm") if cards.get(r)]
+        target = None
+        for c in pool:
+            names = [c["name"]] + list(c["data"].get("aliases") or [])
+            if any(n and n.lower() == (card or "").lower() for n in names) or (card or "").lower() == c["type"]:
+                target = c
+                break
+        if not target:
+            return {"error": f"kartu '{card}' tidak dipakai cerita ini. Pilihan: {', '.join(c['name'] for c in pool)}"}
+        keys = {f["key"] for f in self.cards.schema(target["type"])["fields"]}
+        if field not in keys and field not in target["data"]:
+            return {"error": f"field '{field}' tidak ada di skema {target['type']}. Field: {', '.join(sorted(keys))}"}
+        self.cards.set_field(target["id"], field, value)
+        shown = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+        self.stories.pending(sid, chat_id, f"Kartu {target['name']} · {field}: {shown[:600]}")
+        return {"card_id": target["id"], "version": self.cards.get(target["id"])["version"], "ok": True}
 
     # ---------- studio ----------
 

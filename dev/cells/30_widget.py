@@ -25,6 +25,7 @@ class ChatWidget(_aw.AnyWidget):
     export = _tl.Dict({}).tag(sync=True)
     compose = _tl.Dict({}).tag(sync=True)
     queue = _tl.Int(0).tag(sync=True)
+    notice = _tl.Dict({}).tag(sync=True)
 
 
 class ChatApp:
@@ -85,7 +86,9 @@ class ChatApp:
                     c = CARDS.get(cid)
                     if c:
                         cards.append({"id": cid, "type": c["type"], "name": c["name"]})
-            return {"studio": True, "cards": cards}
+            first_char = next((CARDS.get(x["id"]) for x in cards if x["type"] == "character"), None)
+            return {"studio": True, "cards": cards,
+                    "greetings": (first_char or {}).get("data", {}).get("greetings") or [] if first_char else []}
         if not sid:
             return {}
         s = STORIES.get(sid)
@@ -151,8 +154,11 @@ class ChatApp:
             w.queue = int(payload or 0)
         elif kind == "settings" and payload == cur:
             w.chat = self.chat_info(STORE.chat(cur))
-        elif kind in ("learn", "recall"):
+        elif kind in ("learn", "recall", "variations"):
             w.aux = {"n": time.time(), "kind": kind, "data": payload}
+        elif kind == "notice":
+            if payload and payload.get("chat_id") == cur:
+                w.notice = {"n": time.time(), "text": payload["text"]}
         elif kind == "model":
             w.server = self.server_info()
 
@@ -166,9 +172,20 @@ class ChatApp:
                 "installed": SERVERS.installed() or bool(CFG.BASE_URL)}
 
     def _ticker(self):
+        last_phase = None
         while True:
             try:
-                self.w.server = self.server_info()
+                info = self.server_info()
+                if info["phase"] != last_phase and info["phase"] in ("ready", "failed"):
+                    st = SERVERS.status()
+                    backend = st.get("backend") or ""
+                    cmd_file = CFG.LOG_DIR / f"{backend}.cmd"
+                    STORE.side_log("server_log", {"phase": info["phase"], "preset": st.get("preset"), "ctx": st.get("ctx"),
+                                                  "mtp": st.get("mtp"), "warnings": st.get("warnings"),
+                                                  "errors": st.get("errors"), "log": Sys.tail(SERVERS.logf.get(backend, ""), 300) if backend else "",
+                                                  "cmd": cmd_file.read_text() if backend and cmd_file.exists() else ""})
+                last_phase = info["phase"]
+                self.w.server = info
                 self.w.backup = {**BACKUP.status, "dirty": BACKUP.dirty()}
             except Exception:
                 pass
@@ -310,6 +327,29 @@ class ChatApp:
         self.w.history = self.engine.display(chat_id, self.limit)
         self.w.aux = {"n": time.time(), "kind": "scroll_to", "data": mid}
 
+    def c_variations(self, card_id, field):
+        self.engine.variations(self._cur(), int(card_id), field)
+
+    def c_card_field(self, card_id, field, value):
+        CARDS.set_field(int(card_id), field, value)
+        self.w.card = self.card_info(int(card_id))
+        chat = STORE.chat(self._cur()) if self._cur() else None
+        if chat:
+            self.w.story = self.story_info(chat)
+
+    def c_compare(self, a, b):
+        self.w.aux = {"n": time.time(), "kind": "compare", "data": self.engine.compare(self._cur(), int(a), int(b))}
+
+    def c_notice_clear(self):
+        self.w.notice = {}
+
+    def c_note_view(self, mid):
+        m = STORE.msg(int(mid))
+        self.w.aux = {"n": time.time(), "kind": "note", "data": {"note": (m or {}).get("meta", {}).get("ephemeral", "")}}
+
+    def c_side_logs(self, kind=None):
+        self.w.aux = {"n": time.time(), "kind": "side_logs", "data": STORE.side_logs(self._cur(), kind, 30)}
+
     def c_prompt_view(self):
         self.w.aux = {"n": time.time(), "kind": "prompt", "data": self.engine.prompt_view(self._cur())}
 
@@ -410,11 +450,11 @@ class ChatApp:
         cid = self.engine.new_chat("studio", "Studio")
         self.select(cid)
 
-    def c_studio_finish(self, title=""):
+    def c_studio_finish(self, title="", greeting=0):
         chat = STORE.chat(self._cur())
         drafts = (chat["settings"].get("studio") or {}).get("drafts") or {}
         ids = {k: v for k, v in drafts.items()}
-        cid = self.engine.start_story(ids, title or None)
+        cid = self.engine.start_story(ids, title or None, int(greeting or 0))
         self.select(cid)
 
     # cards

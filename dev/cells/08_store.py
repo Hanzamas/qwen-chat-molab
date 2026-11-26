@@ -130,6 +130,10 @@ CREATE TABLE IF NOT EXISTS memory_log (
 );
 CREATE TABLE IF NOT EXISTS vectors (kind TEXT NOT NULL, ref_id INTEGER NOT NULL, dim INTEGER NOT NULL, v BLOB NOT NULL,
     PRIMARY KEY (kind, ref_id));
+CREATE TABLE IF NOT EXISTS side_log (
+    id INTEGER PRIMARY KEY, kind TEXT NOT NULL, chat_id INTEGER, message_id INTEGER, data TEXT NOT NULL, created REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS side_log_chat ON side_log (chat_id, kind);
 CREATE TABLE IF NOT EXISTS vocab (
     id INTEGER PRIMARY KEY, term TEXT NOT NULL, lang TEXT NOT NULL DEFAULT '', translation TEXT NOT NULL DEFAULT '',
     note TEXT NOT NULL DEFAULT '', example TEXT NOT NULL DEFAULT '', due REAL NOT NULL, interval REAL NOT NULL DEFAULT 0,
@@ -263,8 +267,29 @@ class Store:
         return json.loads(r["value"]) if r else default
 
     def meta_set(self, key, value):
+        if self.meta_get(key) == value:
+            return  # unchanged: do not mark the database dirty (that would trigger a backup)
         self.x("INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                (key, json.dumps(value)))
+
+    def side_log(self, kind, data, chat_id=None, message_id=None):
+        """Keep the output of side tasks (drafts, explanations, transcripts, server logs) so nothing is lost."""
+        text = json.dumps(data, ensure_ascii=False, default=str)[:400_000]
+        return self.x("INSERT INTO side_log (kind, chat_id, message_id, data, created) VALUES (?, ?, ?, ?, ?)",
+                      (kind, chat_id, message_id, text, time.time()))
+
+    def side_logs(self, chat_id=None, kind=None, limit=50):
+        sql, args = "SELECT * FROM side_log WHERE 1 = 1", []
+        if chat_id:
+            sql += " AND chat_id = ?"
+            args.append(chat_id)
+        if kind:
+            sql += " AND kind = ?"
+            args.append(kind)
+        rows = self.q(sql + " ORDER BY id DESC LIMIT ?", args + [limit])
+        for r in rows:
+            r["data"] = json.loads(r["data"])
+        return rows
 
     # ---------- export / import ----------
 
@@ -329,7 +354,7 @@ class Store:
                 self.conn.execute(f"DELETE FROM attachments WHERE message_id IN ({marks})", part)
                 self.conn.execute(f"DELETE FROM vectors WHERE kind = 'msg' AND ref_id IN ({marks})", part)
             for table in ("messages", "summaries", "snapshots", "chapters", "status_events", "world_events",
-                          "dice_log", "pending_changes", "memory_log"):
+                          "dice_log", "pending_changes", "memory_log", "side_log"):
                 self.conn.execute(f"DELETE FROM {table} WHERE chat_id = ?", (chat_id,))
             self.conn.execute("DELETE FROM memories WHERE chat_id = ? AND (scope = 'chat' OR kind = 'summary_core')", (chat_id,))
             self.conn.execute("DELETE FROM chats WHERE id = ?", (chat_id,))

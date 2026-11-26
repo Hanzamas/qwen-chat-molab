@@ -56,8 +56,10 @@ class Engine(EngineView):
         self.bg_busy = False
         self.fact_jobs = []
         self.backfilled = False
-        self.idle_thread = threading.Thread(target=self._idle_loop, daemon=True)
-        self.idle_thread.start()
+        # QCHAT_IDLE=0 turns the background loop off (tests run several engines against one fake server).
+        if os.environ.get("QCHAT_IDLE", "1") != "0":
+            self.idle_thread = threading.Thread(target=self._idle_loop, daemon=True)
+            self.idle_thread.start()
 
     # ---------- job runner ----------
 
@@ -114,7 +116,7 @@ class Engine(EngineView):
         self.emit("chats")
         return cid
 
-    def start_story(self, card_ids, title=None, greeting_index=0, from_chat=None):
+    def start_story(self, card_ids, title=None, greeting_index=0, from_chat=None):  # noqa: C901
         """New story + RP chat from cards, with the chosen opening as the first message."""
         sc = self.cards.get(card_ids.get("scenario")) if card_ids.get("scenario") else None
         chars = card_ids.get("character") or []
@@ -247,9 +249,17 @@ class Engine(EngineView):
         minutes = min(minutes, 60 * 24 * 30)
         ids = self.store.path_ids(chat_id)
         t0 = self.world.state(chat_id, ids)["time"]
+        before = self.world.last_event_id(chat_id)
         self.world.advance(chat_id, uid, minutes, "AFK")
         self._tick(chat_id, t0, minutes, "Pemain sedang tidak ada (AFK).", head=uid)
+        self._away_notice(chat_id, before, minutes)
         return [f"Pemain baru kembali setelah {World.fmt_span(minutes)} waktu dunia berlalu. Kejadian selama itu ada di atas."]
+
+    def _away_notice(self, chat_id, before_id, minutes):
+        events = self.world.events_after(chat_id, before_id)
+        text = f"Selama kamu pergi ({World.fmt_span(minutes)} waktu dunia): " + (
+            " · ".join(e["text"] for e in events[:6]) if events else "tidak ada kabar yang sampai padamu.")
+        self.emit("notice", {"chat_id": chat_id, "text": text})
 
     # ---------- the turn ----------
 
@@ -286,6 +296,10 @@ class Engine(EngineView):
                 msgs, used_round = self.prompt.build(chat_id, path, extra=extra if _round == 0 else None)
                 if _round == 0:
                     used_info = used_round
+                    # keep the exact temporary block of this turn with the user message
+                    if used_round.get("note") and path and path[-1]["role"] == "user":
+                        um = path[-1]
+                        self.store.update_message(um["id"], meta={**um["meta"], "ephemeral": used_round["note"]})
                 base_c, base_r = live["content"], live["reasoning"]
                 state = {"mid": None, "saved": 0.0}
 
@@ -472,8 +486,25 @@ class Engine(EngineView):
                 self.emit("live", {})
         # fact check
         mode = c["settings"].get("fact_mode") or "latar"
-        if mode == "ketat":
-            self._fact_check(chat_id, mid, False)
+        if mode == "ketat" and not getattr(self, "_rewriting", False):
+            self.emit("live", {"active": True, "content": m["content"], "phase": "Memeriksa fakta…", "reasoning": "",
+                               "tools": [], "chat_id": chat_id})
+            warnings = self._fact_check(chat_id, mid, False, stop=self.stop)
+            self.emit("live", {})
+            if warnings and not self.stop.is_set():
+                # Strict mode: write the turn again with the corrections; the wrong version stays as a sibling.
+                u = self._turn_user(chat_id, mid)
+                if u:
+                    self.store.set_head(chat_id, u["id"])
+                    note = "Koreksi fakta untuk giliran ini (jawaban sebelumnya salah):\n" + "\n".join(
+                        f"- {w['claim']} -> {w['correction']} ({w['source']})" for w in warnings)
+                    self.emit("toast", {"text": f"{len(warnings)} fakta salah; jawaban ditulis ulang. Versi lama bisa digeser.",
+                                        "kind": "warn"})
+                    self._rewriting = True
+                    try:
+                        self._turn(chat_id, extra=[note])
+                    finally:
+                        self._rewriting = False
         elif mode == "latar":
             self.fact_jobs.append((chat_id, mid))
 
@@ -529,7 +560,9 @@ class Engine(EngineView):
 
     # ---------- fact check ----------
 
-    def _fact_check(self, chat_id, mid, announce):
+    def _fact_check(self, chat_id, mid, announce, stop=None):
+        # foreground (announce / strict) stops with Stop; background checks stop when the user sends something
+        stop = stop or (self.stop if announce else self.bg_cancel)
         c = self.prompt.ctx(chat_id)
         world = c["cards"].get("world")
         real = not world or (world["data"].get("realworld") or "ya") == "ya"
@@ -540,12 +573,12 @@ class Engine(EngineView):
         acc = self.llm.complete(self.prompt.side(chat_id, FACTCHECK_CLAIMS.format(kind="dunia nyata" if real else "tentang dunia cerita"),
                                                  path=path),
                                 kwargs=self.prompt.kwargs(c), sampling={"temperature": 0.3}, max_tokens=6000,
-                                tools=self.tools.specs(c), stop=self.bg_cancel if not announce else self.stop)
+                                tools=self.tools.specs(c), stop=stop)
         data = self._json(acc["content"]) or {}
         warnings = []
         for claim in (data.get("claims") or [])[:6]:
-            if self.bg_cancel.is_set() and not announce:
-                return
+            if stop.is_set():
+                return []
             known = self.mem.fact_lookup(claim, world["id"] if world else None, limit=3)
             if any(TXT.jaccard(claim, k["claim"]) >= 0.5 for k in known):
                 continue
@@ -565,12 +598,13 @@ class Engine(EngineView):
             v = self.llm.complete(self.prompt.side(chat_id, FACTCHECK_VERIFY.format(claim=claim, source=source, text=text[:8000]),
                                                    path=path),
                                   kwargs=self.prompt.kwargs(c), sampling={"temperature": 0.2}, max_tokens=4000,
-                                  tools=self.tools.specs(c), stop=self.stop if announce else self.bg_cancel)
+                                  tools=self.tools.specs(c), stop=stop)
             verdict = self._json(v["content"]) or {}
             if verdict.get("verdict") == "salah":
                 warnings.append({"claim": claim, "correction": verdict.get("correction", ""), "source": source})
             if real and verdict.get("fact") and verdict.get("verdict") in ("benar", "salah"):
                 self.mem.fact_save(verdict["fact"], source, "", world["id"] if world else None, 0.8)
+        self.store.side_log("fact_check", {"claims": data.get("claims") or [], "warnings": warnings}, chat_id, mid)
         m = self.store.msg(mid)
         m["meta"]["fact_warnings"] = warnings
         m["meta"]["fact_checked"] = True
@@ -578,6 +612,7 @@ class Engine(EngineView):
         self.emit("history", chat_id)
         if announce:
             self.emit("toast", {"text": f"Cek fakta: {len(warnings)} klaim salah." if warnings else "Cek fakta: tidak ada yang salah."})
+        return warnings
 
     # ---------- tree operations ----------
 
@@ -731,6 +766,9 @@ class Engine(EngineView):
             for i, cl in enumerate(calls):
                 res, _, _ = self.tools.call(chat_id, head, cl["name"], cl["arguments"])
                 msgs.append({"role": "tool", "tool_call_id": cl["id"] or f"t{i}", "content": res})
+        self.store.side_log("world_tick", {"why": why, "from": str(t0), "minutes": minutes,
+                                           "transcript": [m for m in msgs if m["role"] in ("assistant", "tool")]},
+                            chat_id, head)
 
     def _idle_loop(self):
         while True:
@@ -743,8 +781,9 @@ class Engine(EngineView):
     def _idle_once(self):
         if self.busy or self.bg_busy or not self.servers.ready():
             return
-        if not self.backfilled and EMB.ready():
-            self.backfilled = True
+        # Embed whatever is new (messages, summaries, lore, events...) every few minutes while idle.
+        if EMB.ready() and time.time() - (self.backfilled or 0) > 300:
+            self.backfilled = time.time()
             threading.Thread(target=EMB.backfill, daemon=True).start()
         self.bg_cancel.clear()
         self.bg_busy = True
@@ -779,10 +818,12 @@ class Engine(EngineView):
                     ids = self.store.path_ids(chat_id)
                     head = chat["head_id"]
                     t0 = self.world.state(chat_id, ids)["time"]
+                    before = self.world.last_event_id(chat_id)
                     self.world.advance(chat_id, head, minutes, "AFK")
                     self.store.chat_settings(chat_id, world_sync=time.time())
                     self.emit("status", "Dunia berjalan…")
                     self._tick(chat_id, t0, minutes, "Pemain sedang tidak ada (AFK).", head=head, stop=self.bg_cancel)
+                    self._away_notice(chat_id, before, minutes)
                     self.emit("status", "")
                     self.emit("panels", chat_id)
         finally:
@@ -798,21 +839,27 @@ class Engine(EngineView):
                  f"Tulis drafnya saja.")
         acc = self.llm.complete(self.prompt.side(chat_id, instr), kwargs=self.prompt.kwargs(c), sampling=self.prompt.sampling(c),
                                 max_tokens=6000, tools=self.tools.specs(c), stop=self.stop)
-        self.emit("compose", (acc["content"] or "").strip())
+        draft = (acc["content"] or "").strip()
+        self.store.side_log("impersonate", {"hint": hint, "draft": draft}, chat_id)
+        self.emit("compose", draft)
 
     def _studio_change(self, chat_id, request):
         """'/studio ...' or '((ubah: ...))' during RP: the model edits cards or the story book through tools."""
         c = self.prompt.ctx(chat_id)
         allowed = {"canon_set", "status_update", "memory_save", "memory_update"}
-        tools = [t for t in self.tools.specs(c) if t["function"]["name"] in allowed]
+        tools = [t for t in self.tools.specs(c) if t["function"]["name"] in allowed] + TOOL_CARD_EDIT
         msgs = self.prompt.side(chat_id, f"Permintaan perubahan dari pemain (di luar cerita): {request}\n"
-                                         f"Terapkan dengan canon_set / status_update / memory_save. Jawab singkat apa yang diubah.")
+                                         f"Kalau yang berubah adalah sifat tetap tokoh/dunia/gaya, pakai card_update (kartu). Kalau yang "
+                                         f"berubah keadaan cerita, pakai canon_set / status_update / memory_save. Jawab singkat apa yang diubah.")
         head = self.store.chat(chat_id)["head_id"]
         for _ in range(3):
             acc = self.llm.chat(msgs, tools=tools, kwargs=self.prompt.kwargs(c), sampling=self.prompt.sampling(c), max_tokens=8000,
                                 stop=self.stop)
             calls = [v for _, v in sorted(acc["calls"].items())]
             if not calls:
+                self.store.side_log("studio_change", {"request": request, "answer": acc["content"],
+                                                      "transcript": [m for m in msgs if m["role"] in ("assistant", "tool")]},
+                                    chat_id, head)
                 self.emit("toast", {"text": (acc["content"] or "Selesai.").strip()[:600], "long": True})
                 break
             msgs.append({"role": "assistant", "content": acc["content"], "tool_calls": [
@@ -822,6 +869,38 @@ class Engine(EngineView):
                 res, _, _ = self.tools.call(chat_id, head, cl["name"], cl["arguments"])
                 msgs.append({"role": "tool", "tool_call_id": cl["id"] or f"s{i}", "content": res})
         self.emit("panels", chat_id)
+
+    def variations(self, chat_id, card_id, field):
+        self.run(self._variations, chat_id, card_id, field)
+
+    def _variations(self, chat_id, card_id, field):
+        card = self.cards.get(card_id)
+        f = next((x for x in self.cards.visible_fields(card) if x["key"] == field), {"label": field, "type": "text"})
+        c = self.prompt.ctx(chat_id)
+        shape = "array" if f["type"] in ("list", "tags", "table") else "string"
+        instr = (f"Beri 3 alternatif yang jelas berbeda untuk field '{f['label']}' ({f['type']}) di kartu #{card_id} "
+                 f"({card['name']}), konsisten dengan kartu lain. Nilai sekarang: "
+                 f"{json.dumps(card['data'].get(field), ensure_ascii=False)}\n"
+                 f'Jawab HANYA JSON: {{"options": [<{shape}>, <{shape}>, <{shape}>]}}')
+        acc = self.llm.complete(self.prompt.side(chat_id, instr), kwargs=self.prompt.kwargs(c),
+                                sampling={**self.prompt.sampling(c), "temperature": 1.1}, max_tokens=12000,
+                                tools=self.tools.specs(c), stop=self.stop)
+        data = self._json(acc["content"]) or {}
+        options = (data.get("options") or [])[:3]
+        self.store.side_log("variations", {"card_id": card_id, "field": field, "options": options}, chat_id)
+        self.emit("variations", {"card_id": card_id, "field": field, "label": f["label"], "options": options})
+
+    def compare(self, chat_id, a, b):
+        """Two branches side by side, from the message where they split."""
+        pa, pb = self.store.path_ids(chat_id, a), self.store.path_ids(chat_id, b)
+        k = 0
+        while k < min(len(pa), len(pb)) and pa[k] == pb[k]:
+            k += 1
+
+        def side(ids):
+            return [{"id": m["id"], "role": m["role"], "content": m["content"][:4000]}
+                    for m in self.store.path(chat_id, ids=ids[k:k + 16]) if m["role"] in ("user", "assistant") and m["content"]]
+        return {"split_at": k, "a": side(pa), "b": side(pb), "a_id": a, "b_id": b}
 
     def learn(self, chat_id, text):
         self.run(self._learn, chat_id, text)
@@ -833,6 +912,7 @@ class Engine(EngineView):
                                 kwargs=self.prompt.kwargs(c), sampling={"temperature": 0.3}, max_tokens=6000,
                                 tools=self.tools.specs(c), stop=self.stop)
         data = self._json(acc["content"]) or {"translation": acc["content"]}
+        self.store.side_log("learn", {"text": text, "lang": lang, **data}, chat_id)
         self.emit("learn", {"text": text, "lang": lang, **data})
 
     def vocab_add(self, term, translation="", note="", example="", lang=""):
@@ -891,7 +971,9 @@ class Engine(EngineView):
             score = TXT.jaccard(got, x["a"])
             ok = score >= 0.35 or (x["a"].strip().lower() in got.lower() and len(x["a"]) > 2)
             report.append({"q": x["q"], "expected": x["a"], "got": got, "ok": ok})
-        self.emit("recall", {"items": report, "score": sum(r["ok"] for r in report), "total": len(report)})
+        result = {"items": report, "score": sum(r["ok"] for r in report), "total": len(report)}
+        self.store.side_log("recall_test", result, chat_id)
+        self.emit("recall", result)
 
     def switch_model(self, preset, ctx, mtp=True, embed=True):
         def job():
@@ -899,6 +981,7 @@ class Engine(EngineView):
                 self.emit("status", f"{title}: {'selesai' if code == 0 else 'gagal' if code else 'jalan…'}")
             try:
                 SERVERS.start(preset, ctx, mtp=mtp, embed=embed, log=log)
+                self.store.meta_set("server", {"preset": preset, "ctx": ctx, "mtp": mtp, "embed": embed})
                 self.emit("toast", {"text": f"{preset} dimulai. Tunggu READY di bar atas."})
             except Exception as e:
                 self.emit("toast", {"text": f"Ganti model gagal: {e}", "kind": "error"})

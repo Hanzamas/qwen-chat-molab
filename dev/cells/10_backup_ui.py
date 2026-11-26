@@ -1,8 +1,11 @@
 bk_token = mo.ui.text(kind="password", label="Token Hugging Face (write, sebaiknya fine-grained ke repo backup saja)",
                       full_width=True)
-bk_repo = mo.ui.text(label="Repo dataset private (kosong = <username>/qwen-chat-backup)", full_width=True)
-bk_interval = mo.ui.dropdown(options={"5 menit": 300, "10 menit": 600, "30 menit": 1800}, value="10 menit",
-                             label="Backup otomatis tiap")
+_bk_last = STORE.meta_get("backup", {}) or {}
+_bk_choices = {"5 menit": 300, "10 menit": 600, "30 menit": 1800}
+bk_repo = mo.ui.text(value=_bk_last.get("repo", ""), label="Repo dataset private (kosong = <username>/qwen-chat-backup)",
+                     full_width=True)
+bk_interval = mo.ui.dropdown(options=_bk_choices, label="Backup otomatis tiap",
+                             value=next((k for k, v in _bk_choices.items() if v == _bk_last.get("interval")), "10 menit"))
 bk_now = mo.ui.run_button(label="Backup sekarang")
 bk_restore = mo.ui.run_button(label="Pulihkan terbaru", kind="danger")
 mo.accordion({"Backup ke Hugging Face": mo.vstack([

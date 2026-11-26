@@ -253,6 +253,14 @@ class World:
                 break
         return out[::-1]
 
+    def events_after(self, chat_id, after_id, who="player"):
+        rows = self.store.q("SELECT * FROM world_events WHERE chat_id = ? AND id > ? ORDER BY id", (chat_id, after_id))
+        return [r for r in rows if r["public"] or who in json.loads(r["known_to"] or "[]")]
+
+    def last_event_id(self, chat_id):
+        r = self.store.one("SELECT MAX(id) AS m FROM world_events WHERE chat_id = ?", (chat_id,))
+        return (r or {}).get("m") or 0
+
     def mark_shown(self, ids):
         if ids:
             self.store.x(f"UPDATE world_events SET shown = 1 WHERE id IN ({','.join('?' * len(ids))})", list(ids))

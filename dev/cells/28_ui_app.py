@@ -47,6 +47,7 @@ function render({ model, el }) {
     </div>
     <div class="qr-world" hidden></div>
     <div class="qr-composer">
+      <div class="qr-notice" hidden></div>
       <div class="qr-pending" hidden></div>
       <div class="qr-statusline" hidden></div>
       <form class="qr-form">
@@ -166,10 +167,13 @@ function render({ model, el }) {
         <div class="qr-sbar"><i style="width:${pct}%"></i></div><b>${Number(s.value)}</b>${ch}</div>`;
     };
     const status = Object.entries(p.status || {}).map(([k, v]) => `<span class="qr-tag">${esc(k)}: ${esc(Array.isArray(v) ? v.join(", ") : typeof v === "object" ? JSON.stringify(v) : v)}</span>`).join("");
+    const npcs = Object.entries(p.characters || {});
+    const npcHTML = npcs.length ? `<details class="qr-npcs" data-key="npcs" ${state.open.has("npcs") ? "open" : ""}><summary>${icon("users")}Tokoh lain (${npcs.length})</summary>
+      ${npcs.map(([name, st]) => `<div class="qr-npc"><b>${esc(name)}</b> ${Object.entries(st).map(([k, v]) => `<span class="qr-tag">${esc(k)}: ${esc(Array.isArray(v) ? v.join(", ") : typeof v === "object" ? JSON.stringify(v) : String(v)).slice(0, 120)}</span>`).join("")}</div>`).join("")}</details>` : "";
     sp.innerHTML = `<div class="qr-sp-head">${icon("clock")}<b>${esc(p.time)}</b><span>·</span>${icon("map")}<span>${esc(p.location || "-")}</span>
         <span>·</span><span>Giliran ${p.turn}</span>${p.story ? `<span class="qr-muted">· ${esc(p.story)}</span>` : ""}</div>
       ${p.stats && p.stats.length ? `<div class="qr-stats">${p.stats.map(bar).join("")}</div>` : ""}
-      ${status ? `<div class="qr-tags">${status}</div>` : ""}`;
+      ${status ? `<div class="qr-tags">${status}</div>` : ""}${npcHTML}`;
     const open = state.open.has("world");
     wp.innerHTML = `<button class="qr-world-head" data-act="toggle-world">${icon("globe")}<b>Dunia</b>
         <span class="qr-muted">${esc(p.weather || "")}</span>${(p.events || []).some((e) => e.new) ? '<i class="qr-dot ok"></i>' : ""}${icon(open ? "down" : "right")}</button>
@@ -203,7 +207,7 @@ function render({ model, el }) {
     const sw = it.swipe && it.swipe[1] > 1
       ? `<span class="qr-swipe"><button class="qr-icon qr-xs" data-act="swipe" data-id="${it.id}" data-dir="-1">${icon("left")}</button>${it.swipe[0]}/${it.swipe[1]}<button class="qr-icon qr-xs" data-act="swipe" data-id="${it.id}" data-dir="1">${icon("right")}</button></span>` : "";
     const b = (act, ic, title) => `<button class="qr-icon qr-xs" data-act="${act}" data-id="${it.id}" title="${title}">${icon(ic)}</button>`;
-    if (it.kind === "user") return `<div class="qr-actions">${sw}${b("copy", "copy", "Salin")}${b("edit", "edit", "Edit (membuat cabang)")}${b("pin", "pin", it.pinned ? "Lepas pin" : "Pin")}${b("branch", "branch", "Cabang dari sini")}${b("delete", "trash", "Hapus")}</div>`;
+    if (it.kind === "user") return `<div class="qr-actions">${sw}${it.has_note ? b("note-view", "eye", "Catatan sistem giliran ini") : ""}${b("copy", "copy", "Salin")}${b("edit", "edit", "Edit (membuat cabang)")}${b("pin", "pin", it.pinned ? "Lepas pin" : "Pin")}${b("branch", "branch", "Cabang dari sini")}${b("delete", "trash", "Hapus")}</div>`;
     return `<div class="qr-actions">${sw}${b("copy", "copy", "Salin")}${b("reroll", "refresh", "Jawab ulang")}${b("continue", "forward", "Lanjutkan")}${b("edit", "edit", "Edit")}${b("pin", "pin", it.pinned ? "Lepas pin" : "Pin")}${b("chapter", "bookmark", "Tandai bab")}${b("fact-check", "flag", "Cek fakta")}${b("branch", "branch", "Cabang dari sini")}${b("delete", "trash", "Hapus")}</div>`;
   }
   function statsLine(st) {
@@ -370,7 +374,13 @@ function render({ model, el }) {
     pane.innerHTML = `<div class="qr-studio-head"><b>Kartu di Studio</b>
         <button class="qr-btn qr-sm qr-primary" data-act="studio-finish" ${cards.length ? "" : "disabled"}>${icon("book")}Mulai RP</button></div>
       <div class="qr-studio-quick">${quick.map(([l, t]) => `<button class="qr-btn qr-sm" data-act="quick" data-text="${esc(t)}">${esc(l)}</button>`).join("")}</div>
+      <div class="qr-studio-quick">
+        <button class="qr-btn qr-sm" data-act="studio-image">${icon("upload")}Dari gambar</button>
+        <button class="qr-btn qr-sm" data-act="studio-tidy">${icon("edit")}Rapikan teks</button></div>
       <div class="qr-studio-tabs">${cards.map((x) => `<button class="qr-tabbtn ${x.id === state.studioCard ? "on" : ""}" data-act="studio-card" data-id="${x.id}">${esc((get("boot").types || {})[x.type] || x.type)}: ${esc(x.name)}</button>`).join("") || '<span class="qr-muted">Belum ada kartu. Mulai ngobrol di kiri.</span>'}</div>
+      ${state.studioCard && card.id === state.studioCard ? `<div class="qr-row qr-var"><select class="qr-var-field">${(card.fields || [])
+        .filter((f) => f.visibility !== "ui" || ["greetings", "opening"].includes(f.key)).map((f) => `<option value="${esc(f.key)}">${esc(f.label)}</option>`).join("")}</select>
+        <button class="qr-btn qr-sm" data-act="variations">${icon("sparkles")}Variasi</button></div>` : ""}
       <div class="qr-studio-form">${state.studioCard && card.id === state.studioCard ? cardForm(card, true) : ""}</div>`;
     if (state.studioCard && card.id !== state.studioCard) send("card_open", { card_id: state.studioCard });
   }
@@ -485,6 +495,7 @@ function render({ model, el }) {
       <button class="qr-btn" data-act="branches">${icon("branch")}Pohon cabang</button>
       <button class="qr-btn" data-act="prompt-view">${icon("eye")}Lihat prompt</button>
       <button class="qr-btn" data-act="recall-test">${icon("brain")}Uji ingatan</button>
+      <button class="qr-btn" data-act="side-logs">${icon("archive")}Log tugas sampingan</button>
       <button class="qr-btn" data-act="export" data-fmt="md">${icon("download")}Ekspor MD</button>
       <button class="qr-btn" data-act="export" data-fmt="html">${icon("download")}Ekspor HTML</button>
       <button class="qr-btn" data-act="export" data-fmt="epub">${icon("download")}Ekspor EPUB</button></div></section>
@@ -630,7 +641,15 @@ function render({ model, el }) {
     const f = e.target.files?.[0]; e.target.value = "";
     if (f && confirm("Muat file ini? Semua chat, kartu, dan memory sekarang diganti isi file.")) send("load_db", { b64: await readB64(f) });
   });
-  $(".qr-file-att").addEventListener("change", (e) => { addFiles([...(e.target.files || [])]); e.target.value = ""; });
+  $(".qr-file-att").addEventListener("change", (e) => {
+    addFiles([...(e.target.files || [])]);
+    e.target.value = "";
+    if (state.imageIntent && state.pending.length) {
+      state.imageIntent = false;
+      input.value = "Isi penampilan tokoh dari gambar terlampir (card_draft_update, field appearance), lalu jelaskan singkat apa yang kamu isi.";
+      $(".qr-form").requestSubmit();
+    }
+  });
   $(".qr-file-card").addEventListener("change", async (e) => { const f = e.target.files?.[0]; e.target.value = ""; if (f) send("card_import", { b64: await readB64(f), name: f.name }); });
   $(".qr-file-avatar").addEventListener("change", async (e) => {
     const f = e.target.files?.[0]; e.target.value = "";
@@ -712,7 +731,24 @@ function render({ model, el }) {
       case "think-full": { const d = btn.closest(".qr-think"); d.classList.toggle("full"); btn.textContent = d.classList.contains("full") ? "Ringkas" : "Tampilkan penuh"; break; }
       case "quick": send("send", { text: btn.dataset.text }); break;
       case "studio-card": state.studioCard = id; send("card_open", { card_id: id }); break;
-      case "studio-finish": { const t = prompt("Judul cerita (kosong = dari skenario):", ""); if (t !== null) send("studio_finish", { title: t }); break; }
+      case "studio-finish": {
+        const g = get("story").greetings || [];
+        openModal("Mulai RP dari Studio", `<label>Judul<input class="sf-title" placeholder="Kosong = dari skenario"></label>
+          ${g.length ? `<label>Pesan pembuka<select class="sf-greet">${g.map((x, i) => `<option value="${i}">${i + 1}. ${esc(x.slice(0, 90))}</option>`).join("")}</select></label>` : ""}
+          <button class="qr-btn qr-primary" data-act="studio-go">${icon("book")}Mulai</button>`);
+        break;
+      }
+      case "studio-go": { const sel = el.querySelector(".sf-greet"); send("studio_finish", { title: el.querySelector(".sf-title").value, greeting: sel ? Number(sel.value) : 0 }); closeModal(); break; }
+      case "studio-image": state.imageIntent = true; $(".qr-file-att").click(); break;
+      case "studio-tidy": openModal("Rapikan teks bebas ke kartu", `<textarea class="qr-tidy" rows="12" placeholder="Tempel deskripsi tokoh, dunia, atau skenario apa adanya"></textarea>
+          <button class="qr-btn qr-primary" data-act="tidy-send">Rapikan</button>`); break;
+      case "tidy-send": { const t = el.querySelector(".qr-tidy").value.trim(); if (t) send("send", { text: `Rapikan teks bebas berikut ke kartu yang sesuai lewat card_draft_update (buat kartu baru kalau perlu, isi sebanyak mungkin field):\n\n${t}` }); closeModal(); break; }
+      case "variations": { const f = el.querySelector(".qr-var-field"); if (f && state.studioCard) { send("variations", { card_id: state.studioCard, field: f.value }); toast("Membuat 3 alternatif…"); } break; }
+      case "use-variation": { const v = state.variations; if (v) { send("card_field", { card_id: v.card_id, field: v.field, value: v.options[Number(btn.dataset.i)] }); closeModal(); } break; }
+      case "note-view": send("note_view", { mid }); break;
+      case "side-logs": send("side_logs"); break;
+      case "notice-close": send("notice_clear"); break;
+      case "compare": { const ids = [...el.querySelectorAll(".qr-cmp:checked")].map((i) => Number(i.value)); if (ids.length === 2) send("compare", { a: ids[0], b: ids[1] }); else toast("Pilih tepat 2 cabang.", "warn"); break; }
       case "card-save": { const form = btn.closest(".qr-card-form"); send("card_save", { card_id: Number(form.dataset.card), data: collectCard(form) }); break; }
       case "card-avatar": $(".qr-file-avatar").click(); break;
       case "card-export": { const form = btn.closest(".qr-card-form"); send("card_export", { card_id: Number(form.dataset.card), fmt: btn.dataset.fmt }); break; }
@@ -773,8 +809,22 @@ function render({ model, el }) {
     const d = a.data;
     if (a.kind === "memory") { state.memory = d; if (state.tab === "memory") { const f = document.activeElement; dbody.innerHTML = tabMemory(); if (f && f.classList.contains("qr-mem-q")) dbody.querySelector(".qr-mem-q").focus(); } }
     else if (a.kind === "vocab") { state.vocab = d; if (state.tab === "learn") dbody.innerHTML = tabLearn(); }
-    else if (a.kind === "branches") openModal("Pohon cabang", d.map((b) => `<div class="qr-branch ${b.active ? "on" : ""}"><span class="qr-badge">${b.depth} pesan</span>
-        <span>${esc(b.preview)}</span>${b.head ? '<span class="qr-muted">aktif</span>' : `<button class="qr-btn qr-sm" data-act="goto" data-id="${b.id}">Buka</button>`}</div>`).join("") || "Belum ada cabang.");
+    else if (a.kind === "branches") openModal("Pohon cabang", (d.map((b) => `<div class="qr-branch ${b.active ? "on" : ""}"><input type="checkbox" class="qr-cmp" value="${b.id}" title="Pilih untuk dibandingkan">
+        <span class="qr-badge">${b.depth} pesan</span><span>${esc(b.preview)}</span>${b.head ? '<span class="qr-muted">aktif</span>' : `<button class="qr-btn qr-sm" data-act="goto" data-id="${b.id}">Buka</button>`}</div>`).join("") || "Belum ada cabang.")
+        + (d.length > 1 ? `<button class="qr-btn qr-primary" data-act="compare">${icon("branch")}Bandingkan 2 cabang</button>` : ""));
+    else if (a.kind === "compare") {
+      const col = (msgs, id) => `<div><div class="qr-row"><b>Cabang</b><button class="qr-btn qr-sm" data-act="goto" data-id="${id}">Buka</button></div>${msgs.map((m) =>
+        `<div class="qr-cmp-msg ${m.role}"><span class="qr-muted">${m.role === "user" ? "Kamu" : "Narator"}</span><div class="qr-md">${md(m.content)}</div></div>`).join("")}</div>`;
+      openModal(`Bandingkan cabang (berpisah di pesan ${d.split_at + 1})`, `<div class="qr-cmp-grid">${col(d.a, d.a_id)}${col(d.b, d.b_id)}</div>`);
+    }
+    else if (a.kind === "note") openModal("Catatan sistem giliran ini", d.note ? `<pre class="qr-pre">${esc(d.note)}</pre>` : "Tidak ada catatan untuk giliran ini.");
+    else if (a.kind === "side_logs") openModal("Log tugas sampingan", (d || []).map((r) => `<details class="qr-lore"><summary><span class="qr-badge">${esc(r.kind)}</span>
+        <span class="qr-muted">${new Date(r.created * 1000).toLocaleString("id-ID")}</span></summary><pre class="qr-pre">${esc(JSON.stringify(r.data, null, 1))}</pre></details>`).join("") || "Belum ada.");
+    else if (a.kind === "variations") {
+      state.variations = d;
+      openModal(`Variasi: ${d.label}`, (d.options || []).map((o, i) => `<div class="qr-variation"><pre class="qr-pre">${esc(typeof o === "string" ? o : JSON.stringify(o, null, 1))}</pre>
+        <button class="qr-btn qr-sm qr-primary" data-act="use-variation" data-i="${i}">Pakai ini</button></div>`).join("") || "Model tidak memberi alternatif. Coba lagi.");
+    }
     else if (a.kind === "prompt") openModal("Prompt yang dikirim", `<div class="qr-muted">${fmtN(d.tokens)} token (system ${fmtN(d.system_tokens)}) dari ${fmtN(d.max)} · epoch ${d.epoch} · ${d.history_messages} pesan riwayat</div>
         <div class="qr-muted">kwargs ${esc(JSON.stringify(d.kwargs))} · sampler ${esc(JSON.stringify(d.sampling))}</div>
         <h4>System (beku)</h4><pre class="qr-pre">${esc(d.system)}</pre><h4>Pesan terakhir + blok sementara</h4><pre class="qr-pre">${esc(d.last_user_text)}</pre>`);
@@ -797,6 +847,11 @@ function render({ model, el }) {
     const a = Object.assign(document.createElement("a"), { href: url, download: ex.name || "export" });
     document.body.appendChild(a); a.click(); a.remove();
     setTimeout(() => URL.revokeObjectURL(url), 5000);
+  };
+  const onNotice = () => {
+    const n = model.get("notice") || {}, box = $(".qr-notice");
+    box.hidden = !n.text;
+    box.innerHTML = n.text ? `${icon("globe")}<span>${esc(n.text)}</span><button class="qr-icon qr-xs" data-act="notice-close" aria-label="Tutup">${icon("x")}</button>` : "";
   };
   const onToast = () => { const t = model.get("toast") || {}; if (t.text) toast(t.text, t.kind || "info", !!t.long); };
   const onCompose = () => { const c = model.get("compose") || {}; if (c.text) { input.value = c.text; grow(); input.focus(); } };
@@ -822,7 +877,7 @@ function render({ model, el }) {
     "change:server": () => { renderTop(); if (state.tab === "model") renderDrawer(); }, "change:backup": renderBackup,
     "change:library": () => { if (state.tab === "cards" || state.tab === "story") renderDrawer(); renderWizard(); },
     "change:card": onCard, "change:story": () => { renderStudio(); if (state.tab === "story") renderDrawer(); },
-    "change:aux": onAux, "change:export": onExport, "change:compose": onCompose, "change:boot": renderDrawer,
+    "change:aux": onAux, "change:notice": onNotice, "change:export": onExport, "change:compose": onCompose, "change:boot": renderDrawer,
   };
   for (const [ev, fn] of Object.entries(handlers)) model.on(ev, fn);
   const timer = setInterval(renderBackup, 30000);

@@ -296,7 +296,7 @@ def test_hybrid_recall_with_embedder(nb, monkeypatch):
     assert E.ready()
     ctx = {"chat_id": None, "story_id": None, "card_ids": []}
     mid = M.save("Raka selalu minum kopi tubruk tiap pagi", "user", ctx)["saved"]
-    for _ in range(100):
+    for _ in range(300):
         if S.one("SELECT 1 AS x FROM vectors WHERE kind = 'mem' AND ref_id = ?", (mid,)):
             break
         time.sleep(0.05)

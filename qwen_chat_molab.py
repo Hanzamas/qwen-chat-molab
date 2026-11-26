@@ -370,10 +370,12 @@ def _(
     CFG,
     EMBEDDER,
     PRESETS,
+    Path,
     Sys,
     hashlib,
     json,
     os,
+    re,
     subprocess,
     sys,
     thinking_kwargs,
@@ -696,6 +698,32 @@ def _(
             self.proxy = _hs.ThreadingHTTPServer(("127.0.0.1", CFG.PORT), _make_proxy(f"http://127.0.0.1:{CFG.LLAMA_PORT}", ctx))
             threading.Thread(target=self.proxy.serve_forever, daemon=True).start()
 
+        SPEC_ERROR = re.compile(r"specul|draft[_ ]?model|drafter|\bmtp\b|eagle|gemma4_mtp|spec-type|spec_draft", re.I)
+
+        @staticmethod
+        def jit_logs(log_tail):
+            """vLLM's JIT kernels (humming / NVRTC) write their compiler output to a folder named in the error.
+            Show it, otherwise the real cause stays hidden."""
+            out = []
+            for path in dict.fromkeys(re.findall(r"compiler logs: (\S+)", log_tail)):
+                p = Path(path)
+                files = sorted(p.glob("*")) if p.is_dir() else [p] if p.exists() else []
+                for f in files:
+                    if f.suffix in (".log", ".txt", ".err") or "log" in f.name.lower():
+                        out.append(f"--- {f} ---\n" + f.read_text(errors="replace")[-4000:])
+                if not out and files:
+                    out.append(f"--- isi {p} ---\n" + "\n".join(f.name for f in files))
+            return ("\n\n" + "\n\n".join(out)) if out else ""
+
+        @staticmethod
+        def hint(log_tail, p):
+            if "NVRTCCompiler failed" in log_tail or "humming" in log_tail:
+                return ("\n\nSaran: kernel JIT vLLM untuk bobot ini gagal di-compile di GPU/driver ini. Pakai preset llama.cpp "
+                        "(Dark-Gemistry HB16-Q8_0) atau 'BF16 → FP8 saat dimuat', lalu kirim log compiler di atas.")
+            if "out of memory" in log_tail.lower():
+                return "\n\nSaran: VRAM tidak cukup. Kecilkan konteks atau matikan embedder."
+            return ""
+
         def _watch(self, p, files, ctx):
             backend = p["backend"]
             health = (f"http://127.0.0.1:{CFG.PORT}/health" if backend == "vllm"
@@ -703,13 +731,17 @@ def _(
             while self.state.get("preset") and PRESETS.get(self.state["preset"]) is p:
                 proc = self.procs.get(backend)
                 if proc is not None and proc.poll() is not None:
-                    if self.state.get("mtp"):
+                    log_tail = Sys.tail(self.logf[backend], 400)
+                    # Retry without MTP only when the failure is in the speculative/draft part; any other error would
+                    # just happen again, and the message would blame MTP for something else.
+                    if self.state.get("mtp") and self.SPEC_ERROR.search(log_tail):
                         with self.lock:
-                            self.state["warnings"].append("Server mati dengan MTP/drafter; dijalankan ulang tanpa MTP.")
-                            (CFG.LOG_DIR / f"{backend}-mtp-failed.log").write_text(Sys.tail(self.logf[backend], 200))
+                            self.state["warnings"].append("Server gagal di bagian MTP/drafter; dijalankan ulang tanpa MTP.")
+                            (CFG.LOG_DIR / f"{backend}-mtp-failed.log").write_text(log_tail)
                             self._launch(p, files, ctx, False)
                         continue
-                    self.state.update(phase="failed", error=Sys.log_errors(self.logf[backend]) or "server berhenti")
+                    error = Sys.log_errors(self.logf[backend]) or "server berhenti"
+                    self.state.update(phase="failed", error=error + self.jit_logs(log_tail) + self.hint(log_tail, p))
                     self._save()
                     return
                 if Sys.http("GET", health, timeout=2)[0] == 200:
@@ -765,11 +797,15 @@ def _(
 
 
 @app.cell(hide_code=True)
-def _(CTX_CHOICES, PRESETS, mo):
-    ctl_preset = mo.ui.dropdown(options=list(PRESETS), value=next(iter(PRESETS)), label="Model", full_width=True)
-    ctl_ctx = mo.ui.dropdown(options=CTX_CHOICES, value="512K (YaRN)", label="Konteks")
-    ctl_mtp = mo.ui.switch(value=True, label="MTP (lebih cepat)")
-    ctl_embed = mo.ui.switch(value=True, label="Embedder (pencarian memory lebih pintar)")
+def _(CTX_CHOICES, PRESETS, STORE, mo):
+    # Last used server settings are stored in the database, so a restored backup starts with them selected.
+    _last = STORE.meta_get("server", {}) or {}
+    _ctx_label = next((k for k, v in CTX_CHOICES.items() if v == _last.get("ctx")), "512K (YaRN)")
+    ctl_preset = mo.ui.dropdown(options=list(PRESETS), value=_last.get("preset") if _last.get("preset") in PRESETS else next(iter(PRESETS)),
+                                label="Model", full_width=True)
+    ctl_ctx = mo.ui.dropdown(options=CTX_CHOICES, value=_ctx_label, label="Konteks")
+    ctl_mtp = mo.ui.switch(value=_last.get("mtp", True), label="MTP (lebih cepat)")
+    ctl_embed = mo.ui.switch(value=_last.get("embed", True), label="Embedder (pencarian memory lebih pintar)")
     ctl_install = mo.ui.run_button(label="Install")
     ctl_start = mo.ui.run_button(label="Start", kind="success")
     ctl_stop = mo.ui.run_button(label="Stop", kind="danger")
@@ -794,6 +830,7 @@ def _(CTX_CHOICES, PRESETS, mo):
 def _(
     PRESETS,
     SERVERS,
+    STORE,
     ctl_ctx,
     ctl_embed,
     ctl_install,
@@ -819,6 +856,8 @@ def _(
                 SERVERS.start(ctl_preset.value, ctl_ctx.value, mtp=ctl_mtp.value, embed=ctl_embed.value)
             except Exception as e:
                 return mo.callout(mo.md(f"Start gagal: {e}"), kind="danger")
+            STORE.meta_set("server", {"preset": ctl_preset.value, "ctx": ctl_ctx.value, "mtp": ctl_mtp.value,
+                                      "embed": ctl_embed.value})
             note = ""
             if ctl_ctx.value > p["max_ctx"] and p.get("yarn_exp"):
                 note = ("\n\n**YaRN eksperimental:** model ini tidak punya resep YaRN resmi. Cek `n_ctx` di log dan uji "
@@ -1007,6 +1046,10 @@ def _(CFG, Path, json, sqlite3, threading, time):
     );
     CREATE TABLE IF NOT EXISTS vectors (kind TEXT NOT NULL, ref_id INTEGER NOT NULL, dim INTEGER NOT NULL, v BLOB NOT NULL,
         PRIMARY KEY (kind, ref_id));
+    CREATE TABLE IF NOT EXISTS side_log (
+        id INTEGER PRIMARY KEY, kind TEXT NOT NULL, chat_id INTEGER, message_id INTEGER, data TEXT NOT NULL, created REAL NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS side_log_chat ON side_log (chat_id, kind);
     CREATE TABLE IF NOT EXISTS vocab (
         id INTEGER PRIMARY KEY, term TEXT NOT NULL, lang TEXT NOT NULL DEFAULT '', translation TEXT NOT NULL DEFAULT '',
         note TEXT NOT NULL DEFAULT '', example TEXT NOT NULL DEFAULT '', due REAL NOT NULL, interval REAL NOT NULL DEFAULT 0,
@@ -1140,8 +1183,29 @@ def _(CFG, Path, json, sqlite3, threading, time):
             return json.loads(r["value"]) if r else default
 
         def meta_set(self, key, value):
+            if self.meta_get(key) == value:
+                return  # unchanged: do not mark the database dirty (that would trigger a backup)
             self.x("INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                    (key, json.dumps(value)))
+
+        def side_log(self, kind, data, chat_id=None, message_id=None):
+            """Keep the output of side tasks (drafts, explanations, transcripts, server logs) so nothing is lost."""
+            text = json.dumps(data, ensure_ascii=False, default=str)[:400_000]
+            return self.x("INSERT INTO side_log (kind, chat_id, message_id, data, created) VALUES (?, ?, ?, ?, ?)",
+                          (kind, chat_id, message_id, text, time.time()))
+
+        def side_logs(self, chat_id=None, kind=None, limit=50):
+            sql, args = "SELECT * FROM side_log WHERE 1 = 1", []
+            if chat_id:
+                sql += " AND chat_id = ?"
+                args.append(chat_id)
+            if kind:
+                sql += " AND kind = ?"
+                args.append(kind)
+            rows = self.q(sql + " ORDER BY id DESC LIMIT ?", args + [limit])
+            for r in rows:
+                r["data"] = json.loads(r["data"])
+            return rows
 
         # ---------- export / import ----------
 
@@ -1206,7 +1270,7 @@ def _(CFG, Path, json, sqlite3, threading, time):
                     self.conn.execute(f"DELETE FROM attachments WHERE message_id IN ({marks})", part)
                     self.conn.execute(f"DELETE FROM vectors WHERE kind = 'msg' AND ref_id IN ({marks})", part)
                 for table in ("messages", "summaries", "snapshots", "chapters", "status_events", "world_events",
-                              "dice_log", "pending_changes", "memory_log"):
+                              "dice_log", "pending_changes", "memory_log", "side_log"):
                     self.conn.execute(f"DELETE FROM {table} WHERE chat_id = ?", (chat_id,))
                 self.conn.execute("DELETE FROM memories WHERE chat_id = ? AND (scope = 'chat' OR kind = 'summary_core')", (chat_id,))
                 self.conn.execute("DELETE FROM chats WHERE id = ?", (chat_id,))
@@ -1338,6 +1402,8 @@ def _(CFG, Path, STORE, os, threading, time):
                     self.status["last_error"] = f"Token tidak bisa dipakai: {type(e).__name__}"
                     self.status["enabled"] = False
             self.status["repo"] = self.repo
+            if self.status["enabled"]:
+                self.store.meta_set("backup", {"repo": self.repo, "interval": self.interval})
             if self.status["enabled"] and (self.thread is None or not self.thread.is_alive()):
                 self.thread = threading.Thread(target=self._loop, daemon=True)
                 self.thread.start()
@@ -1395,12 +1461,15 @@ def _(CFG, Path, STORE, os, threading, time):
 
 
 @app.cell(hide_code=True)
-def _(mo):
+def _(STORE, mo):
     bk_token = mo.ui.text(kind="password", label="Token Hugging Face (write, sebaiknya fine-grained ke repo backup saja)",
                           full_width=True)
-    bk_repo = mo.ui.text(label="Repo dataset private (kosong = <username>/qwen-chat-backup)", full_width=True)
-    bk_interval = mo.ui.dropdown(options={"5 menit": 300, "10 menit": 600, "30 menit": 1800}, value="10 menit",
-                                 label="Backup otomatis tiap")
+    _bk_last = STORE.meta_get("backup", {}) or {}
+    _bk_choices = {"5 menit": 300, "10 menit": 600, "30 menit": 1800}
+    bk_repo = mo.ui.text(value=_bk_last.get("repo", ""), label="Repo dataset private (kosong = <username>/qwen-chat-backup)",
+                         full_width=True)
+    bk_interval = mo.ui.dropdown(options=_bk_choices, label="Backup otomatis tiap",
+                                 value=next((k for k, v in _bk_choices.items() if v == _bk_last.get("interval")), "10 menit"))
     bk_now = mo.ui.run_button(label="Backup sekarang")
     bk_restore = mo.ui.run_button(label="Pulihkan terbaru", kind="danger")
     mo.accordion({"Backup ke Hugging Face": mo.vstack([
@@ -2481,6 +2550,14 @@ def _(CARDS, STORE, STORIES, datetime, json, random, re, time, timedelta):
                     break
             return out[::-1]
 
+        def events_after(self, chat_id, after_id, who="player"):
+            rows = self.store.q("SELECT * FROM world_events WHERE chat_id = ? AND id > ? ORDER BY id", (chat_id, after_id))
+            return [r for r in rows if r["public"] or who in json.loads(r["known_to"] or "[]")]
+
+        def last_event_id(self, chat_id):
+            r = self.store.one("SELECT MAX(id) AS m FROM world_events WHERE chat_id = ?", (chat_id,))
+            return (r or {}).get("m") or 0
+
         def mark_shown(self, ids):
             if ids:
                 self.store.x(f"UPDATE world_events SET shown = 1 WHERE id IN ({','.join('?' * len(ids))})", list(ids))
@@ -2552,7 +2629,7 @@ def _(
                 if not batch:
                     return
                 if not self.ready():
-                    time.sleep(10)
+                    time.sleep(2)
                     with self.qlock:
                         self.queue = batch + self.queue
                     if not self.servers.state.get("embed"):
@@ -2828,7 +2905,7 @@ def _(
 
     EMB = Embedder(STORE, SERVERS)
     MEM = Memory(STORE, CARDS, STORIES, EMB)
-    return EMB, MEM
+    return EMB, MEM, Memory
 
 
 @app.cell(hide_code=True)
@@ -3494,6 +3571,7 @@ def _(
             if ephemeral and msgs[-1]["role"] == "user":
                 user_text = path[-1]["content"] if path else ""
                 note, used = self.ephemeral(chat_id, path, user_text, extra)
+                used = {**used, "note": note}
                 if note:
                     block = "\n\n[Catatan sistem untuk giliran ini, bukan tulisan pemain]\n" + note
                     last = msgs[-1]
@@ -3702,6 +3780,9 @@ def _(TXT, re, threading, time):
                                     max_tokens=8000)
                 calls = [v for _, v in sorted(acc["calls"].items())]
                 if not calls:
+                    self.store.side_log("memory_flush", {"range": [a, b], "answer": acc["content"],
+                                                         "transcript": [m for m in msgs if m["role"] in ("assistant", "tool")]},
+                                        chat_id, head)
                     return
                 msgs.append({"role": "assistant", "content": acc["content"],
                              "tool_calls": [{"id": cl["id"] or f"f{i}", "type": "function",
@@ -3766,7 +3847,7 @@ def _(TXT, re, threading, time):
 
 
 @app.cell(hide_code=True)
-def _(CARDS, MEM, STORE, STORIES, TXT, WEB, WORLD, World, json):
+def _(CARDS, MEM, Memory, STORE, STORIES, TXT, WEB, WORLD, World, json):
     def _fn(name, description, properties, required=()):
         return {"type": "function", "function": {"name": name, "description": description,
                 "parameters": {"type": "object", "properties": properties, "required": list(required)}}}
@@ -3811,6 +3892,12 @@ def _(CARDS, MEM, STORE, STORIES, TXT, WEB, WORLD, World, json):
         _fn("canon_set", "Write a section of the story book (what is true now in this story). Empty text removes it.",
             {"section": _S, "text": _S}, ["section", "text"]),
         _fn("card_read", "Read the full card of a character in this story.", {"name": _S}, ["name"]),
+    ]
+
+    TOOL_CARD_EDIT = [
+        _fn("card_update", "Change one field of a card used by this story (character, persona, world, scenario, style, gm). "
+            "Makes a new card version; it applies now through the system note and in the frozen prompt from the next epoch.",
+            {"card": _S, "field": _S, "value": {}}, ["card", "field", "value"]),
     ]
 
     TOOL_STUDIO = [
@@ -3929,16 +4016,34 @@ def _(CARDS, MEM, STORE, STORIES, TXT, WEB, WORLD, World, json):
             return self.mem.forget(int(id), self.mem.ctx_of(chat_id))
 
         def t_history_search(self, chat_id, mid, query, scope="chat", limit=10):
+            """Hybrid: BM25 over the original messages plus vector search when the embedder runs (RRF)."""
             q = TXT.fts_query(query)
-            if not q:
+            rows = []
+            if q:
+                sql = ("SELECT m.id, m.chat_id, m.role, snippet(messages_fts, 0, '[', ']', '…', 16) AS snippet "
+                       "FROM messages_fts JOIN messages m ON m.id = messages_fts.rowid WHERE messages_fts MATCH ?")
+                args = [q]
+                if scope != "all":
+                    sql += " AND m.chat_id = ?"
+                    args.append(chat_id)
+                rows = self.store.q(sql + " ORDER BY bm25(messages_fts) LIMIT 40", args)
+            emb = self.mem.emb
+            if emb.ready():
+                ids_sql = "SELECT id FROM messages" + ("" if scope == "all" else " WHERE chat_id = ?")
+                allowed_msgs = {r["id"] for r in self.store.q(ids_sql, () if scope == "all" else (chat_id,))}
+                hits = emb.search("msg", query, limit=60, allowed={m * 100 + i for m in allowed_msgs for i in range(20)})
+                vec_ids = list(dict.fromkeys(ref // 100 for ref, s in hits if s > 0.35))
+                by_id = {r["id"]: r for r in rows}
+                for mid2 in vec_ids:
+                    if mid2 not in by_id:
+                        m = self.store.msg(mid2)
+                        if m:
+                            by_id[mid2] = {"id": m["id"], "chat_id": m["chat_id"], "role": m["role"], "snippet": m["content"][:240]}
+                order = Memory.rrf([r["id"] for r in rows], vec_ids)
+                rows = [by_id[i] for i in order if i in by_id]
+            rows = rows[:int(limit)]
+            if not rows:
                 return {"results": []}
-            sql = ("SELECT m.id, m.chat_id, m.role, snippet(messages_fts, 0, '[', ']', '…', 16) AS snippet "
-                   "FROM messages_fts JOIN messages m ON m.id = messages_fts.rowid WHERE messages_fts MATCH ?")
-            args = [q]
-            if scope != "all":
-                sql += " AND m.chat_id = ?"
-                args.append(chat_id)
-            rows = self.store.q(sql + " ORDER BY bm25(messages_fts) LIMIT ?", args + [int(limit)])
             paths = {}
             for r in rows:
                 if r["chat_id"] not in paths:
@@ -4003,6 +4108,27 @@ def _(CARDS, MEM, STORE, STORIES, TXT, WEB, WORLD, World, json):
                     return self.cards.render(c, mode="all", limit=12000)
             return {"error": f"tidak ada kartu bernama {name} di cerita ini"}
 
+        def t_card_update(self, chat_id, mid, card, field, value):
+            sid, cards = self._story(chat_id)
+            if not sid:
+                return {"error": "chat ini tidak terhubung ke cerita"}
+            pool = cards["character"] + [cards[r] for r in ("persona", "world", "scenario", "style", "gm") if cards.get(r)]
+            target = None
+            for c in pool:
+                names = [c["name"]] + list(c["data"].get("aliases") or [])
+                if any(n and n.lower() == (card or "").lower() for n in names) or (card or "").lower() == c["type"]:
+                    target = c
+                    break
+            if not target:
+                return {"error": f"kartu '{card}' tidak dipakai cerita ini. Pilihan: {', '.join(c['name'] for c in pool)}"}
+            keys = {f["key"] for f in self.cards.schema(target["type"])["fields"]}
+            if field not in keys and field not in target["data"]:
+                return {"error": f"field '{field}' tidak ada di skema {target['type']}. Field: {', '.join(sorted(keys))}"}
+            self.cards.set_field(target["id"], field, value)
+            shown = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+            self.stories.pending(sid, chat_id, f"Kartu {target['name']} · {field}: {shown[:600]}")
+            return {"card_id": target["id"], "version": self.cards.get(target["id"])["version"], "ok": True}
+
         # ---------- studio ----------
 
         def _drafts(self, chat_id):
@@ -4048,7 +4174,7 @@ def _(CARDS, MEM, STORE, STORIES, TXT, WEB, WORLD, World, json):
 
 
     TOOLS = ToolBox(STORE, CARDS, STORIES, WORLD, MEM, WEB)
-    return (TOOLS,)
+    return TOOLS, TOOL_CARD_EDIT
 
 
 @app.cell(hide_code=True)
@@ -4198,6 +4324,7 @@ def _(TXT, hashlib, io, json, re, time, zipfile):
                     items.append({"kind": "user", "id": m["id"], "n": n, "content": m["meta"].get("typed", m["content"]),
                                   "ooc": bool(m["ooc"]), "pinned": bool(m["pinned"]), "time_skip": m["meta"].get("time_skip"),
                                   "attachments": (a["names"].split("|") if a else []), "notes": m["meta"].get("notes") or [],
+                                  "has_note": bool(m["meta"].get("ephemeral")),
                                   "swipe": [sib.index(m["id"]) + 1 if m["id"] in sib else 1, max(1, len(sib))]})
                 else:
                     if cur is None:
@@ -4384,11 +4511,13 @@ def _(
     STORE,
     STORIES,
     TOOLS,
+    TOOL_CARD_EDIT,
     TXT,
     WEB,
     WORLD,
     World,
     json,
+    os,
     random,
     re,
     threading,
@@ -4454,8 +4583,10 @@ def _(
             self.bg_busy = False
             self.fact_jobs = []
             self.backfilled = False
-            self.idle_thread = threading.Thread(target=self._idle_loop, daemon=True)
-            self.idle_thread.start()
+            # QCHAT_IDLE=0 turns the background loop off (tests run several engines against one fake server).
+            if os.environ.get("QCHAT_IDLE", "1") != "0":
+                self.idle_thread = threading.Thread(target=self._idle_loop, daemon=True)
+                self.idle_thread.start()
 
         # ---------- job runner ----------
 
@@ -4512,7 +4643,7 @@ def _(
             self.emit("chats")
             return cid
 
-        def start_story(self, card_ids, title=None, greeting_index=0, from_chat=None):
+        def start_story(self, card_ids, title=None, greeting_index=0, from_chat=None):  # noqa: C901
             """New story + RP chat from cards, with the chosen opening as the first message."""
             sc = self.cards.get(card_ids.get("scenario")) if card_ids.get("scenario") else None
             chars = card_ids.get("character") or []
@@ -4645,9 +4776,17 @@ def _(
             minutes = min(minutes, 60 * 24 * 30)
             ids = self.store.path_ids(chat_id)
             t0 = self.world.state(chat_id, ids)["time"]
+            before = self.world.last_event_id(chat_id)
             self.world.advance(chat_id, uid, minutes, "AFK")
             self._tick(chat_id, t0, minutes, "Pemain sedang tidak ada (AFK).", head=uid)
+            self._away_notice(chat_id, before, minutes)
             return [f"Pemain baru kembali setelah {World.fmt_span(minutes)} waktu dunia berlalu. Kejadian selama itu ada di atas."]
+
+        def _away_notice(self, chat_id, before_id, minutes):
+            events = self.world.events_after(chat_id, before_id)
+            text = f"Selama kamu pergi ({World.fmt_span(minutes)} waktu dunia): " + (
+                " · ".join(e["text"] for e in events[:6]) if events else "tidak ada kabar yang sampai padamu.")
+            self.emit("notice", {"chat_id": chat_id, "text": text})
 
         # ---------- the turn ----------
 
@@ -4684,6 +4823,10 @@ def _(
                     msgs, used_round = self.prompt.build(chat_id, path, extra=extra if _round == 0 else None)
                     if _round == 0:
                         used_info = used_round
+                        # keep the exact temporary block of this turn with the user message
+                        if used_round.get("note") and path and path[-1]["role"] == "user":
+                            um = path[-1]
+                            self.store.update_message(um["id"], meta={**um["meta"], "ephemeral": used_round["note"]})
                     base_c, base_r = live["content"], live["reasoning"]
                     state = {"mid": None, "saved": 0.0}
 
@@ -4870,8 +5013,25 @@ def _(
                     self.emit("live", {})
             # fact check
             mode = c["settings"].get("fact_mode") or "latar"
-            if mode == "ketat":
-                self._fact_check(chat_id, mid, False)
+            if mode == "ketat" and not getattr(self, "_rewriting", False):
+                self.emit("live", {"active": True, "content": m["content"], "phase": "Memeriksa fakta…", "reasoning": "",
+                                   "tools": [], "chat_id": chat_id})
+                warnings = self._fact_check(chat_id, mid, False, stop=self.stop)
+                self.emit("live", {})
+                if warnings and not self.stop.is_set():
+                    # Strict mode: write the turn again with the corrections; the wrong version stays as a sibling.
+                    u = self._turn_user(chat_id, mid)
+                    if u:
+                        self.store.set_head(chat_id, u["id"])
+                        note = "Koreksi fakta untuk giliran ini (jawaban sebelumnya salah):\n" + "\n".join(
+                            f"- {w['claim']} -> {w['correction']} ({w['source']})" for w in warnings)
+                        self.emit("toast", {"text": f"{len(warnings)} fakta salah; jawaban ditulis ulang. Versi lama bisa digeser.",
+                                            "kind": "warn"})
+                        self._rewriting = True
+                        try:
+                            self._turn(chat_id, extra=[note])
+                        finally:
+                            self._rewriting = False
             elif mode == "latar":
                 self.fact_jobs.append((chat_id, mid))
 
@@ -4927,7 +5087,9 @@ def _(
 
         # ---------- fact check ----------
 
-        def _fact_check(self, chat_id, mid, announce):
+        def _fact_check(self, chat_id, mid, announce, stop=None):
+            # foreground (announce / strict) stops with Stop; background checks stop when the user sends something
+            stop = stop or (self.stop if announce else self.bg_cancel)
             c = self.prompt.ctx(chat_id)
             world = c["cards"].get("world")
             real = not world or (world["data"].get("realworld") or "ya") == "ya"
@@ -4938,12 +5100,12 @@ def _(
             acc = self.llm.complete(self.prompt.side(chat_id, FACTCHECK_CLAIMS.format(kind="dunia nyata" if real else "tentang dunia cerita"),
                                                      path=path),
                                     kwargs=self.prompt.kwargs(c), sampling={"temperature": 0.3}, max_tokens=6000,
-                                    tools=self.tools.specs(c), stop=self.bg_cancel if not announce else self.stop)
+                                    tools=self.tools.specs(c), stop=stop)
             data = self._json(acc["content"]) or {}
             warnings = []
             for claim in (data.get("claims") or [])[:6]:
-                if self.bg_cancel.is_set() and not announce:
-                    return
+                if stop.is_set():
+                    return []
                 known = self.mem.fact_lookup(claim, world["id"] if world else None, limit=3)
                 if any(TXT.jaccard(claim, k["claim"]) >= 0.5 for k in known):
                     continue
@@ -4963,12 +5125,13 @@ def _(
                 v = self.llm.complete(self.prompt.side(chat_id, FACTCHECK_VERIFY.format(claim=claim, source=source, text=text[:8000]),
                                                        path=path),
                                       kwargs=self.prompt.kwargs(c), sampling={"temperature": 0.2}, max_tokens=4000,
-                                      tools=self.tools.specs(c), stop=self.stop if announce else self.bg_cancel)
+                                      tools=self.tools.specs(c), stop=stop)
                 verdict = self._json(v["content"]) or {}
                 if verdict.get("verdict") == "salah":
                     warnings.append({"claim": claim, "correction": verdict.get("correction", ""), "source": source})
                 if real and verdict.get("fact") and verdict.get("verdict") in ("benar", "salah"):
                     self.mem.fact_save(verdict["fact"], source, "", world["id"] if world else None, 0.8)
+            self.store.side_log("fact_check", {"claims": data.get("claims") or [], "warnings": warnings}, chat_id, mid)
             m = self.store.msg(mid)
             m["meta"]["fact_warnings"] = warnings
             m["meta"]["fact_checked"] = True
@@ -4976,6 +5139,7 @@ def _(
             self.emit("history", chat_id)
             if announce:
                 self.emit("toast", {"text": f"Cek fakta: {len(warnings)} klaim salah." if warnings else "Cek fakta: tidak ada yang salah."})
+            return warnings
 
         # ---------- tree operations ----------
 
@@ -5129,6 +5293,9 @@ def _(
                 for i, cl in enumerate(calls):
                     res, _, _ = self.tools.call(chat_id, head, cl["name"], cl["arguments"])
                     msgs.append({"role": "tool", "tool_call_id": cl["id"] or f"t{i}", "content": res})
+            self.store.side_log("world_tick", {"why": why, "from": str(t0), "minutes": minutes,
+                                               "transcript": [m for m in msgs if m["role"] in ("assistant", "tool")]},
+                                chat_id, head)
 
         def _idle_loop(self):
             while True:
@@ -5141,8 +5308,9 @@ def _(
         def _idle_once(self):
             if self.busy or self.bg_busy or not self.servers.ready():
                 return
-            if not self.backfilled and EMB.ready():
-                self.backfilled = True
+            # Embed whatever is new (messages, summaries, lore, events...) every few minutes while idle.
+            if EMB.ready() and time.time() - (self.backfilled or 0) > 300:
+                self.backfilled = time.time()
                 threading.Thread(target=EMB.backfill, daemon=True).start()
             self.bg_cancel.clear()
             self.bg_busy = True
@@ -5177,10 +5345,12 @@ def _(
                         ids = self.store.path_ids(chat_id)
                         head = chat["head_id"]
                         t0 = self.world.state(chat_id, ids)["time"]
+                        before = self.world.last_event_id(chat_id)
                         self.world.advance(chat_id, head, minutes, "AFK")
                         self.store.chat_settings(chat_id, world_sync=time.time())
                         self.emit("status", "Dunia berjalan…")
                         self._tick(chat_id, t0, minutes, "Pemain sedang tidak ada (AFK).", head=head, stop=self.bg_cancel)
+                        self._away_notice(chat_id, before, minutes)
                         self.emit("status", "")
                         self.emit("panels", chat_id)
             finally:
@@ -5196,21 +5366,27 @@ def _(
                      f"Tulis drafnya saja.")
             acc = self.llm.complete(self.prompt.side(chat_id, instr), kwargs=self.prompt.kwargs(c), sampling=self.prompt.sampling(c),
                                     max_tokens=6000, tools=self.tools.specs(c), stop=self.stop)
-            self.emit("compose", (acc["content"] or "").strip())
+            draft = (acc["content"] or "").strip()
+            self.store.side_log("impersonate", {"hint": hint, "draft": draft}, chat_id)
+            self.emit("compose", draft)
 
         def _studio_change(self, chat_id, request):
             """'/studio ...' or '((ubah: ...))' during RP: the model edits cards or the story book through tools."""
             c = self.prompt.ctx(chat_id)
             allowed = {"canon_set", "status_update", "memory_save", "memory_update"}
-            tools = [t for t in self.tools.specs(c) if t["function"]["name"] in allowed]
+            tools = [t for t in self.tools.specs(c) if t["function"]["name"] in allowed] + TOOL_CARD_EDIT
             msgs = self.prompt.side(chat_id, f"Permintaan perubahan dari pemain (di luar cerita): {request}\n"
-                                             f"Terapkan dengan canon_set / status_update / memory_save. Jawab singkat apa yang diubah.")
+                                             f"Kalau yang berubah adalah sifat tetap tokoh/dunia/gaya, pakai card_update (kartu). Kalau yang "
+                                             f"berubah keadaan cerita, pakai canon_set / status_update / memory_save. Jawab singkat apa yang diubah.")
             head = self.store.chat(chat_id)["head_id"]
             for _ in range(3):
                 acc = self.llm.chat(msgs, tools=tools, kwargs=self.prompt.kwargs(c), sampling=self.prompt.sampling(c), max_tokens=8000,
                                     stop=self.stop)
                 calls = [v for _, v in sorted(acc["calls"].items())]
                 if not calls:
+                    self.store.side_log("studio_change", {"request": request, "answer": acc["content"],
+                                                          "transcript": [m for m in msgs if m["role"] in ("assistant", "tool")]},
+                                        chat_id, head)
                     self.emit("toast", {"text": (acc["content"] or "Selesai.").strip()[:600], "long": True})
                     break
                 msgs.append({"role": "assistant", "content": acc["content"], "tool_calls": [
@@ -5220,6 +5396,38 @@ def _(
                     res, _, _ = self.tools.call(chat_id, head, cl["name"], cl["arguments"])
                     msgs.append({"role": "tool", "tool_call_id": cl["id"] or f"s{i}", "content": res})
             self.emit("panels", chat_id)
+
+        def variations(self, chat_id, card_id, field):
+            self.run(self._variations, chat_id, card_id, field)
+
+        def _variations(self, chat_id, card_id, field):
+            card = self.cards.get(card_id)
+            f = next((x for x in self.cards.visible_fields(card) if x["key"] == field), {"label": field, "type": "text"})
+            c = self.prompt.ctx(chat_id)
+            shape = "array" if f["type"] in ("list", "tags", "table") else "string"
+            instr = (f"Beri 3 alternatif yang jelas berbeda untuk field '{f['label']}' ({f['type']}) di kartu #{card_id} "
+                     f"({card['name']}), konsisten dengan kartu lain. Nilai sekarang: "
+                     f"{json.dumps(card['data'].get(field), ensure_ascii=False)}\n"
+                     f'Jawab HANYA JSON: {{"options": [<{shape}>, <{shape}>, <{shape}>]}}')
+            acc = self.llm.complete(self.prompt.side(chat_id, instr), kwargs=self.prompt.kwargs(c),
+                                    sampling={**self.prompt.sampling(c), "temperature": 1.1}, max_tokens=12000,
+                                    tools=self.tools.specs(c), stop=self.stop)
+            data = self._json(acc["content"]) or {}
+            options = (data.get("options") or [])[:3]
+            self.store.side_log("variations", {"card_id": card_id, "field": field, "options": options}, chat_id)
+            self.emit("variations", {"card_id": card_id, "field": field, "label": f["label"], "options": options})
+
+        def compare(self, chat_id, a, b):
+            """Two branches side by side, from the message where they split."""
+            pa, pb = self.store.path_ids(chat_id, a), self.store.path_ids(chat_id, b)
+            k = 0
+            while k < min(len(pa), len(pb)) and pa[k] == pb[k]:
+                k += 1
+
+            def side(ids):
+                return [{"id": m["id"], "role": m["role"], "content": m["content"][:4000]}
+                        for m in self.store.path(chat_id, ids=ids[k:k + 16]) if m["role"] in ("user", "assistant") and m["content"]]
+            return {"split_at": k, "a": side(pa), "b": side(pb), "a_id": a, "b_id": b}
 
         def learn(self, chat_id, text):
             self.run(self._learn, chat_id, text)
@@ -5231,6 +5439,7 @@ def _(
                                     kwargs=self.prompt.kwargs(c), sampling={"temperature": 0.3}, max_tokens=6000,
                                     tools=self.tools.specs(c), stop=self.stop)
             data = self._json(acc["content"]) or {"translation": acc["content"]}
+            self.store.side_log("learn", {"text": text, "lang": lang, **data}, chat_id)
             self.emit("learn", {"text": text, "lang": lang, **data})
 
         def vocab_add(self, term, translation="", note="", example="", lang=""):
@@ -5289,7 +5498,9 @@ def _(
                 score = TXT.jaccard(got, x["a"])
                 ok = score >= 0.35 or (x["a"].strip().lower() in got.lower() and len(x["a"]) > 2)
                 report.append({"q": x["q"], "expected": x["a"], "got": got, "ok": ok})
-            self.emit("recall", {"items": report, "score": sum(r["ok"] for r in report), "total": len(report)})
+            result = {"items": report, "score": sum(r["ok"] for r in report), "total": len(report)}
+            self.store.side_log("recall_test", result, chat_id)
+            self.emit("recall", result)
 
         def switch_model(self, preset, ctx, mtp=True, embed=True):
             def job():
@@ -5297,6 +5508,7 @@ def _(
                     self.emit("status", f"{title}: {'selesai' if code == 0 else 'gagal' if code else 'jalan…'}")
                 try:
                     SERVERS.start(preset, ctx, mtp=mtp, embed=embed, log=log)
+                    self.store.meta_set("server", {"preset": preset, "ctx": ctx, "mtp": mtp, "embed": embed})
                     self.emit("toast", {"text": f"{preset} dimulai. Tunggu READY di bar atas."})
                 except Exception as e:
                     self.emit("toast", {"text": f"Ganti model gagal: {e}", "kind": "error"})
@@ -5518,6 +5730,7 @@ def _():
         </div>
         <div class="qr-world" hidden></div>
         <div class="qr-composer">
+          <div class="qr-notice" hidden></div>
           <div class="qr-pending" hidden></div>
           <div class="qr-statusline" hidden></div>
           <form class="qr-form">
@@ -5637,10 +5850,13 @@ def _():
             <div class="qr-sbar"><i style="width:${pct}%"></i></div><b>${Number(s.value)}</b>${ch}</div>`;
         };
         const status = Object.entries(p.status || {}).map(([k, v]) => `<span class="qr-tag">${esc(k)}: ${esc(Array.isArray(v) ? v.join(", ") : typeof v === "object" ? JSON.stringify(v) : v)}</span>`).join("");
+        const npcs = Object.entries(p.characters || {});
+        const npcHTML = npcs.length ? `<details class="qr-npcs" data-key="npcs" ${state.open.has("npcs") ? "open" : ""}><summary>${icon("users")}Tokoh lain (${npcs.length})</summary>
+          ${npcs.map(([name, st]) => `<div class="qr-npc"><b>${esc(name)}</b> ${Object.entries(st).map(([k, v]) => `<span class="qr-tag">${esc(k)}: ${esc(Array.isArray(v) ? v.join(", ") : typeof v === "object" ? JSON.stringify(v) : String(v)).slice(0, 120)}</span>`).join("")}</div>`).join("")}</details>` : "";
         sp.innerHTML = `<div class="qr-sp-head">${icon("clock")}<b>${esc(p.time)}</b><span>·</span>${icon("map")}<span>${esc(p.location || "-")}</span>
             <span>·</span><span>Giliran ${p.turn}</span>${p.story ? `<span class="qr-muted">· ${esc(p.story)}</span>` : ""}</div>
           ${p.stats && p.stats.length ? `<div class="qr-stats">${p.stats.map(bar).join("")}</div>` : ""}
-          ${status ? `<div class="qr-tags">${status}</div>` : ""}`;
+          ${status ? `<div class="qr-tags">${status}</div>` : ""}${npcHTML}`;
         const open = state.open.has("world");
         wp.innerHTML = `<button class="qr-world-head" data-act="toggle-world">${icon("globe")}<b>Dunia</b>
             <span class="qr-muted">${esc(p.weather || "")}</span>${(p.events || []).some((e) => e.new) ? '<i class="qr-dot ok"></i>' : ""}${icon(open ? "down" : "right")}</button>
@@ -5674,7 +5890,7 @@ def _():
         const sw = it.swipe && it.swipe[1] > 1
           ? `<span class="qr-swipe"><button class="qr-icon qr-xs" data-act="swipe" data-id="${it.id}" data-dir="-1">${icon("left")}</button>${it.swipe[0]}/${it.swipe[1]}<button class="qr-icon qr-xs" data-act="swipe" data-id="${it.id}" data-dir="1">${icon("right")}</button></span>` : "";
         const b = (act, ic, title) => `<button class="qr-icon qr-xs" data-act="${act}" data-id="${it.id}" title="${title}">${icon(ic)}</button>`;
-        if (it.kind === "user") return `<div class="qr-actions">${sw}${b("copy", "copy", "Salin")}${b("edit", "edit", "Edit (membuat cabang)")}${b("pin", "pin", it.pinned ? "Lepas pin" : "Pin")}${b("branch", "branch", "Cabang dari sini")}${b("delete", "trash", "Hapus")}</div>`;
+        if (it.kind === "user") return `<div class="qr-actions">${sw}${it.has_note ? b("note-view", "eye", "Catatan sistem giliran ini") : ""}${b("copy", "copy", "Salin")}${b("edit", "edit", "Edit (membuat cabang)")}${b("pin", "pin", it.pinned ? "Lepas pin" : "Pin")}${b("branch", "branch", "Cabang dari sini")}${b("delete", "trash", "Hapus")}</div>`;
         return `<div class="qr-actions">${sw}${b("copy", "copy", "Salin")}${b("reroll", "refresh", "Jawab ulang")}${b("continue", "forward", "Lanjutkan")}${b("edit", "edit", "Edit")}${b("pin", "pin", it.pinned ? "Lepas pin" : "Pin")}${b("chapter", "bookmark", "Tandai bab")}${b("fact-check", "flag", "Cek fakta")}${b("branch", "branch", "Cabang dari sini")}${b("delete", "trash", "Hapus")}</div>`;
       }
       function statsLine(st) {
@@ -5841,7 +6057,13 @@ def _():
         pane.innerHTML = `<div class="qr-studio-head"><b>Kartu di Studio</b>
             <button class="qr-btn qr-sm qr-primary" data-act="studio-finish" ${cards.length ? "" : "disabled"}>${icon("book")}Mulai RP</button></div>
           <div class="qr-studio-quick">${quick.map(([l, t]) => `<button class="qr-btn qr-sm" data-act="quick" data-text="${esc(t)}">${esc(l)}</button>`).join("")}</div>
+          <div class="qr-studio-quick">
+            <button class="qr-btn qr-sm" data-act="studio-image">${icon("upload")}Dari gambar</button>
+            <button class="qr-btn qr-sm" data-act="studio-tidy">${icon("edit")}Rapikan teks</button></div>
           <div class="qr-studio-tabs">${cards.map((x) => `<button class="qr-tabbtn ${x.id === state.studioCard ? "on" : ""}" data-act="studio-card" data-id="${x.id}">${esc((get("boot").types || {})[x.type] || x.type)}: ${esc(x.name)}</button>`).join("") || '<span class="qr-muted">Belum ada kartu. Mulai ngobrol di kiri.</span>'}</div>
+          ${state.studioCard && card.id === state.studioCard ? `<div class="qr-row qr-var"><select class="qr-var-field">${(card.fields || [])
+            .filter((f) => f.visibility !== "ui" || ["greetings", "opening"].includes(f.key)).map((f) => `<option value="${esc(f.key)}">${esc(f.label)}</option>`).join("")}</select>
+            <button class="qr-btn qr-sm" data-act="variations">${icon("sparkles")}Variasi</button></div>` : ""}
           <div class="qr-studio-form">${state.studioCard && card.id === state.studioCard ? cardForm(card, true) : ""}</div>`;
         if (state.studioCard && card.id !== state.studioCard) send("card_open", { card_id: state.studioCard });
       }
@@ -5956,6 +6178,7 @@ def _():
           <button class="qr-btn" data-act="branches">${icon("branch")}Pohon cabang</button>
           <button class="qr-btn" data-act="prompt-view">${icon("eye")}Lihat prompt</button>
           <button class="qr-btn" data-act="recall-test">${icon("brain")}Uji ingatan</button>
+          <button class="qr-btn" data-act="side-logs">${icon("archive")}Log tugas sampingan</button>
           <button class="qr-btn" data-act="export" data-fmt="md">${icon("download")}Ekspor MD</button>
           <button class="qr-btn" data-act="export" data-fmt="html">${icon("download")}Ekspor HTML</button>
           <button class="qr-btn" data-act="export" data-fmt="epub">${icon("download")}Ekspor EPUB</button></div></section>
@@ -6101,7 +6324,15 @@ def _():
         const f = e.target.files?.[0]; e.target.value = "";
         if (f && confirm("Muat file ini? Semua chat, kartu, dan memory sekarang diganti isi file.")) send("load_db", { b64: await readB64(f) });
       });
-      $(".qr-file-att").addEventListener("change", (e) => { addFiles([...(e.target.files || [])]); e.target.value = ""; });
+      $(".qr-file-att").addEventListener("change", (e) => {
+        addFiles([...(e.target.files || [])]);
+        e.target.value = "";
+        if (state.imageIntent && state.pending.length) {
+          state.imageIntent = false;
+          input.value = "Isi penampilan tokoh dari gambar terlampir (card_draft_update, field appearance), lalu jelaskan singkat apa yang kamu isi.";
+          $(".qr-form").requestSubmit();
+        }
+      });
       $(".qr-file-card").addEventListener("change", async (e) => { const f = e.target.files?.[0]; e.target.value = ""; if (f) send("card_import", { b64: await readB64(f), name: f.name }); });
       $(".qr-file-avatar").addEventListener("change", async (e) => {
         const f = e.target.files?.[0]; e.target.value = "";
@@ -6183,7 +6414,24 @@ def _():
           case "think-full": { const d = btn.closest(".qr-think"); d.classList.toggle("full"); btn.textContent = d.classList.contains("full") ? "Ringkas" : "Tampilkan penuh"; break; }
           case "quick": send("send", { text: btn.dataset.text }); break;
           case "studio-card": state.studioCard = id; send("card_open", { card_id: id }); break;
-          case "studio-finish": { const t = prompt("Judul cerita (kosong = dari skenario):", ""); if (t !== null) send("studio_finish", { title: t }); break; }
+          case "studio-finish": {
+            const g = get("story").greetings || [];
+            openModal("Mulai RP dari Studio", `<label>Judul<input class="sf-title" placeholder="Kosong = dari skenario"></label>
+              ${g.length ? `<label>Pesan pembuka<select class="sf-greet">${g.map((x, i) => `<option value="${i}">${i + 1}. ${esc(x.slice(0, 90))}</option>`).join("")}</select></label>` : ""}
+              <button class="qr-btn qr-primary" data-act="studio-go">${icon("book")}Mulai</button>`);
+            break;
+          }
+          case "studio-go": { const sel = el.querySelector(".sf-greet"); send("studio_finish", { title: el.querySelector(".sf-title").value, greeting: sel ? Number(sel.value) : 0 }); closeModal(); break; }
+          case "studio-image": state.imageIntent = true; $(".qr-file-att").click(); break;
+          case "studio-tidy": openModal("Rapikan teks bebas ke kartu", `<textarea class="qr-tidy" rows="12" placeholder="Tempel deskripsi tokoh, dunia, atau skenario apa adanya"></textarea>
+              <button class="qr-btn qr-primary" data-act="tidy-send">Rapikan</button>`); break;
+          case "tidy-send": { const t = el.querySelector(".qr-tidy").value.trim(); if (t) send("send", { text: `Rapikan teks bebas berikut ke kartu yang sesuai lewat card_draft_update (buat kartu baru kalau perlu, isi sebanyak mungkin field):\n\n${t}` }); closeModal(); break; }
+          case "variations": { const f = el.querySelector(".qr-var-field"); if (f && state.studioCard) { send("variations", { card_id: state.studioCard, field: f.value }); toast("Membuat 3 alternatif…"); } break; }
+          case "use-variation": { const v = state.variations; if (v) { send("card_field", { card_id: v.card_id, field: v.field, value: v.options[Number(btn.dataset.i)] }); closeModal(); } break; }
+          case "note-view": send("note_view", { mid }); break;
+          case "side-logs": send("side_logs"); break;
+          case "notice-close": send("notice_clear"); break;
+          case "compare": { const ids = [...el.querySelectorAll(".qr-cmp:checked")].map((i) => Number(i.value)); if (ids.length === 2) send("compare", { a: ids[0], b: ids[1] }); else toast("Pilih tepat 2 cabang.", "warn"); break; }
           case "card-save": { const form = btn.closest(".qr-card-form"); send("card_save", { card_id: Number(form.dataset.card), data: collectCard(form) }); break; }
           case "card-avatar": $(".qr-file-avatar").click(); break;
           case "card-export": { const form = btn.closest(".qr-card-form"); send("card_export", { card_id: Number(form.dataset.card), fmt: btn.dataset.fmt }); break; }
@@ -6244,8 +6492,22 @@ def _():
         const d = a.data;
         if (a.kind === "memory") { state.memory = d; if (state.tab === "memory") { const f = document.activeElement; dbody.innerHTML = tabMemory(); if (f && f.classList.contains("qr-mem-q")) dbody.querySelector(".qr-mem-q").focus(); } }
         else if (a.kind === "vocab") { state.vocab = d; if (state.tab === "learn") dbody.innerHTML = tabLearn(); }
-        else if (a.kind === "branches") openModal("Pohon cabang", d.map((b) => `<div class="qr-branch ${b.active ? "on" : ""}"><span class="qr-badge">${b.depth} pesan</span>
-            <span>${esc(b.preview)}</span>${b.head ? '<span class="qr-muted">aktif</span>' : `<button class="qr-btn qr-sm" data-act="goto" data-id="${b.id}">Buka</button>`}</div>`).join("") || "Belum ada cabang.");
+        else if (a.kind === "branches") openModal("Pohon cabang", (d.map((b) => `<div class="qr-branch ${b.active ? "on" : ""}"><input type="checkbox" class="qr-cmp" value="${b.id}" title="Pilih untuk dibandingkan">
+            <span class="qr-badge">${b.depth} pesan</span><span>${esc(b.preview)}</span>${b.head ? '<span class="qr-muted">aktif</span>' : `<button class="qr-btn qr-sm" data-act="goto" data-id="${b.id}">Buka</button>`}</div>`).join("") || "Belum ada cabang.")
+            + (d.length > 1 ? `<button class="qr-btn qr-primary" data-act="compare">${icon("branch")}Bandingkan 2 cabang</button>` : ""));
+        else if (a.kind === "compare") {
+          const col = (msgs, id) => `<div><div class="qr-row"><b>Cabang</b><button class="qr-btn qr-sm" data-act="goto" data-id="${id}">Buka</button></div>${msgs.map((m) =>
+            `<div class="qr-cmp-msg ${m.role}"><span class="qr-muted">${m.role === "user" ? "Kamu" : "Narator"}</span><div class="qr-md">${md(m.content)}</div></div>`).join("")}</div>`;
+          openModal(`Bandingkan cabang (berpisah di pesan ${d.split_at + 1})`, `<div class="qr-cmp-grid">${col(d.a, d.a_id)}${col(d.b, d.b_id)}</div>`);
+        }
+        else if (a.kind === "note") openModal("Catatan sistem giliran ini", d.note ? `<pre class="qr-pre">${esc(d.note)}</pre>` : "Tidak ada catatan untuk giliran ini.");
+        else if (a.kind === "side_logs") openModal("Log tugas sampingan", (d || []).map((r) => `<details class="qr-lore"><summary><span class="qr-badge">${esc(r.kind)}</span>
+            <span class="qr-muted">${new Date(r.created * 1000).toLocaleString("id-ID")}</span></summary><pre class="qr-pre">${esc(JSON.stringify(r.data, null, 1))}</pre></details>`).join("") || "Belum ada.");
+        else if (a.kind === "variations") {
+          state.variations = d;
+          openModal(`Variasi: ${d.label}`, (d.options || []).map((o, i) => `<div class="qr-variation"><pre class="qr-pre">${esc(typeof o === "string" ? o : JSON.stringify(o, null, 1))}</pre>
+            <button class="qr-btn qr-sm qr-primary" data-act="use-variation" data-i="${i}">Pakai ini</button></div>`).join("") || "Model tidak memberi alternatif. Coba lagi.");
+        }
         else if (a.kind === "prompt") openModal("Prompt yang dikirim", `<div class="qr-muted">${fmtN(d.tokens)} token (system ${fmtN(d.system_tokens)}) dari ${fmtN(d.max)} · epoch ${d.epoch} · ${d.history_messages} pesan riwayat</div>
             <div class="qr-muted">kwargs ${esc(JSON.stringify(d.kwargs))} · sampler ${esc(JSON.stringify(d.sampling))}</div>
             <h4>System (beku)</h4><pre class="qr-pre">${esc(d.system)}</pre><h4>Pesan terakhir + blok sementara</h4><pre class="qr-pre">${esc(d.last_user_text)}</pre>`);
@@ -6268,6 +6530,11 @@ def _():
         const a = Object.assign(document.createElement("a"), { href: url, download: ex.name || "export" });
         document.body.appendChild(a); a.click(); a.remove();
         setTimeout(() => URL.revokeObjectURL(url), 5000);
+      };
+      const onNotice = () => {
+        const n = model.get("notice") || {}, box = $(".qr-notice");
+        box.hidden = !n.text;
+        box.innerHTML = n.text ? `${icon("globe")}<span>${esc(n.text)}</span><button class="qr-icon qr-xs" data-act="notice-close" aria-label="Tutup">${icon("x")}</button>` : "";
       };
       const onToast = () => { const t = model.get("toast") || {}; if (t.text) toast(t.text, t.kind || "info", !!t.long); };
       const onCompose = () => { const c = model.get("compose") || {}; if (c.text) { input.value = c.text; grow(); input.focus(); } };
@@ -6293,7 +6560,7 @@ def _():
         "change:server": () => { renderTop(); if (state.tab === "model") renderDrawer(); }, "change:backup": renderBackup,
         "change:library": () => { if (state.tab === "cards" || state.tab === "story") renderDrawer(); renderWizard(); },
         "change:card": onCard, "change:story": () => { renderStudio(); if (state.tab === "story") renderDrawer(); },
-        "change:aux": onAux, "change:export": onExport, "change:compose": onCompose, "change:boot": renderDrawer,
+        "change:aux": onAux, "change:notice": onNotice, "change:export": onExport, "change:compose": onCompose, "change:boot": renderDrawer,
       };
       for (const [ev, fn] of Object.entries(handlers)) model.on(ev, fn);
       const timer = setInterval(renderBackup, 30000);
@@ -6494,6 +6761,22 @@ def _(UI_APP_JS, UI_BASE_JS):
     .qr-event { padding:3px 0; } .qr-event.new { color:var(--text); font-weight:500; }
     .qr-skips { display:flex; flex-wrap:wrap; gap:6px; align-items:center; margin-top:8px; color:var(--muted); }
 
+    .qr-npcs { font-size:12.5px; color:var(--muted); }
+    .qr-npcs summary { cursor:pointer; list-style:none; display:flex; align-items:center; gap:6px; }
+    .qr-npc { display:flex; flex-wrap:wrap; gap:4px 6px; align-items:center; padding:3px 0; color:var(--text); }
+    .qr-notice { max-width:800px; margin:0 auto 6px; display:flex; align-items:flex-start; gap:8px; font-size:13.5px; background:var(--panel);
+      border:1px solid var(--line); border-radius:12px; padding:8px 10px; }
+    .qr-notice span { flex:1; }
+    .qr-cmp-grid { display:grid; grid-template-columns:1fr 1fr; gap:14px; }
+    .qr-cmp-msg { border-top:1px solid var(--line); padding:8px 0; }
+    .qr-cmp-msg.user .qr-md { color:var(--muted); }
+    .qr-cmp-msg .qr-md { font-size:14px; }
+    .qr-variation { border:1px solid var(--line); border-radius:12px; padding:8px 10px; margin-bottom:10px; }
+    .qr-var { margin-bottom:8px; }
+    .qr-var select { flex:1; }
+    .qr-branch input { width:auto; }
+    @media (max-width: 760px) { .qr-cmp-grid { grid-template-columns:1fr; } }
+
     /* composer */
     .qr-composer { padding:8px 20px 16px; }
     .qr-pending, .qr-statusline { max-width:800px; margin:0 auto 6px; display:flex; flex-wrap:wrap; gap:6px; font-size:13px; color:var(--muted); }
@@ -6657,6 +6940,7 @@ def _(
         export = _tl.Dict({}).tag(sync=True)
         compose = _tl.Dict({}).tag(sync=True)
         queue = _tl.Int(0).tag(sync=True)
+        notice = _tl.Dict({}).tag(sync=True)
 
 
     class ChatApp:
@@ -6717,7 +7001,9 @@ def _(
                         c = CARDS.get(cid)
                         if c:
                             cards.append({"id": cid, "type": c["type"], "name": c["name"]})
-                return {"studio": True, "cards": cards}
+                first_char = next((CARDS.get(x["id"]) for x in cards if x["type"] == "character"), None)
+                return {"studio": True, "cards": cards,
+                        "greetings": (first_char or {}).get("data", {}).get("greetings") or [] if first_char else []}
             if not sid:
                 return {}
             s = STORIES.get(sid)
@@ -6783,8 +7069,11 @@ def _(
                 w.queue = int(payload or 0)
             elif kind == "settings" and payload == cur:
                 w.chat = self.chat_info(STORE.chat(cur))
-            elif kind in ("learn", "recall"):
+            elif kind in ("learn", "recall", "variations"):
                 w.aux = {"n": time.time(), "kind": kind, "data": payload}
+            elif kind == "notice":
+                if payload and payload.get("chat_id") == cur:
+                    w.notice = {"n": time.time(), "text": payload["text"]}
             elif kind == "model":
                 w.server = self.server_info()
 
@@ -6798,9 +7087,20 @@ def _(
                     "installed": SERVERS.installed() or bool(CFG.BASE_URL)}
 
         def _ticker(self):
+            last_phase = None
             while True:
                 try:
-                    self.w.server = self.server_info()
+                    info = self.server_info()
+                    if info["phase"] != last_phase and info["phase"] in ("ready", "failed"):
+                        st = SERVERS.status()
+                        backend = st.get("backend") or ""
+                        cmd_file = CFG.LOG_DIR / f"{backend}.cmd"
+                        STORE.side_log("server_log", {"phase": info["phase"], "preset": st.get("preset"), "ctx": st.get("ctx"),
+                                                      "mtp": st.get("mtp"), "warnings": st.get("warnings"),
+                                                      "errors": st.get("errors"), "log": Sys.tail(SERVERS.logf.get(backend, ""), 300) if backend else "",
+                                                      "cmd": cmd_file.read_text() if backend and cmd_file.exists() else ""})
+                    last_phase = info["phase"]
+                    self.w.server = info
                     self.w.backup = {**BACKUP.status, "dirty": BACKUP.dirty()}
                 except Exception:
                     pass
@@ -6942,6 +7242,29 @@ def _(
             self.w.history = self.engine.display(chat_id, self.limit)
             self.w.aux = {"n": time.time(), "kind": "scroll_to", "data": mid}
 
+        def c_variations(self, card_id, field):
+            self.engine.variations(self._cur(), int(card_id), field)
+
+        def c_card_field(self, card_id, field, value):
+            CARDS.set_field(int(card_id), field, value)
+            self.w.card = self.card_info(int(card_id))
+            chat = STORE.chat(self._cur()) if self._cur() else None
+            if chat:
+                self.w.story = self.story_info(chat)
+
+        def c_compare(self, a, b):
+            self.w.aux = {"n": time.time(), "kind": "compare", "data": self.engine.compare(self._cur(), int(a), int(b))}
+
+        def c_notice_clear(self):
+            self.w.notice = {}
+
+        def c_note_view(self, mid):
+            m = STORE.msg(int(mid))
+            self.w.aux = {"n": time.time(), "kind": "note", "data": {"note": (m or {}).get("meta", {}).get("ephemeral", "")}}
+
+        def c_side_logs(self, kind=None):
+            self.w.aux = {"n": time.time(), "kind": "side_logs", "data": STORE.side_logs(self._cur(), kind, 30)}
+
         def c_prompt_view(self):
             self.w.aux = {"n": time.time(), "kind": "prompt", "data": self.engine.prompt_view(self._cur())}
 
@@ -7042,11 +7365,11 @@ def _(
             cid = self.engine.new_chat("studio", "Studio")
             self.select(cid)
 
-        def c_studio_finish(self, title=""):
+        def c_studio_finish(self, title="", greeting=0):
             chat = STORE.chat(self._cur())
             drafts = (chat["settings"].get("studio") or {}).get("drafts") or {}
             ids = {k: v for k, v in drafts.items()}
-            cid = self.engine.start_story(ids, title or None)
+            cid = self.engine.start_story(ids, title or None, int(greeting or 0))
             self.select(cid)
 
         # cards
@@ -7137,6 +7460,20 @@ def _(
 
     CHAT_APP = ChatApp()
     mo.ui.anywidget(CHAT_APP.w)
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    dbg_cmd = mo.ui.text_area(value="nvidia-smi; ls ~/.humming/cache 2>/dev/null | tail -5", label="Shell (debug)", full_width=True)
+    dbg_btn = mo.ui.run_button(label="Jalankan")
+    mo.accordion({"Shell untuk debug": mo.vstack([dbg_cmd, dbg_btn])})
+    return dbg_btn, dbg_cmd
+
+
+@app.cell(hide_code=True)
+def _(Sys, dbg_btn, dbg_cmd, mo):
+    mo.stop(not dbg_btn.value)
+    Sys.run_live(dbg_cmd.value, "Shell")
 
 
 if __name__ == "__main__":

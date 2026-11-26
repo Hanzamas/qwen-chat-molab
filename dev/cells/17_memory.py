@@ -45,7 +45,7 @@ class Embedder:
             if not batch:
                 return
             if not self.ready():
-                time.sleep(10)
+                time.sleep(2)
                 with self.qlock:
                     self.queue = batch + self.queue
                 if not self.servers.state.get("embed"):

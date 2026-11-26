@@ -15,7 +15,7 @@ import fake_server  # noqa: E402
 _SRV = fake_server.start()
 _WORK = tempfile.mkdtemp(prefix="qchat-test-")
 os.environ.update(QCHAT_WORK=_WORK, QCHAT_BASE_URL=f"http://127.0.0.1:{_SRV.server_address[1]}/v1", HF_TOKEN="",
-                  QCHAT_EMBED_URL="http://127.0.0.1:9")
+                  QCHAT_EMBED_URL="http://127.0.0.1:9", QCHAT_IDLE="0")
 
 
 @pytest.fixture(scope="session")

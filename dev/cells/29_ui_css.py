@@ -185,6 +185,22 @@ UI_CSS = r"""
 .qr-event { padding:3px 0; } .qr-event.new { color:var(--text); font-weight:500; }
 .qr-skips { display:flex; flex-wrap:wrap; gap:6px; align-items:center; margin-top:8px; color:var(--muted); }
 
+.qr-npcs { font-size:12.5px; color:var(--muted); }
+.qr-npcs summary { cursor:pointer; list-style:none; display:flex; align-items:center; gap:6px; }
+.qr-npc { display:flex; flex-wrap:wrap; gap:4px 6px; align-items:center; padding:3px 0; color:var(--text); }
+.qr-notice { max-width:800px; margin:0 auto 6px; display:flex; align-items:flex-start; gap:8px; font-size:13.5px; background:var(--panel);
+  border:1px solid var(--line); border-radius:12px; padding:8px 10px; }
+.qr-notice span { flex:1; }
+.qr-cmp-grid { display:grid; grid-template-columns:1fr 1fr; gap:14px; }
+.qr-cmp-msg { border-top:1px solid var(--line); padding:8px 0; }
+.qr-cmp-msg.user .qr-md { color:var(--muted); }
+.qr-cmp-msg .qr-md { font-size:14px; }
+.qr-variation { border:1px solid var(--line); border-radius:12px; padding:8px 10px; margin-bottom:10px; }
+.qr-var { margin-bottom:8px; }
+.qr-var select { flex:1; }
+.qr-branch input { width:auto; }
+@media (max-width: 760px) { .qr-cmp-grid { grid-template-columns:1fr; } }
+
 /* composer */
 .qr-composer { padding:8px 20px 16px; }
 .qr-pending, .qr-statusline { max-width:800px; margin:0 auto 6px; display:flex; flex-wrap:wrap; gap:6px; font-size:13px; color:var(--muted); }

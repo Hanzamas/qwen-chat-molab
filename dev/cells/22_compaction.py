@@ -127,6 +127,9 @@ class Compactor:
                                 max_tokens=8000)
             calls = [v for _, v in sorted(acc["calls"].items())]
             if not calls:
+                self.store.side_log("memory_flush", {"range": [a, b], "answer": acc["content"],
+                                                     "transcript": [m for m in msgs if m["role"] in ("assistant", "tool")]},
+                                    chat_id, head)
                 return
             msgs.append({"role": "assistant", "content": acc["content"],
                          "tool_calls": [{"id": cl["id"] or f"f{i}", "type": "function",

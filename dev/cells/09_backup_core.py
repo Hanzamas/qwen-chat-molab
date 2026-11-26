@@ -26,6 +26,8 @@ class Backup:
                 self.status["last_error"] = f"Token tidak bisa dipakai: {type(e).__name__}"
                 self.status["enabled"] = False
         self.status["repo"] = self.repo
+        if self.status["enabled"]:
+            self.store.meta_set("backup", {"repo": self.repo, "interval": self.interval})
         if self.status["enabled"] and (self.thread is None or not self.thread.is_alive()):
             self.thread = threading.Thread(target=self._loop, daemon=True)
             self.thread.start()

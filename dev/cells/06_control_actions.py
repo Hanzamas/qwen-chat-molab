@@ -14,6 +14,8 @@ def _act():
             SERVERS.start(ctl_preset.value, ctl_ctx.value, mtp=ctl_mtp.value, embed=ctl_embed.value)
         except Exception as e:
             return mo.callout(mo.md(f"Start gagal: {e}"), kind="danger")
+        STORE.meta_set("server", {"preset": ctl_preset.value, "ctx": ctl_ctx.value, "mtp": ctl_mtp.value,
+                                  "embed": ctl_embed.value})
         note = ""
         if ctl_ctx.value > p["max_ctx"] and p.get("yarn_exp"):
             note = ("\n\n**YaRN eksperimental:** model ini tidak punya resep YaRN resmi. Cek `n_ctx` di log dan uji "

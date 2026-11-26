@@ -31,6 +31,7 @@ class EngineView:
                 items.append({"kind": "user", "id": m["id"], "n": n, "content": m["meta"].get("typed", m["content"]),
                               "ooc": bool(m["ooc"]), "pinned": bool(m["pinned"]), "time_skip": m["meta"].get("time_skip"),
                               "attachments": (a["names"].split("|") if a else []), "notes": m["meta"].get("notes") or [],
+                              "has_note": bool(m["meta"].get("ephemeral")),
                               "swipe": [sib.index(m["id"]) + 1 if m["id"] in sib else 1, max(1, len(sib))]})
             else:
                 if cur is None:
