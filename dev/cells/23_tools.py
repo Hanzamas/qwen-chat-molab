@@ -270,7 +270,8 @@ class ToolBox:
         return {"ok": True, "minutes": int(minutes)}
 
     def t_status_update(self, chat_id, mid, subject, changes, reason=""):
-        done = self.world.status_update(chat_id, mid, subject or "player", changes, reason)
+        subject = self._holder(chat_id, subject) or "player"  # "Lotte", "pemain", the persona's name: one key each
+        done = self.world.status_update(chat_id, mid, subject, changes, reason)
         return {"updated": done}
 
     DIFFICULTY = {"mudah": 0.2, "sedang": 0.0, "sulit": -0.2, "sangat sulit": -0.35}
@@ -331,7 +332,7 @@ class ToolBox:
         return min(max(p, 0.03), 0.97), why
 
     def t_roll(self, chat_id, mid, event, odds=None, skill="", difficulty="sedang", who="player"):
-        p, why = self.roll_odds(chat_id, who, skill, difficulty, odds)
+        p, why = self.roll_odds(chat_id, self._holder(chat_id, who) or "player", skill, difficulty, odds)
         r = self.world.roll(chat_id, mid, event, p)
         verdict = "BERHASIL" if r["success"] else "GAGAL"
         return {**r, "why": why, "result": f"{verdict} (peluang {r['odds']:.0%}: {', '.join(why)}). Hasil ini wajib diikuti."}
@@ -347,10 +348,18 @@ class ToolBox:
         persona = cards.get("persona") if cards else None
         if persona and n.lower() == persona["name"].lower():
             return "player"
-        for ch in (cards or {}).get("character", []):
+        chars = (cards or {}).get("character", [])
+        for ch in chars:
             if n.lower() in [ch["name"].lower()] + [str(a).lower() for a in ch["data"].get("aliases") or []]:
                 return ch["name"]
-        return n
+        # a first name alone, when exactly one card (or the persona) has it
+        first = n.lower().split()[0]
+        hits = [ch["name"] for ch in chars if ch["name"].lower().split()[0] == first]
+        if persona and persona["name"].lower().split()[0] == first:
+            hits.append("player")
+        if len(hits) == 1 and len(n.split()) == 1:
+            return hits[0]
+        return n  # someone without a card: kept as written
 
     def _holders(self, chat_id, names):
         names = names if isinstance(names, list) else [x for x in re.split(r"[,;]", str(names or ""))]
@@ -358,8 +367,8 @@ class ToolBox:
 
     def t_world_event(self, chat_id, mid, text, known_to=None, public=False):
         st = self.world.state(chat_id, self.store.path_ids(chat_id))
-        eid = self.world.add_world_event(chat_id, mid, st["time"], text, known_to or [], public)
         holders = self._holders(chat_id, known_to or [])
+        eid = self.world.add_world_event(chat_id, mid, st["time"], text, holders, public)
         if holders:
             KNOW.add(chat_id, mid, holders, text, source="lihat sendiri", world_time=st["time_text"])
         return {"saved": eid}

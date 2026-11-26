@@ -22,6 +22,7 @@ class ChatWidget(_aw.AnyWidget):
     story = _tl.Dict({}).tag(sync=True)
     aux = _tl.Dict({}).tag(sync=True)
     command = _tl.Dict({}).tag(sync=True)
+    ack = _tl.Dict({}).tag(sync=True)  # {sid, seq}: the last command of that page that ran
     export = _tl.Dict({}).tag(sync=True)
     compose = _tl.Dict({}).tag(sync=True)
     queue = _tl.Int(0).tag(sync=True)
@@ -82,9 +83,9 @@ class ChatApp:
         last = getattr(self, "_last_live", {}) or {}
         self.w.live = last if last.get("active") and last.get("chat_id") == chat_id else {}
         self.w.chat = self.chat_info(chat)
+        self.w.story = self.story_info(chat)  # before the history: speaker avatars come from the story's cards
         self.w.history = self.engine.display(chat_id, self.limit)
         self.w.panels = self.engine.panels(chat_id)
-        self.w.story = self.story_info(chat)
         self.w.ctx = {"used": self.engine.last_used.get(chat_id, 0), "max": LLM_CLIENT.max_context() if SERVERS.ready() else 0}
 
     def chat_info(self, chat):
@@ -235,6 +236,7 @@ class ChatApp:
         return {"phase": "ready" if SERVERS.ready() else st["phase"],
                 "preset": st.get("preset") or ("Server eksternal" if CFG.BASE_URL else None), "ctx": st.get("ctx"),
                 "mtp": st.get("mtp"), "embed": st.get("embed"), "embed_ready": st.get("embed_ready"),
+                "embed_model": SERVERS.state.get("embed_model") or "0.6B",
                 "warnings": st.get("warnings") or [], "error": st.get("error") or "", "gpu": gpu,
                 "installed": SERVERS.installed() or bool(CFG.BASE_URL)}
 
@@ -273,9 +275,23 @@ class ChatApp:
     # ---------- commands in ----------
 
     def on_command(self, change):
+        """A message repeats every command the page has not seen acknowledged (marimo can merge queued updates and
+        deliver only the last): run the new ones, skip those already run, then acknowledge."""
         cmd = dict(change["new"] or {})
-        for one in cmd.get("batch") or [cmd]:
-            self._run_command(dict(one))
+        sid = cmd.get("sid")
+        seen = self.__dict__.setdefault("_seen", {})
+        try:
+            for one in cmd.get("batch") or [cmd]:
+                one = dict(one)
+                s = one.pop("_seq", None)
+                if sid and s is not None:
+                    if s <= seen.get(sid, 0):
+                        continue
+                    seen[sid] = s  # before it runs: a command that fails is not run again
+                self._run_command(one)
+        finally:
+            if sid:
+                self.w.ack = {"sid": sid, "seq": seen.get(sid, 0), "n": time.time()}
 
     def _run_command(self, cmd):
         action = cmd.pop("action", "")
@@ -318,6 +334,10 @@ class ChatApp:
                 if not self.engine.busy:
                     break
                 time.sleep(0.05)
+        if not self.engine.forget_chat(int(chat_id)):
+            self.w.toast = {"n": time.time(), "text": "Tugas latar belakang masih berjalan; coba hapus lagi sebentar lagi.",
+                            "kind": "warn"}
+            return
         STORE.delete_chat(int(chat_id))
         self.refresh_chats()
         if int(chat_id) == self._cur():
@@ -491,11 +511,18 @@ class ChatApp:
     def c_recall_test(self):
         self.engine.recall_test(self._cur())
 
+    def _toast(self, text, kind="info"):
+        self.w.toast = {"n": time.time(), "text": text, "kind": kind}
+
     def c_continuity(self, mid):
-        self.engine.run(self.engine._continuity_check, self._cur(), int(mid), True)
+        if (STORE.chat(self._cur()) or {}).get("kind") not in ("rp", "group"):
+            return self._toast("Cek kontinuitas hanya untuk chat cerita.", "warn")
+        if self.engine.run(self.engine._continuity_check, self._cur(), int(mid), True):
+            self._toast("Cek kontinuitas…")
 
     def c_fact_check(self, mid):
-        self.engine.run(self.engine._fact_check, self._cur(), int(mid), True)
+        if self.engine.run(self.engine._fact_check, self._cur(), int(mid), True):
+            self._toast("Memeriksa fakta…")
 
     # memory
     def c_memory(self, q=""):
@@ -503,7 +530,13 @@ class ChatApp:
         ctx = MEM.ctx_of(cid) if cid else {"chat_id": None, "story_id": None, "card_ids": []}
         rows = MEM.search(q, ctx, limit=50, kinds=("fact", "summary_core")) if q.strip() else STORE.q(
             "SELECT * FROM memories ORDER BY id DESC LIMIT 100")
-        rows = [{**r, "other_branch": not MEM._visible(r, ctx)} for r in rows]
+        def where(r):
+            if r.get("scope") not in MEM.BRANCHED or "visible" not in ctx:
+                return ""
+            if r.get("message_id") and r["message_id"] not in ctx["visible"]:
+                return "other"
+            return "" if MEM._visible(r, ctx) else "forgotten"
+        rows = [{**r, "other_branch": where(r) == "other", "forgotten_here": where(r) == "forgotten"} for r in rows]
         self.w.aux = {"n": time.time(), "kind": "memory", "data": {"q": q, "rows": rows, "log": MEM.log(limit=40)}}
 
     def c_memory_undo(self, log_id):
@@ -524,7 +557,7 @@ class ChatApp:
         names += [h for h in KNOW.holders(cid) if h not in names]
         holder = holder or names[0]
         self.w.aux = {"n": time.time(), "kind": "knowledge", "data": {
-            "holder": holder, "holders": names, "rows": KNOW.of(cid, holder),
+            "chat_id": cid, "holder": holder, "holders": names, "rows": KNOW.of(cid, holder),
             "persona": ((cards or {}).get("persona") or {}).get("name", "")}}
 
     def c_knowledge_add(self, holder, text, kind="fakta", truth="benar"):
@@ -548,10 +581,14 @@ class ChatApp:
     def c_proposals_make(self):
         cid = self._cur()
 
+        if (STORE.chat(cid) or {}).get("kind") not in ("rp", "group"):
+            return self._toast("Usulan kartu hanya untuk chat cerita.", "warn")
+
         def job():
             self.engine.propose_cards(cid)
             self.c_proposals()
-        self.engine.run(job)
+        if self.engine.run(job):
+            self._toast("Menyusun usulan…")
 
     def c_proposal(self, pid, accept):
         self.engine.decide_proposal(self._cur(), int(pid), bool(accept))
@@ -567,7 +604,7 @@ class ChatApp:
             return
         st = WORLD.state(cid, STORE.path_ids(cid))
         rows = THREADS.list(cid, now=st["time"], include_closed=True)
-        self.w.aux = {"n": time.time(), "kind": "threads", "data": {"rows": rows, "kinds": list(Threads.KINDS)}}
+        self.w.aux = {"n": time.time(), "kind": "threads", "data": {"chat_id": cid, "rows": rows, "kinds": list(Threads.KINDS)}}
 
     def c_thread_add(self, kind, title, due="", who=""):
         cid = self._cur()

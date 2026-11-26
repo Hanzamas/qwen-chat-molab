@@ -600,6 +600,38 @@ dengan membaca kodenya.
 **Urutan kerja:** cabang untuk memory/buku cerita → ingatan per tokoh + kehadiran dari lokasi → pemeriksa keadaan
 → panel → cek kontinuitas → benang cerita → dadu berbasis skill → sisanya.
 
+### Review kedua — perbaikan celah (selesai, belum dites di GPU)
+
+Lima pemeriksa (data, engine, konkurensi, UI, kualitas RP). Yang berupa bug diperbaiki; yang berupa fitur baru
+dicatat di bawah sebagai usulan.
+
+- [x] Data: id pesan/chat tidak pernah dipakai ulang; hapus pesan/chat ikut membersihkan pengetahuan tokoh, benang,
+      hubungan, perubahan buku cerita, memory, dan vektornya; "lanjut di chat baru" menyalin keadaan sehingga tidak
+      bergantung pada chat lama; catatan "menunggu epoch" dan lupa/ubah memory mengikuti cabang; edit manual di UI
+      berlaku untuk seluruh chat (tidak hilang saat reroll); Lanjutkan pada balasan lama ikut membawa efek gilirannya.
+- [x] Engine: pesan OOC tidak lagi diperlakukan sebagai giliran cerita; group satu-tokoh memberi instruksi pembicara
+      di setiap putaran, 1-3 paragraf, dan pemeriksaan per bagian tokoh; tulis ulang mode ketat berhenti setelah
+      menulis ulang dan memakai hasil dadu yang sama; satu penerjemah nama untuk semua tool ("Lotte", "pemain", nama
+      persona); lokasi awal skenario masuk ke status; benang yang sama tidak dibuka dua kali; kehadiran menurut tempat
+      (bukan potongan kata); tugas sampingan memakai setelan thinking yang sama dengan chat (prefix sama, cache kena);
+      compaction menyisakan ±25% konteks sebagai giliran utuh dan epoch baru tetap dibuat kalau gagal di tengah.
+- [x] Konkurensi: loop diam tidak bisa kehilangan sinyal batal atau berjalan saat Load; hapus chat menunggu tugas
+      latar; compaction diam tanpa kemajuan menunggu 10 menit; waktu AFK tidak dimajukan dua kali.
+- [x] UI: perintah tidak hilang saat kernel sibuk (nomor urut + ack); dialog berisi tautan tidak bisa menyuntik
+      atribut; pilihan embedder menampilkan yang berjalan dan minta konfirmasi sebelum ganti; tab Cerita ikut cabang
+      aktif; teks yang sedang diketik tidak tertimpa; avatar per kartu; tombol Mode GM selalu ada; daftar bab urut.
+- [x] Kualitas RP: aturan yang bertentangan dirapikan (Persona boleh mengizinkan, tokoh tahu isi kartunya sendiri,
+      penanda rahasia, cara roll); target panjang kalah dari titik berhenti; pilihan ditulis sebagai "Aku …" dan hanya
+      di balasan terakhir; frasa berulang dihindari bergulir (kecuali contoh ucapan kartu); Studio melihat semua field.
+
+**Usulan fitur (belum dikerjakan, menunggu keputusanmu):**
+- Cek pembuka berulang: lima kata pertama balasan dibandingkan dengan empat balasan sebelumnya.
+- Aturan Gaya tambahan (kamu ketik sendiri kalau mau): jangan mengulang aksi pemain di awal; jangan menutup dengan
+  pertanyaan narator; variasikan pembuka; terjemahan dialog bahasa sehari-hari.
+- Default panjang 4-7 × 4-7 kalimat dan AFK mati secara default (sekarang 5-10 × 5-10 dan AFK skala 1).
+- Thinking live tertutup di chat RP (menghindari spoiler) dan chip tool dilipat jadi satu.
+- Hapus ingatan tokoh per cabang dengan undo; isi form tetap saat laci digambar ulang.
+
 ---
 
 ## 9. Tes

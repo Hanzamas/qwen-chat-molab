@@ -72,7 +72,7 @@ const readB64 = (f) => new Promise((ok, fail) => {
 
 // Markdown subset, escape-first: nothing from the model is ever inserted as raw HTML.
 function inline(s, learn) {
-  let t = esc(s);
+  let t = esc(String(s ?? "").replace(/\u0000/g, ""));
   // Code spans and links become placeholders first, so the emphasis and dialogue rules below never touch an href
   // or code (a quote inside a URL used to break the link).
   const kept = [];
@@ -84,8 +84,17 @@ function inline(s, learn) {
   t = t.replace(/(^|[\s(])_([^_\n]+)_(?=[\s).,!?;:]|$)/g, "$1<em>$2</em>");
   // dialogue: quoted speech, then a translation in parentheses right after it
   t = t.replace(/(&quot;|“|„|«)([^\n]{1,600}?)(&quot;|”|“|»)(\s*)\(([^()\n]{1,400})\)/g,
-    (m, a, q, b, sp, tr) => `<span class="qq" data-q="${q.replace(/"/g, "&quot;")}">${a}${q}${b}</span>${sp}<span class="qtr">(${tr})</span>`);
-  return t.replace(/\u0000(\d+)\u0000/g, (m, n) => kept[Number(n)]);
+    (m, a, q, b, sp, tr) => `<span class="qq" data-q="${plain(q)}">${a}${q}${b}</span>${sp}<span class="qtr">(${tr})</span>`);
+  return restore(t);
+  // a kept link can hold a kept code span: restore until none is left
+  function restore(x) {
+    for (let i = 0; i < 4 && /\u0000\d+\u0000/.test(x); i++) x = x.replace(/\u0000(\d+)\u0000/g, (m, n) => kept[Number(n)] ?? "");
+    return x;
+  }
+  // the attribute gets text only: tags dropped, quotes escaped (an href inside it used to end the attribute)
+  function plain(x) {
+    return restore(x).replace(/<[^>]*>/g, "").replace(/"/g, "&quot;");
+  }
 }
 function md(src, learn) {
   const text = String(src || "").replace(/\r\n/g, "\n");
@@ -137,7 +146,7 @@ function md(src, learn) {
     i++;
   }
   flush();
-  return DOMPurify.sanitize(out.join(""), { ADD_ATTR: ["target"] });
+  return DOMPurify.sanitize(out.join(""), { ADD_ATTR: ["target"], FORBID_ATTR: ["style"] });
 }
 
 // Scroll that only follows new content while the user has not scrolled away.

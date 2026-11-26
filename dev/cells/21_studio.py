@@ -30,7 +30,7 @@ def STUDIO_EPHEMERAL(c):
                 continue
             filled = {k for k, v in card["data"].items() if v not in (None, "", [], {})}
             empty = [f["key"] for f in sch["fields"] if f["key"] not in filled]
-            lines.append(f"[kartu #{cid}, jenis {type_}]\n{CARDS.render(card, mode='all', limit=4000)}\n"
+            lines.append(f"[kartu #{cid}, jenis {type_}]\n{CARDS.render(card, mode='all', limit=6000, include_ui=True)}\n"
                          f"Field kosong: {', '.join(empty) or '-'}")
             if card["type"] == "world":
                 lore = CARDS.lore(cid)
@@ -40,6 +40,7 @@ def STUDIO_EPHEMERAL(c):
                 if tl:
                     lines.append("Garis waktu: " + "; ".join(f"{e['at']} {e['title']}" for e in tl[:40]))
     schemas = {t: [f"{f['key']} ({f['type']}{', kolom ' + '/'.join(f['columns']) if f.get('columns') else ''})"
+                   + (f" [{f['help'][:140]}]" if f.get("help") else "")
                    for f in CARDS.schema(t)["fields"]] for t in Cards.TYPE_ORDER}
     lines.append("Field per jenis kartu:\n" + "\n".join(f"- {t}: {', '.join(fs)}" for t, fs in schemas.items()))
     head = "Kartu di Studio ini:" if drafts else "Kartu di Studio ini: belum ada, buat dengan card_draft_update."

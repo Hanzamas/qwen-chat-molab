@@ -167,3 +167,86 @@ def test_embedder_failed_batch_is_not_stuck(nb):
         assert ("mem", 123457) in EMB.queue
         EMB.queue.remove(("mem", 123457))
         EMB.pending.pop(("mem", 123457))
+
+
+# ---------- engine and RP consistency ----------
+
+def test_ooc_answer_stays_out_of_the_story(engine, nb, fake):
+    chat, _ = _story(nb, engine)
+    S = nb["STORE"]
+    fake["script"].append({"content": "Itu cuma soal teknis, bukan bagian cerita."})
+    n0 = len(fake["log"])
+    engine.send(chat, "((OOC: kenapa tadi jawabannya pendek?))")
+    wait_idle(engine)
+    bot = S.msg(S.chat(chat)["head_id"])
+    assert bot["role"] == "assistant" and bot["ooc"]
+    sent = fake["log"][n0]["messages"][-1]["content"]
+    text = sent if isinstance(sent, str) else json.dumps(sent)
+    assert "OOC" in text and "Panjang giliran ini" not in text
+    assert len(fake["log"]) == n0 + 1  # no length fill, choices or checks after it
+
+
+def test_names_resolve_to_one_status_key(engine, nb):
+    chat, _ = _story(nb, engine)
+    S, T, W = nb["STORE"], nb["TOOLS"], nb["WORLD"]
+    head = _turn(engine, nb, chat)
+    T.call(chat, head, "status_update", json.dumps({"subject": "Lotte", "changes": {"mood": "kesal"}}))
+    T.call(chat, head, "status_update", json.dumps({"subject": "Raka", "changes": {"location": "Dapur"}}))
+    st = W.state(chat, S.path_ids(chat))["status"]
+    assert st["Lotte Braun"]["mood"] == "kesal" and "Lotte" not in st
+    assert st["player"]["location"] == "Dapur" and "Raka" not in st
+
+
+def test_scenario_start_location_is_the_players_place(engine, nb):
+    chat, _ = _story(nb, engine)
+    S, W = nb["STORE"], nb["WORLD"]
+    assert W.state(chat, S.path_ids(chat))["status"]["player"]["location"] == "Ruang tengah"
+
+
+def test_same_thread_is_not_opened_twice(engine, nb):
+    chat, _ = _story(nb, engine)
+    TH = nb["THREADS"]
+    a = TH.open(chat, None, "janji", "Mengantar Lotte ke stasiun besok")
+    b = TH.open(chat, None, "janji", "Mengantar Lotte ke stasiun besok pagi")
+    assert a == b and len(TH.list(chat)) == 1
+
+
+def test_presence_by_place_prefix_not_substring(engine, nb):
+    chat, _ = _story(nb, engine)
+    P = nb["PROMPT"]
+    c = P.ctx(chat)
+    status = {"player": {"location": "WG, dapur"}, "Lotte Braun": {"location": "WG"}}
+    assert [ch["name"] for ch in P.present_characters(c, "", status)] == ["Lotte Braun"]
+    status = {"player": {"location": "Universitas"}, "Lotte Braun": {"location": "Uni"}}
+    assert P.present_characters(c, "", status) == []
+    assert [ch["name"] for ch in P.present_characters(c, "Lotte melambai dari jauh.", status)] == ["Lotte Braun"]
+
+
+def test_pending_keeps_the_newest_change_per_section(engine, nb):
+    chat, _ = _story(nb, engine)
+    S, ST = nb["STORE"], nb["STORIES"]
+    sid = S.chat(chat)["story_id"]
+    ST.canon_set(sid, "Cuaca", "Hujan", chat, chat_wide=True)
+    ST.canon_set(sid, "Cuaca", "Cerah", chat, chat_wide=True)
+    texts = [p["text"] for p in ST.pending_list(sid, chat)]
+    assert any("Cerah" in t for t in texts) and not any("Hujan" in t for t in texts)
+
+
+def test_saving_a_card_without_a_name_keeps_it(nb):
+    C = nb["CARDS"]
+    gid = C.save(None, "gm", {"format": "prosa"}, name="GM saya")
+    C.save(gid, "gm", {"format": "game"})
+    assert C.get(gid)["name"] == "GM saya"
+
+
+def test_commands_repeated_after_a_merge_run_once(nb):
+    from types import SimpleNamespace
+    ran = []
+    obj = SimpleNamespace(w=SimpleNamespace(ack={}), _run_command=lambda cmd: ran.append(cmd["action"]))
+    on_command = nb["ChatApp"].on_command
+    on_command(obj, {"new": {"sid": "p1", "batch": [{"action": "a", "_seq": 1}]}})
+    # marimo merged two flushes: the later one repeats the unacknowledged first command
+    on_command(obj, {"new": {"sid": "p1", "batch": [{"action": "a", "_seq": 1}, {"action": "b", "_seq": 2}]}})
+    assert ran == ["a", "b"] and obj.w.ack["seq"] == 2
+    on_command(obj, {"new": {"sid": "p2", "batch": [{"action": "c", "_seq": 1}]}})  # a reloaded page starts again at 1
+    assert ran == ["a", "b", "c"]

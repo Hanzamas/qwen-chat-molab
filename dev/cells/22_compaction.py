@@ -33,6 +33,7 @@ class Compactor:
     COMPACT_AT = 0.90
     TARGET = 0.60
     KEEP_USER_TURNS = 3
+    KEEP_TAIL = 0.25  # share of the context window kept as verbatim recent turns
     CHUNK_TOKENS = 100_000
     CHRONICLE_SHARE = 0.25
 
@@ -106,7 +107,15 @@ class Compactor:
         users_after = [u for u in users if u > done_pos]
         if len(users_after) <= self.KEEP_USER_TURNS:
             return used
-        cutoff = users_after[-self.KEEP_USER_TURNS] - 1
+        # Verbatim tail: at least KEEP_USER_TURNS turns and about KEEP_TAIL of the window, so voices, language and
+        # rhythm carry over (only older turns become summaries). Never so much that nothing can be summarized.
+        size = lambda i: self.llm.estimate([{"content": path[i]["content"], "reasoning_content": ""}])
+        k = self.KEEP_USER_TURNS
+        tail = sum(size(i) for i in range(users_after[-k], len(path)))
+        while k + 1 < len(users_after) and tail < self.KEEP_TAIL * maxc:
+            k += 1
+            tail += sum(size(i) for i in range(users_after[-k], users_after[-k + 1]))
+        cutoff = users_after[-k] - 1
         if cutoff <= done_pos:
             return used
         label = f"Menyimpan memory sebelum memadatkan pesan {done_pos + 2}–{cutoff + 1}…"
@@ -118,6 +127,18 @@ class Compactor:
         think = 12000 if self.prompt.kwargs(self.prompt.ctx(chat_id)).get("enable_thinking", True) else 0
         done_any = False
         chapters = [r["message_id"] for r in self.store.q("SELECT message_id FROM chapters WHERE chat_id = ?", (chat_id,))]
+        try:
+            done_any = self._summarize_chunks(chat_id, path, ids, chat, done_pos, cutoff, chapters, budget, think, tools, phase)
+            if not self.cancel.is_set():
+                self.condense(chat_id, ids, maxc, tools, phase)
+        finally:
+            if done_any or getattr(self, "_partial", False):
+                self.prompt.new_epoch(chat_id)  # summaries written before a failure go into the prompt too
+            self._partial = False
+        return self.measure(chat_id, tools)
+
+    def _summarize_chunks(self, chat_id, path, ids, chat, done_pos, cutoff, chapters, budget, think, tools, phase):
+        done_any = False
         for a, b in self.chunks(path, done_pos + 1, cutoff, chapters):
             if self.cancel.is_set():
                 break
@@ -138,11 +159,8 @@ class Compactor:
                 self.mem.save(f"[Inti {chat['title']}, pesan {a + 1}–{b + 1}] {core}",
                               "story" if mctx.get("story_id") else "chat", mctx, kind="summary_core", message_id=ids[b])
             done_any = True
-        if not self.cancel.is_set():
-            self.condense(chat_id, ids, maxc, tools, phase)
-        if done_any:
-            self.prompt.new_epoch(chat_id)
-        return self.measure(chat_id, tools)
+            self._partial = True
+        return done_any
 
     def chunks(self, path, start, end, chapters=()):
         """Split path[start..end] into ~CHUNK_TOKENS pieces that end right before a user message. A chapter mark on the
@@ -154,7 +172,10 @@ class Compactor:
             nxt = path[i + 1] if i + 1 < len(path) else None
             if nxt is None or nxt["role"] != "user" or i >= end:
                 continue
-            turn = [path[j]["id"] for j in range(i + 1, min(len(path), i + 4)) if j == i + 1 or path[j]["role"] != "user"]
+            turn, j = [path[i + 1]["id"]], i + 2  # the whole next turn: its user message and every reply before the next one
+            while j < len(path) and path[j]["role"] != "user":
+                turn.append(path[j]["id"])
+                j += 1
             new_chapter = any(t in chapters for t in turn)
             if size >= self.CHUNK_TOKENS or (new_chapter and size >= self.CHUNK_TOKENS / 3):
                 out.append((a, i))
@@ -206,9 +227,7 @@ class Compactor:
         max_tokens = max(2048, min(want, maxc - used - 1024)) if maxc else want
         # Long thinking can eat the whole budget and leave no summary: think less here, and if the answer is
         # still empty, write it again with thinking off.
-        kw = dict(self.prompt.kwargs(c))
-        if kw.get("reasoning_effort") in ("high", "xhigh") and "low" in c["preset"]["thinking"]:
-            kw["reasoning_effort"] = "low"
+        kw = self.prompt.side_kwargs(c)
         text, acc = "", None
         for attempt in range(2):
             acc = self.llm.complete(msgs, kwargs=kw, sampling={"temperature": 0.6, "top_p": 0.95},
@@ -218,8 +237,7 @@ class Compactor:
             text = (acc["content"] or "").strip()
             if text:
                 break
-            kw = {k: v for k, v in kw.items() if k != "reasoning_effort"}
-            kw["enable_thinking"] = False
+            kw = self.prompt.side_kwargs(c, retry=True)
         if not text:
             self.last_error = (f"jawaban kosong (finish={acc['finish']}, thinking {len(acc['reasoning'])} karakter, "
                                f"max_tokens {max_tokens}, prompt ≈{used} token)")
@@ -263,9 +281,7 @@ class Compactor:
         limit = min(32768, maxc // 16)
         if self.llm.estimate(msgs) + limit + 12000 > maxc - 1024:
             msgs = self.prompt.side(chat_id, instr, path=[])  # the summaries alone, without the chat history
-        kw = {k: v for k, v in self.prompt.kwargs(c).items() if k != "reasoning_effort"}
-        if "low" in c["preset"]["thinking"]:
-            kw["reasoning_effort"] = "low"
+        kw = self.prompt.side_kwargs(c)
         acc = self.llm.complete(msgs, kwargs=kw, sampling={"temperature": 0.6},
                                 max_tokens=max(2048, min(limit + 12000, maxc - self.llm.estimate(msgs) - 1024)),
                                 tools=tools, stop=self.cancel, on_delta=self.progress(phase, label, limit))

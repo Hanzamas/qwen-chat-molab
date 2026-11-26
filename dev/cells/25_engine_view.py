@@ -82,8 +82,8 @@ class EngineView:
                               "range": [pos.get(s["from_id"], 0) + 1, n]})
                 cur = None
         limit = limit or self.DISPLAY_LIMIT
-        return {"items": items[-limit:], "total": len(items), "chapters": [
-            {"id": mid, "title": t, "n": pos[mid] + 1} for mid, t in chapters.items() if mid in pos]}
+        return {"items": items[-limit:], "total": len(items), "chapters": sorted(
+            ({"id": mid, "title": t, "n": pos[mid] + 1} for mid, t in chapters.items() if mid in pos), key=lambda x: x["n"])}
 
     def panels(self, chat_id):
         """Status and world panels for the game format, computed from the database."""

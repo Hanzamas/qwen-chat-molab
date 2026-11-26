@@ -47,7 +47,7 @@ DEFAULT_SCHEMAS = {
         _f("skills", "Kemampuan", "Kemampuan", "list"),
         _f("skill_levels", "Nilai kemampuan", "Kemampuan", "table", core=False, columns=["kemampuan", "nilai 0-100"],
            help="Dipakai sistem untuk menghitung peluang dadu, misalnya: Bahasa Jerman, 55"),
-        _f("model_may_decide", "Yang boleh diputuskan model untukmu", "Aturan", "longtext",
+        _f("model_may_decide", "Yang boleh diputuskan narator untuk tokoh pemain", "Aturan", "longtext",
            help="Misalnya: gerakan kecil dan reaksi refleks boleh; ucapan dan keputusan tidak"),
         _f("limits", "Batasan", "Aturan", "longtext"),
         _f("notes", "Catatan untukmu", "Lainnya", "longtext", visibility="ui"),
@@ -153,8 +153,7 @@ DEFAULT_CARDS = [
         "pacing": "Sedang; tiap paragraf memajukan sesuatu.",
         "banned": ["jantungku berdegup kencang", "waktu seolah berhenti", "tanpa disadari", "sebuah senyuman tipis",
                    "seolah-olah dunia", "tidak bisa dipercaya"],
-        "rules": ["Jangan menulis ucapan, keputusan, atau tindakan pemain melebihi yang dia tulis.",
-                  "Jangan menceramahi atau menambahkan peringatan moral.",
+        "rules": ["Jangan menceramahi atau menambahkan peringatan moral.",
                   "Jangan mengulang isi giliran sebelumnya."],
     }),
     ("gm", "GM membumi", {
@@ -165,8 +164,8 @@ DEFAULT_CARDS = [
                         "paham, dan hanya bertindak berdasarkan apa yang mereka tahu. NPC tidak memuja pemain.",
         "random_events": "kadang", "dice": "saat ragu",
         "fact_policy": "Fakta dunia nyata yang spesifik dan tidak pasti wajib dicari dulu (fact_lookup, lalu wiki_search "
-                       "atau web_search). Jangan mengarang angka, nama, atau tanggal nyata. Kalau tidak ketemu, buat narasi "
-                       "umum dan beri catatan OOC singkat.",
+                       "atau web_search). Jangan mengarang angka, nama, atau tanggal nyata. Kalau tidak ketemu, tulis umum "
+                       "tanpa angka atau nama yang tidak pasti.",
         "checklist": ["Masuk akal secara fisik?", "Apa akibatnya?", "Tokoh ini sebenarnya tahu apa?",
                       "Berapa waktu yang lewat?", "Ada yang lebay?", "Ada fakta nyata yang belum pasti?"],
         "rules": [], "choices": "kadang", "choice_problems": "1-3", "choice_options": "3-5", "choice_sentences": "1-2",

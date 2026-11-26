@@ -90,19 +90,32 @@ function render({ model, el }) {
   const ro1 = new ResizeObserver(() => fol.stick());
   ro1.observe($(".qr-col"));
 
-  // One message per tick with every command queued in it: the command traitlet is synced as a value, so two sets
-  // in a row would only deliver the last.
-  let outbox = [], flushTimer = 0;
+  // Commands carry a sequence number and stay in the outbox until Python acknowledges them. The command traitlet is
+  // synced as a value and marimo merges updates that queue up while the kernel is busy (only the last arrives), so
+  // every message repeats all unacknowledged commands; Python skips the ones it already ran.
+  const sid = Math.random().toString(36).slice(2) + Date.now().toString(36);
+  let unacked = [], seq = 0, flushTimer = 0;
+  const flush = () => {
+    flushTimer = 0;
+    if (!unacked.length) return;
+    model.set("command", { n: Date.now() + Math.random(), sid, batch: unacked.slice() });
+    model.save_changes();
+  };
   const send = (action, extra = {}) => {
-    outbox.push({ action, ...extra });
-    if (flushTimer) return;
-    flushTimer = setTimeout(() => {
-      flushTimer = 0;
-      const batch = outbox;
-      outbox = [];
-      model.set("command", { n: Date.now() + Math.random(), batch });
-      model.save_changes();
-    }, 0);
+    unacked.push({ action, ...extra, _seq: ++seq });
+    if (!flushTimer) flushTimer = setTimeout(flush, 0);
+  };
+  model.on("change:ack", () => {
+    const a = model.get("ack") || {};
+    if (a.sid === sid) unacked = unacked.filter((c) => c._seq > a.seq);
+  });
+  // A section of the drawer is not redrawn while someone types in it or has unsaved text in it (an open <select>
+  // counts too): the redraw would put the old text back.
+  const editing = (box) => {
+    if (!box) return false;
+    const f = rootActive();
+    if (f && box.contains(f) && /^(INPUT|TEXTAREA|SELECT)$/.test(f.tagName)) return true;
+    return [...box.querySelectorAll("input:not([type]), input[type=text], textarea")].some((i) => i.value !== i.defaultValue);
   };
   const get = (k) => model.get(k) || {};
   const toast = (text, kind = "info", long = false) => {
@@ -193,7 +206,7 @@ function render({ model, el }) {
     // Without Mode GM only what your character can see of the people around: no plans, attitudes, knowledge.
     const npcs = Object.entries(p.gm_view ? p.characters_gm || {} : p.characters || {});
     const gmBtn = `<button class="qr-btn qr-sm ${p.gm_view ? "qr-primary" : ""}" data-act="gm-view" title="Tampilkan semua status tokoh (spoiler)">Mode GM</button>`;
-    const npcHTML = npcs.length || p.gm_view ? `<details class="qr-npcs" data-key="npcs" ${state.open.has("npcs") ? "open" : ""}><summary>${icon("users")}${p.gm_view ? "Semua tokoh (mode GM)" : "Yang terlihat di sekitarmu"} (${npcs.length}) ${gmBtn}</summary>
+    const npcHTML = p.time !== undefined ? `<details class="qr-npcs" data-key="npcs" ${state.open.has("npcs") ? "open" : ""}><summary>${icon("users")}${p.gm_view ? "Semua tokoh (mode GM)" : "Yang terlihat di sekitarmu"} (${npcs.length}) ${gmBtn}</summary>
       ${npcs.map(([name, st]) => `<div class="qr-npc"><b>${esc(name)}</b> ${Object.entries(st).map(([k, v]) => `<span class="qr-tag">${esc(k)}: ${esc(Array.isArray(v) ? v.join(", ") : typeof v === "object" ? JSON.stringify(v) : String(v)).slice(0, 120)}</span>`).join("")}</div>`).join("")}</details>` : "";
     sp.innerHTML = `<div class="qr-sp-head">${icon("clock")}<b>${esc(p.time)}</b><span>·</span>${icon("map")}<span>${esc(p.location || "-")}</span>
         <span>·</span><span>Giliran ${p.turn}</span>${p.story ? `<span class="qr-muted">· ${esc(p.story)}</span>` : ""}</div>
@@ -253,13 +266,17 @@ function render({ model, el }) {
   el.appendChild(avStyle);
   function syncAvatars() {
     const map = {}, css = [];
-    (get("story").cards || []).filter((x) => x.role === "character").forEach((x, i) => {
-      map[x.name.toLowerCase()] = { cls: x.avatar ? `qr-av-${i}` : "", name: x.name };
-      if (x.avatar) css.push(`.qr .qr-av-${i}{background-image:url(data:image/png;base64,${x.avatar});background-size:cover;background-position:center}`);
+    (get("story").cards || []).filter((x) => x.role === "character").forEach((x) => {
+      map[x.name.toLowerCase()] = { cls: x.avatar ? `qr-av-${x.id}` : "", name: x.name };
+      if (x.avatar) css.push(`.qr .qr-av-${x.id}{background-image:url(data:image/png;base64,${x.avatar});background-size:cover;background-position:center}`);
     });
     const text = css.join("\n");
     if (avStyle.textContent !== text) avStyle.textContent = text;
+    const sig = JSON.stringify(Object.entries(map).map(([k, v]) => [k, v.cls]));
+    const changed = state.avSig !== undefined && state.avSig !== sig;
     state.avMap = map;
+    state.avSig = sig;
+    return changed;
   }
   function speakers(html) {
     const c = get("chat");
@@ -306,7 +323,7 @@ function render({ model, el }) {
     const flags = (it.flags || []).map((f) => `<span class="qr-flag" title="${esc(f.text)}">${icon("warn")}${esc(f.text.length > 70 ? f.text.slice(0, 70) + "…" : f.text)}</span>`).join("");
     const cont = (it.continuity || []).map((x) => `<div class="qr-fact">${icon("warn")}<div><b>${esc(x.kind)}${x.who ? ` · ${esc(x.who)}` : ""}</b><br>${esc(x.text)}${x.fix ? ` <span class="qr-muted">→ ${esc(x.fix)}</span>` : ""}</div></div>`).join("");
     const facts = cont + (it.fact_warnings || []).map((f) => `<div class="qr-fact">${icon("flag")}<div><b>${esc(f.claim)}</b><br>${esc(f.correction)} ${f.source && /^https?:/.test(f.source) ? `<a href="${esc(f.source)}" target="_blank" rel="noopener noreferrer">sumber</a>` : esc(f.source || "")}</div></div>`).join("");
-    const choices = it.choices && it.choices.problems ? `<div class="qr-choices">${it.choices.problems.map((p, pi) => `
+    const choices = it.choices && it.choices.problems && it.root === state.lastBot ? `<div class="qr-choices">${it.choices.problems.map((p, pi) => `
       <div class="qr-problem"><div class="qr-q">${esc(p.question)}</div>
       ${p.options.map((o, oi) => `<div class="qr-opt"><button class="qr-opt-main" data-act="choose" data-text="${esc(o)}">${esc(o)}</button>
         <button class="qr-icon qr-xs" data-act="choose-edit" data-text="${esc(o)}" title="Edit dulu">${icon("edit")}</button></div>`).join("")}</div>`).join("")}</div>` : "";
@@ -323,6 +340,8 @@ function render({ model, el }) {
     const h = model.get("history") || { items: [] };
     $(".qr-toc-btn").hidden = !(h.chapters || []).length;
     const items = h.items || [];
+    const lastBot = [...items].reverse().find((x) => x.kind === "bot");
+    state.lastBot = lastBot ? lastBot.root : null;
     $(".qr-more").hidden = !(h.total > items.length);
     const empty = $(".qr-empty");
     const c = get("chat");
@@ -336,7 +355,7 @@ function render({ model, el }) {
     for (const it of items) {
       const key = `${it.kind}-${it.kind === "bot" ? it.root : it.id}`;
       keep.add(key);
-      const sig = JSON.stringify(it) + (state.learn ? "L" : "");
+      const sig = JSON.stringify(it) + (state.learn ? "L" : "") + (state.avSig || "") + (it.root === state.lastBot ? "Z" : "");
       let node = els.get(key);
       if (!node || node._sig !== sig) {
         const tmp = document.createElement("div");
@@ -522,9 +541,17 @@ function render({ model, el }) {
   }
 
   // ---------- drawer ----------
+  // Proposals, threads and what a character knows depend on the active branch: ask again whenever it may have moved.
+  function refreshStory() {
+    if (drawer.hidden || state.tab !== "story" || !get("chat").id) return;
+    send("proposals");
+    send("threads");
+    if (state.know && state.know.holder) send("knowledge", { holder: state.know.holder });
+  }
   function openDrawer(tab) {
     state.tab = tab || state.tab;
     drawer.hidden = false;
+    if (state.tab === "story") refreshStory();
     if (state.tab === "cards" || state.tab === "story") send("library");
     if (state.tab === "memory") send("memory", { q: "" });
     if (state.tab === "learn") send("vocab");
@@ -535,7 +562,8 @@ function render({ model, el }) {
     $(".qr-tabs").innerHTML = Object.keys(TAB_NAMES).map((t) => `<button class="qr-tabbtn ${t === state.tab ? "on" : ""}" data-act="tab" data-tab="${t}">${icon(TAB_ICONS[t])}${TAB_NAMES[t]}</button>`).join("");
     const fn = { chat: tabChat, story: tabStory, cards: tabCards, memory: tabMemory, model: tabModel, learn: tabLearn }[state.tab];
     const active = el.getRootNode().activeElement || document.activeElement;  // the widget lives in a shadow root
-    if (active && dbody.contains(active) && (active.tagName === "TEXTAREA" || active.tagName === "INPUT")) return;
+    if (active && dbody.contains(active) && /^(TEXTAREA|INPUT|SELECT)$/.test(active.tagName)) return;
+    if (state.tab === "story" && editing(dbody)) return;
     if (state.tab === "cards" && state.cardView && state.formDirty === state.cardView && dbody.querySelector(".qr-card-form")) return;
     dbody.innerHTML = fn();
   }
@@ -656,7 +684,7 @@ function render({ model, el }) {
   function tabMemory() {
     const a = state.memory || { rows: [], log: [] };
     return `<label class="qr-search">${icon("search")}<input class="qr-mem-q" placeholder="Cari memory" value="${esc(a.q || "")}"></label>
-      <section><h4>Memory</h4>${(a.rows || []).map((m) => `<div class="qr-memrow"><span class="qr-badge">${esc(m.scope)}${m.kind === "summary_core" ? " · ringkasan" : ""}</span>${m.other_branch ? '<span class="qr-badge" title="Dibuat atau dilupakan di cabang/chat lain; tidak dipakai di chat ini">cabang lain</span>' : ""}
+      <section><h4>Memory</h4>${(a.rows || []).map((m) => `<div class="qr-memrow"><span class="qr-badge">${esc(m.scope)}${m.kind === "summary_core" ? " · ringkasan" : ""}</span>${m.other_branch ? '<span class="qr-badge" title="Dibuat di cabang/chat lain; tidak dipakai di chat ini">cabang lain</span>' : ""}${m.forgotten_here ? '<span class="qr-badge" title="Dilupakan di cabang ini; cabang lain masih memakainya">dilupakan di sini</span>' : ""}
         <span class="${m.other_branch ? "qr-muted" : ""}">#${m.id} ${esc(m.text)}</span><button class="qr-icon qr-xs" data-act="mem-del" data-id="${m.id}" title="Hapus">${icon("trash")}</button></div>`).join("") || '<div class="qr-muted">Kosong.</div>'}</section>
       <section><h4>Catatan perubahan oleh model</h4>${(a.log || []).map((l) => `<div class="qr-memrow ${l.undone ? "undone" : ""}"><span class="qr-badge">${esc(l.action)}</span>
         <span>#${l.memory_id} ${esc((l.after || l.before || "").slice(0, 160))}</span>${l.undone ? '<span class="qr-muted">dibatalkan</span>' : `<button class="qr-btn qr-sm" data-act="mem-undo" data-id="${l.id}">Undo</button>`}</div>`).join("") || '<div class="qr-muted">Belum ada.</div>'}</section>`;
@@ -888,8 +916,8 @@ function render({ model, el }) {
       case "branch": send("branch", { mid }); break;
       case "pin": { const it = (model.get("history").items || []).find((x) => x.id === mid || x.answer_id === mid); send("pin", { mid, on: !(it && it.pinned) }); break; }
       case "chapter": { const t = prompt("Judul bab:"); if (t) send("chapter", { mid, title: t }); break; }
-      case "fact-check": send("fact_check", { mid }); toast("Memeriksa fakta…"); break;
-      case "continuity": send("continuity", { mid }); toast("Cek kontinuitas…"); break;
+      case "fact-check": send("fact_check", { mid }); break;
+      case "continuity": send("continuity", { mid }); break;
       case "choose": send("choose", { text: btn.dataset.text }); fol.jump(); break;
       case "choose-edit": input.value = btn.dataset.text; grow(); input.focus(); break;
       case "think-follow": { const box = btn.parentElement.querySelector(".qr-think-box"); thinkFollow = true; btn.hidden = true; box.scrollTop = box.scrollHeight; break; }
@@ -939,17 +967,22 @@ function render({ model, el }) {
       case "toc": { const h = model.get("history") || {}, cid = get("chat").id;
         openModal("Daftar bab", (h.chapters || []).map((c) => `<button class="qr-libitem" data-act="jump-to" data-chat="${cid}" data-id="${c.id}">${icon("bookmark")}<b>${esc(c.title)}</b><span class="qr-muted">pesan ${c.n}</span></button>`).join("") || "Belum ada bab. Tandai dengan /bab atau tombol bab di balasan."); break; }
       case "speaker": send("settings", { speaker: btn.dataset.name || null }); break;
-      case "props-make": send("proposals_make"); toast("Menyusun usulan…"); break;
+      case "props-make": send("proposals_make"); break;
       case "prop-yes": case "prop-no": send("proposal", { pid: Number(btn.closest("[data-pid]").dataset.pid), accept: act === "prop-yes" }); break;
       case "thread-add": { const box = btn.closest(".qr-threads"), title = box.querySelector(".qr-thread-title").value.trim();
-        if (title) send("thread_add", { kind: box.querySelector(".qr-thread-kind").value, title, due: box.querySelector(".qr-thread-due").value.trim() }); break; }
+        if (title) { send("thread_add", { kind: box.querySelector(".qr-thread-kind").value, title, due: box.querySelector(".qr-thread-due").value.trim() });
+          box.querySelector(".qr-thread-title").value = ""; box.querySelector(".qr-thread-due").value = ""; } break; }
       case "thread-close": send("thread_close", { tid: Number(btn.closest("[data-tid]").dataset.tid), status: btn.dataset.status }); break;
       case "know-add": { const box = btn.closest(".qr-know"), t = box.querySelector(".qr-know-new").value.trim();
-        if (t) send("knowledge_add", { holder: state.know.holder, text: t, kind: box.querySelector(".qr-know-kind").value }); break; }
-      case "know-save": { const row = btn.closest("[data-kid]");
-        send("knowledge_edit", { kid: Number(row.dataset.kid), holder: state.know.holder, text: row.querySelector(".qr-know-text").value,
-          truth: row.querySelector(".qr-know-truth").value }); break; }
-      case "know-del": send("knowledge_delete", { kid: Number(btn.closest("[data-kid]").dataset.kid), holder: state.know.holder }); break;
+        if (t && state.know) { send("knowledge_add", { holder: state.know.holder, text: t, kind: box.querySelector(".qr-know-kind").value });
+          box.querySelector(".qr-know-new").value = ""; } break; }
+      case "know-save": { const row = btn.closest("[data-kid]"), ta = row.querySelector(".qr-know-text");
+        if (!state.know) break;
+        send("knowledge_edit", { kid: Number(row.dataset.kid), holder: state.know.holder, text: ta.value,
+          truth: row.querySelector(".qr-know-truth").value });
+        ta.defaultValue = ta.value; break; }
+      case "know-del": if (state.know && confirm("Hapus ingatan ini dari tokoh ini (di semua cabang chat ini)?"))
+        send("knowledge_delete", { kid: Number(btn.closest("[data-kid]").dataset.kid), holder: state.know.holder }); break;
       case "nf-save": send("never_forget", { items: dbody.querySelector(".qr-nf").value.split("\n") }); break;
       case "apply-now": send("apply_now"); break;
       case "continue-new": if (confirm("Lanjutkan cerita ini di chat baru (kronik dan adegan terakhir dibawa)?")) send("continue_new"); break;
@@ -962,7 +995,10 @@ function render({ model, el }) {
       case "smp-reset": send("settings", { sampling: {} }); break;
       case "mem-del": send("memory_delete", { mid: id }); break;
       case "mem-undo": send("memory_undo", { log_id: id }); break;
-      case "model-start": send("model_switch", { preset: dbody.querySelector(".qr-model-sel").value, ctx: Number(dbody.querySelector(".qr-ctx-sel").value), mtp: dbody.querySelector(".qr-mtp").checked, embed: dbody.querySelector(".qr-emb").checked, embed_model: dbody.querySelector(".qr-emb-model").value }); break;
+      case "model-start": {
+        const em = dbody.querySelector(".qr-emb-model").value, on = dbody.querySelector(".qr-emb").checked, run = get("server").embed_model;
+        if (on && run && em !== run && !confirm(`Ganti embedder ${run} → ${em}? Semua vektor dibuat ulang di latar belakang; selama itu pencarian menurut makna memakai kata kunci saja.`)) break;
+        send("model_switch", { preset: dbody.querySelector(".qr-model-sel").value, ctx: Number(dbody.querySelector(".qr-ctx-sel").value), mtp: dbody.querySelector(".qr-mtp").checked, embed: on, embed_model: em }); break; }
       case "model-stop": if (confirm("Hentikan server model?")) send("model_stop"); break;
       case "review": send("vocab_review", { vid: id, grade: Number(btn.dataset.grade) }); break;
       case "vocab-del": send("vocab_delete", { vid: id }); break;
@@ -987,20 +1023,22 @@ function render({ model, el }) {
     const a = model.get("aux") || {};
     if (!a.kind) return;
     const d = a.data;
+    // answers for another chat (the user switched meanwhile) are dropped
+    if (["proposals", "threads", "knowledge"].includes(a.kind) && d && d.chat_id && d.chat_id !== get("chat").id) return;
     if (a.kind === "proposals") {
       state.props = d;
       const box = dbody.querySelector(".qr-props");
-      if (state.tab === "story" && box) box.innerHTML = propsHTML();
+      if (state.tab === "story" && box && !editing(box)) box.innerHTML = propsHTML();
     }
     else if (a.kind === "threads") {
       state.threads = d;
-      const box = dbody.querySelector(".qr-threads"), f = rootActive();
-      if (state.tab === "story" && box && !(f && box.contains(f) && f.tagName === "INPUT")) box.innerHTML = threadsHTML();
+      const box = dbody.querySelector(".qr-threads");
+      if (state.tab === "story" && box && !editing(box)) box.innerHTML = threadsHTML();
     }
     else if (a.kind === "knowledge") {
       state.know = d;
-      const box = dbody.querySelector(".qr-know"), f = rootActive();
-      if (state.tab === "story" && box && !(f && box.contains(f) && f.tagName === "INPUT")) box.innerHTML = knowHTML();
+      const box = dbody.querySelector(".qr-know");
+      if (state.tab === "story" && box && !editing(box)) box.innerHTML = knowHTML();
     }
     else if (a.kind === "memory") {
       state.memory = d;
@@ -1088,20 +1126,20 @@ function render({ model, el }) {
   let raf = 0;
   const onLive = () => { if (!raf) raf = requestAnimationFrame(() => { raf = 0; renderLive(); }); };
   const handlers = {
-    "change:chats": renderChats, "change:chat": onChat, "change:history": () => { renderHistory(); if (get("chat").kind === "studio" && state.studioCard) send("card_open", { card_id: state.studioCard }); },
+    "change:chats": renderChats, "change:chat": onChat, "change:history": () => { renderHistory(); refreshStory(); if (get("chat").kind === "studio" && state.studioCard) send("card_open", { card_id: state.studioCard }); },
     "change:live": onLive, "change:busy": renderBusy, "change:status": renderStatusLine, "change:queue": renderStatusLine,
     "change:toast": onToast, "change:ctx": renderTop, "change:panels": () => { renderPanels(); renderTop(); },
     "change:server": () => {
       renderTop();
       if (state.tab !== "model" || drawer.hidden) return;
       const s = get("server");
-      const k = JSON.stringify([s.phase, s.preset, s.ctx, s.mtp, s.embed, s.embed_ready, s.error, s.warnings, s.installed]);
+      const k = JSON.stringify([s.phase, s.preset, s.ctx, s.mtp, s.embed, s.embed_ready, s.embed_model, s.error, s.warnings, s.installed]);
       if (k !== state.srvKey) { state.srvKey = k; renderDrawer(); return; }
       const g = dbody.querySelector(".qr-gpu");  // only the GPU line changed: leave the form as it is
       if (g) g.textContent = s.gpu ? `GPU ${s.gpu.util.toFixed(0)}% · VRAM ${s.gpu.used_gb.toFixed(1)} / ${s.gpu.total_gb.toFixed(0)} GB` : "";
     }, "change:backup": renderBackup,
     "change:library": () => { if (state.tab === "cards" || state.tab === "story") renderDrawer(); renderWizard(); },
-    "change:card": onCard, "change:story": () => { syncAvatars(); renderSpeakerBar(); renderStudio(); if (state.tab === "story") renderDrawer(); },
+    "change:card": onCard, "change:story": () => { if (syncAvatars()) renderHistory(); renderSpeakerBar(); renderStudio(); if (state.tab === "story") renderDrawer(); },
     "change:rev": () => {
       if (drawer.hidden) return;
       if (state.tab === "memory") send("memory", { q: (state.memory || {}).q || "" });

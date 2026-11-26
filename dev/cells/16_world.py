@@ -355,6 +355,9 @@ class Threads:
             raise ValueError("tenggat harus YYYY-MM-DD HH:MM")
         chat = self.store.chat(chat_id) or {}
         who = ", ".join(who) if isinstance(who, list) else str(who or "")
+        for r in self.list(chat_id):  # already open on this branch: the same thread, not a new one
+            if r["kind"] == kind and TXT.jaccard(r["title"], title) >= 0.6:
+                return r["id"]
         return self.store.x("INSERT INTO threads (story_id, chat_id, message_id, kind, title, text, who, due, opened_at, created) "
                             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                             (chat.get("story_id"), chat_id, message_id, kind, title[:200], (text or "")[:1500], who[:300],

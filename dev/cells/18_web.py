@@ -86,7 +86,13 @@ class WebTools:
         while True:
             if self.dead:
                 self._close()
-                return
+                while True:  # jobs queued before it retired get an answer instead of waiting for the timeout
+                    try:
+                        _, _, box, done = self.jobs.get_nowait()
+                    except _queue.Empty:
+                        return
+                    box["error"] = RuntimeError("browser ini sudah diganti; coba lagi")
+                    done.set()
             try:
                 fn, args, box, done = self.jobs.get(timeout=300)
             except _queue.Empty:
@@ -107,6 +113,8 @@ class WebTools:
                 return
 
     def _run(self, fn, *args, timeout=120):
+        if self.dead:
+            raise RuntimeError("browser ini sudah diganti (cell dijalankan ulang); coba lagi")
         for attempt in range(2):
             self._ensure_thread()
             box, done = {}, threading.Event()

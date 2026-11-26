@@ -11,9 +11,11 @@ BASE_RP = """Kamu narator dan game master sebuah roleplay. Kamu memerankan dunia
 Ikuti kartu Gaya dan kartu GM di bawah. Pemain adalah tokoh di kartu Persona.
 
 Aturan tetap:
-- Jangan menulis ucapan, keputusan, atau tindakan pemain melebihi yang dia tulis. Berhenti di titik pemain harus merespons.
+- Jangan menulis ucapan, keputusan, atau tindakan pemain melebihi yang dia tulis, kecuali yang diizinkan kartu Persona.
+  Berhenti di titik pemain harus merespons.
 - Dunia tidak berputar di sekitar pemain: tokoh lain punya agenda dan bertindak sendiri, hanya berdasarkan apa yang mereka tahu.
-- Tiap tokoh (termasuk tokoh pemain) hanya tahu isi ingatannya di catatan sistem. Memory, buku cerita, dan lore adalah
+- Tiap tokoh (termasuk tokoh pemain) tahu isi kartunya sendiri (riwayat, relasi, yang ia ketahui), pengetahuan umum
+  zaman dan tempatnya, dan ingatannya di catatan sistem. Rahasia tokoh lain, lore RAHASIA, buku cerita, dan memory adalah
   pengetahuan narator; jangan biarkan tokoh memakainya kalau tidak ada di ingatannya. Ingatan bertanda KELIRU dipercaya
   tokoh itu walaupun salah. Catat yang baru diketahui tokoh dengan knowledge_add atau tell.
 - Hubungan: kalau kejadian mengubah perasaan tokoh terhadap tokoh lain atau pemain, catat dengan relationship.
@@ -26,14 +28,20 @@ Aturan tetap:
   Jangan mengarang angka, nama, atau tanggal nyata. Begitu ragu, langsung panggil tool; jangan menebak berulang-ulang
   di dalam pikiran.
 
-Tool untuk menjaga dunia tetap konsisten (panggil tanpa menyebutnya di narasi):
+Tool untuk menjaga dunia tetap konsisten (panggil tanpa menyebutnya di narasi; panggil yang perlu sekaligus dalam satu
+putaran sebelum menulis narasi, tanpa teks pengantar):
 - world_advance: laporkan berapa menit waktu dunia berlalu di giliran ini.
 - status_update: perubahan status pemain (statistik angka, lokasi, luka, barang) atau tokoh lain (lokasi, mood, rencana, sikap).
-- roll: untuk hasil yang tidak pasti, tentukan peluang yang masuk akal; hasil dadu dari sistem wajib diikuti.
+- roll: untuk hasil yang tidak pasti; sebut skill seperti di kartu dan kesulitannya, sistem menghitung peluang. Panggil
+  SEBELUM menulis hasil aksi; hasil dadu dari sistem wajib diikuti.
 - world_event: kejadian di luar layar, dengan siapa saja yang mengetahuinya.
 - canon_set: catat hal penting yang berubah ke buku cerita. memory_save/memory_update untuk fakta yang perlu diingat lama.
 - card_read: detail kartu tokoh yang belum ada di prompt.
 {format_rule}"""
+
+OOC_NOTE = ("Pesan pemain ini OOC (di luar cerita). Jawab sebagai penulis di luar cerita, singkat, tanpa melanjutkan adegan, "
+            "tanpa memerankan tokoh, dan tanpa tool pencatat dunia (world_advance, status_update, roll, knowledge_add, tell, "
+            "thread_open, relationship, canon_set).")
 
 FORMAT_GAME = """- Format game: tulis narasi saja. Status, panel dunia, dan pilihan ditampilkan sistem; jangan menulis blok status,
   daftar pilihan, atau menu sendiri."""
@@ -59,6 +67,24 @@ class Prompt:
 
     def kwargs(self, c):
         return thinking_kwargs(c["preset"], c["settings"].get("thinking") or c["preset"]["thinking"][-1])
+
+    def side_kwargs(self, c, retry=False):
+        """Thinking settings for side tasks (state check, summaries, choices, checks): the chat's own. Some templates
+        put the thinking switch in the system turn (Gemma's <|think|>), so another setting changes the prompt prefix
+        and the whole history is processed again instead of read from cache. Only a retry after an empty answer turns
+        thinking off."""
+        kw = dict(self.kwargs(c))
+        if retry:
+            kw.pop("reasoning_effort", None)
+            kw["enable_thinking"] = False
+        return kw
+
+    def think_budget(self, c, kw=None):
+        """Tokens to leave for thinking on top of an answer."""
+        kw = kw or self.kwargs(c)
+        if not kw.get("enable_thinking", True):
+            return 0
+        return {"low": 4000, "medium": 8000, "high": 16000, "xhigh": 32000}.get(kw.get("reasoning_effort"), 16000)
 
     def sampling(self, c):
         return {**c["preset"]["sampling"], **(c["settings"].get("sampling") or {})}
@@ -205,17 +231,20 @@ class Prompt:
         here = norm((status.get("player") or {}).get("location"))
         low = (text or "").lower()
         out = []
+        def same(a, b):
+            if a == b:
+                return True
+            short, long_ = sorted((a, b), key=len)
+            return long_.startswith(short) and long_[len(short)] in " ,-/(:"
+
         for i, ch in enumerate(chars):
             st = status.get(ch["name"]) or {}
             if norm(st.get("keadaan")) in ("mati", "pergi", "tewas", "meninggal"):
                 continue
             names = [ch["name"]] + list(ch["data"].get("aliases") or [])
-            named = any(n and n.lower() in low for n in names)
+            named = any(n and re.search(r"(?<!\w)" + re.escape(str(n).lower()) + r"(?!\w)", low) for n in names)
             loc = norm(st.get("location"))
-            if here and loc:
-                if loc == here or here in loc or loc in here:
-                    out.append(ch)
-            elif named or (i == 0 and not here):
+            if named or (here and loc and same(loc, here)) or (i == 0 and not here and not loc):
                 out.append(ch)
         return out
 
@@ -239,7 +268,7 @@ class Prompt:
             lo, hi = 3, 6
         return {"paragraphs": n, "sent_lo": lo, "sent_hi": hi}
 
-    def ephemeral(self, chat_id, path, user_text, extra=None):
+    def ephemeral(self, chat_id, path, user_text, extra=None, length=None):
         """The temporary block for the last user message, plus what it used (for marking events shown)."""
         c = self.ctx(chat_id)
         if c["kind"] not in ("rp", "group", "studio"):
@@ -287,10 +316,14 @@ class Prompt:
         if trips:
             lines.append(f"Waktu tempuh dari {here}: " + ", ".join(f"{p} {m} menit" for p, m in trips[:8])
                          + " (pakai world_advance sesuai perjalanan)")
-        for ch in self.present_characters(c, recent, where):
+        present = self.present_characters(c, recent, where)
+        for ch in present:
             bits = []
-            if where.get(ch["name"]):
-                bits.append("status " + json.dumps(where[ch["name"]], ensure_ascii=False))
+            cur = dict(where.get(ch["name"]) or {})
+            guess = cur.pop("location_from", None) == "jadwal"
+            if cur:
+                bits.append("status " + json.dumps(cur, ensure_ascii=False)
+                            + (" (lokasi/kegiatan: perkiraan jadwal; kalau narasi menunjukkan lain, narasi yang benar)" if guess else ""))
             rel = [(b, v) for (a, b), v in RELATIONS.scores(chat_id).items() if a == ch["name"]]
             if rel:
                 bits.append("perasaan: " + "; ".join(f"ke {'pemain' if b == 'player' else b} {Relations.word(v['score'])} "
@@ -307,6 +340,15 @@ class Prompt:
                 bits.append(detail)
             if bits:
                 lines.append(f"Tokoh di adegan, {ch['name']}:\n" + "\n".join(bits))
+        # people without a card (a landlord, squad mates) whose status was recorded: shown when here or named
+        carded = {ch["name"] for ch in c["cards"]["character"]}
+        low = recent.lower()
+        for subject, fields in st["status"].items():
+            if subject in carded or subject in ("player", "world") or not isinstance(fields, dict):
+                continue
+            loc = str(fields.get("location") or "").strip().lower()
+            if subject.lower() in low or (here and loc and loc == str(here).strip().lower()):
+                lines.append(f"Tokoh tanpa kartu, {subject}: status " + json.dumps(fields, ensure_ascii=False)[:600])
         lore = self.mem.lore_triggered(c["mem"]["card_ids"], recent)
         if lore:
             lines.append("Lore terkait:\n" + "\n".join(
@@ -321,10 +363,15 @@ class Prompt:
             lines.append("Memory relevan:\n" + "\n".join(f"- (#{r['id']}) {r['text']}" for r in recall))
         if c["settings"].get("note"):
             lines.append("Catatan penulis: " + c["settings"]["note"])
-        tgt = self.length_target(c)
+        if (self.gm(c).get("state_check") or "ya") == "ya":
+            lines.append("Pengetahuan tokoh, benang cerita, dan hubungan yang tidak sempat kamu catat akan dilengkapi pemeriksa "
+                         "setelah giliran; utamakan narasi. Waktu, dadu, dan status tetap catat sendiri.")
+        tgt = self.length_target(c) if length is None else (length or None)
         if tgt:
             lines.append(f"Panjang giliran ini: {tgt['paragraphs']} paragraf, {tgt['sent_lo']}-{tgt['sent_hi']} kalimat per "
-                         f"paragraf. Susun kerangka per paragraf di thinking dulu.")
+                         f"paragraf. Susun kerangka per paragraf di thinking dulu. Kalau target panjang bertabrakan dengan titik "
+                         f"pemain harus merespons, titik berhenti menang: isi dengan reaksi dan suasana sebelum titik itu, jangan "
+                         f"memajukan waktu atau aksi.")
             used["length"] = tgt
         for x in (extra or []):
             lines.append(x)
@@ -332,15 +379,20 @@ class Prompt:
 
     # ---------- requests ----------
 
-    def build(self, chat_id, path=None, ephemeral=True, extra=None):
-        """Messages for the main request. Returns (messages, used)."""
+    def build(self, chat_id, path=None, ephemeral=True, extra=None, also=None, length=None):
+        """Messages for the main request. Returns (messages, used). also: lines added in every round of the turn but
+        not stored with the user message (a group speaker, a correction). length: None = the style's target,
+        False = none, or a target dict."""
         path = path if path is not None else self.store.path(chat_id)
         msgs = [{"role": "system", "content": self.system_text(chat_id)}] + self.history(chat_id, path)
         used = {}
         note, target = "", None
         if ephemeral and msgs[-1]["role"] == "user":
             user_text = path[-1]["content"] if path else ""
-            note, used = self.ephemeral(chat_id, path, user_text, extra)
+            if path and path[-1].get("ooc") and (self.store.chat(chat_id) or {}).get("kind") in ("rp", "group"):
+                note, used = OOC_NOTE, {"ooc": True}  # out of character: no scene, no length, no bookkeeping
+            else:
+                note, used = self.ephemeral(chat_id, path, user_text, extra, length=length)
             used = {**used, "note": note}
             target = msgs[-1]
         elif ephemeral:
@@ -350,9 +402,11 @@ class Prompt:
             if ui is not None:
                 um = next((m for m in path if m["id"] == msgs[ui].get("_id")), None)
                 note = ((um or {}).get("meta") or {}).get("ephemeral") or ""
-                if extra:  # e.g. the next speaker in a group turn
+                if extra:
                     note = "\n\n".join([note] + [x for x in extra if x]).strip()
                 target = msgs[ui]
+        if also and target is not None:
+            note = "\n\n".join([note] + [x for x in also if x]).strip()
         if note and target is not None:
             persona = (((self.ctx(chat_id).get("cards") or {}).get("persona")) or {}).get("name") or "kamu"
             block = "\n\n[Catatan sistem untuk giliran ini, bukan tulisan pemain]\n" + TXT.macros(note, user=persona)

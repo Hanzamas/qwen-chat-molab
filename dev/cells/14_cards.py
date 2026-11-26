@@ -223,12 +223,15 @@ class Cards:
 
     def _save(self, card_id, type_, data, name=None, avatar=None):
         data = self.normalize(type_, dict(data or {}))
-        name = (name or data.get("name") or data.get("title") or "Tanpa nama").strip()
+        name = (name or data.get("name") or data.get("title") or "").strip()
         now = time.time()
         if card_id:
-            cur = self.store.one("SELECT data, version FROM cards WHERE id = ?", (card_id,))
+            cur = self.store.one("SELECT data, version, name FROM cards WHERE id = ?", (card_id,))
             if cur is None:
                 card_id = None
+            elif not name:
+                name = cur["name"]  # Style and GM cards have no name field: saving the form keeps the name
+        name = name or "Tanpa nama"
         if not card_id:
             card_id = self.store.x("INSERT INTO cards (type, name, data, avatar, version, created, updated) VALUES (?, ?, ?, ?, 1, ?, ?)",
                                    (type_, name, json.dumps(data), avatar, now, now))
@@ -305,15 +308,16 @@ class Cards:
         text = str(v).strip()
         return ("\n  " + text.replace("\n", "\n  ")) if f["type"] == "longtext" and "\n" in text else text
 
-    def render(self, card, mode="core", keys=None, limit=6000):
-        """Text for the prompt. mode: core (frozen part), detail (the rest), all. 'ui' fields never render."""
-        return TXT.macros(self._render(card, mode, keys, limit), char=card.get("name", ""))
+    def render(self, card, mode="core", keys=None, limit=6000, include_ui=False):
+        """Text for the prompt. mode: core (frozen part), detail (the rest), all. 'ui' fields render only with
+        include_ui (Studio, which fills them in); notes never."""
+        return TXT.macros(self._render(card, mode, keys, limit, include_ui), char=card.get("name", ""))
 
-    def _render(self, card, mode="core", keys=None, limit=6000):
+    def _render(self, card, mode="core", keys=None, limit=6000, include_ui=False):
         sch = self.schema(card["type"])
         out, section = [f"## {sch.get('label', card['type'])}: {card['name']}"], None
         for f in sch["fields"]:
-            if f.get("visibility") == "ui" or (keys and f["key"] not in keys):
+            if (f.get("visibility") == "ui" and not (include_ui and f["key"] != "notes")) or (keys and f["key"] not in keys):
                 continue
             if mode == "core" and not f.get("core") or mode == "detail" and f.get("core"):
                 continue
@@ -323,7 +327,7 @@ class Cards:
             if f.get("section") != section:
                 section = f.get("section")
                 out.append(f"### {section}")
-            secret = " (rahasia: hanya kamu yang tahu, jangan diungkap tanpa sebab)" if f.get("visibility") == "secret" else ""
+            secret = " (rahasia tokoh ini: narator tahu, jangan diungkap tanpa sebab)" if f.get("visibility") == "secret" else ""
             out.append(f"- {f['label']}{secret}: {text}")
         known = {f["key"] for f in sch["fields"]}
         if mode != "core":

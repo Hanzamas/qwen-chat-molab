@@ -136,7 +136,12 @@ class Stories:
         rows = self.store.q("SELECT id, text, message_id FROM pending_changes WHERE (story_id = ? AND story_id IS NOT NULL) "
                             "OR chat_id = ? ORDER BY id", (story_id, chat_id))
         vis = self.store.visible_ids(chat_id) if chat_id and any(r["message_id"] for r in rows) else set()
-        return [r for r in rows if not r["message_id"] or r["message_id"] in vis]
+        rows = [r for r in rows if not r["message_id"] or r["message_id"] in vis]
+        latest = {}
+        for r in rows:  # "Buku cerita · Bagian: ..." / "Kartu X · field: ...": one line per section or field
+            key = r["text"].split(":", 1)[0] if " · " in r["text"].split(":", 1)[0] else f"#{r['id']}"
+            latest[key] = r
+        return sorted(latest.values(), key=lambda r: r["id"])
 
     def clear_pending(self, story_id, chat_id):
         self.store.x("DELETE FROM pending_changes WHERE (story_id = ? AND story_id IS NOT NULL) OR chat_id = ?",
