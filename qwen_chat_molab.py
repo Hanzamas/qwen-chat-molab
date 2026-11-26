@@ -440,6 +440,15 @@ def _(PORT, Path, mo):
         "Dark-Gemistry 31B HB16-Q6_K (29.7GB, lebih cepat)": {
             "gguf": "ReadyArt/Nimbz_Gemma-4-Dark-Gemistry-31B-GGUF:HB16-Q6_K", "mmproj": _G4_MMPROJ, "mtp": False,
             "max_ctx": 262144, "yarn_max": 524288, "yarn_exp": True, "sampling": _DG_SAMPLING},
+        # Benchmark RP (judge): 8.62, prosa 1.8. GGUF berisi tensor MTP (blk.64.nextn.*) dan mmproj di repo yang sama.
+        # Sampler thinking dari card Qwen3.8: temp 1.0, top_p 0.95, top_k 20, min_p 0. YaRN resmi sampai 1M.
+        "Qwen3.8 27B heretic-ara Q8_0 (29GB)": {
+            "gguf": "mradermacher/Qwen3.8-27B-heretic-ara-GGUF:Q8_0",
+            "mmproj": ("https://huggingface.co/mradermacher/Qwen3.8-27B-heretic-ara-GGUF"
+                       "/resolve/main/Qwen3.8-27B-heretic-ara.mmproj-Q8_0.gguf"),
+            "mtp": True, "max_ctx": 262144, "yarn_max": 1000000, "yarn_exp": False,
+            "sampling": {"temperature": 1.0, "top_p": 0.95, "top_k": 20, "min_p": 0.0,
+                         "repetition_penalty": 1.0, "frequency_penalty": 0, "presence_penalty": 0}},
         "Qwen3.8 40B Heretic Build2 i1-Q6_K (lama)": {
             "gguf": "mradermacher/Qwen3.8-40B-Ultimate-Heretic-Uncensored-Build2-i1-GGUF:Q6_K", "mmproj": _QWEN40_MMPROJ,
             # sampler dari card DavidAU (temp 1.0, top_k 64, top_p 0.95, min_p 0.05, rep pen 1.0).
