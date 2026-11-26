@@ -1092,3 +1092,54 @@ def test_old_browser_thread_stops_when_the_cell_runs_again(nb):
     old.shutdown()  # what the cell does to the previous WebTools when it runs again
     th.join(5)
     assert not th.is_alive() and closed and old.page is None
+
+
+def test_idle_compaction_failure_is_shown_and_backs_off(engine, nb, monkeypatch):
+    chat = engine.new_chat("chat", "gagal compact")
+    engine.send(chat, "Halo")
+    wait_idle(engine)
+    calls = []
+
+    def boom(*a, **kw):
+        calls.append(1)
+        raise RuntimeError("Ringkasan pesan 232–314 kosong")
+    monkeypatch.setattr(engine.compactor, "maybe", boom)
+    engine.active_chat = chat
+    engine.last_used[chat] = int(nb["LLM_CLIENT"].max_context() * 0.8)
+    engine.last_activity = time.time() - 600
+    engine._idle_once()
+    statuses = engine.events.of("status")
+    assert calls and statuses[-1] == ""  # the status line is cleared after the failure
+    assert any("Compaction saat diam gagal" in t["text"] for t in engine.events.of("toast"))
+    assert nb["STORE"].side_logs(chat, "compaction_error")
+    engine._idle_once()
+    assert len(calls) == 1  # no retry every 30 s
+
+
+def test_summary_retries_without_thinking_and_fits_the_context(engine, nb, fake):
+    chat, _ = _story(nb, engine)
+    for i in range(3):
+        engine.send(chat, f"giliran {i}")
+        wait_idle(engine)
+    comp, S = engine.compactor, nb["STORE"]
+    comp.cancel.clear()
+    path = S.path(chat)
+    tools = nb["TOOLS"].specs(nb["PROMPT"].ctx(chat))
+    fake["script"] += [{"reasoning": "mikir panjang sekali", "content": ""}, {"content": "## Inti\nRingkasan setelah ulang."}]
+    n0 = len(fake["log"])
+    text = comp.summarize(chat, path, 0, len(path) - 1, 4096, 2000, tools)
+    assert text.startswith("## Inti")
+    second = fake["log"][n0 + 1]
+    assert second["chat_template_kwargs"].get("enable_thinking") is False
+    # a small context: only the piece is sent, and max_tokens fits what is left
+    fake["max_len"] = 3000
+    nb["LLM_CLIENT"]._ctx_cache = {}
+    try:
+        fake["script"].append({"content": "## Inti\nKecil."})
+        n1 = len(fake["log"])
+        comp.summarize(chat, path, len(path) - 2, len(path) - 1, 4096, 2000, tools)
+        req = fake["log"][n1]
+        assert len(req["messages"]) <= 4 and req["max_tokens"] <= 3000
+    finally:
+        fake["max_len"] = 200_000
+        nb["LLM_CLIENT"]._ctx_cache = {}

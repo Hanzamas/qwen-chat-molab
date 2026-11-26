@@ -4874,7 +4874,8 @@ def _(TXT, re, threading, time):
                 if text is None:  # cancelled: what is already summarized stays, this piece is redone next time
                     break
                 if not text:
-                    raise RuntimeError(f"Ringkasan pesan {a + 1}–{b + 1} kosong. Compaction dihentikan; tidak ada yang dihapus.")
+                    raise RuntimeError(f"Ringkasan pesan {a + 1}–{b + 1} kosong ({getattr(self, 'last_error', '')}). "
+                                       f"Compaction dihentikan; tidak ada yang dihapus.")
                 text = self.entity_check(chat_id, path[a:b + 1], text)
                 core = self.core_of(text)
                 self.store.x("INSERT INTO summaries (chat_id, node_id, from_id, level, text, core, created) VALUES (?, ?, ?, 'chunk', ?, ?, ?)",
@@ -4940,13 +4941,35 @@ def _(TXT, re, threading, time):
             anchors = "\n".join(f"{i + 1}: {path[i]['content'][:80].replace(chr(10), ' ')}"
                                 for i in range(a, b + 1) if path[i]["role"] == "user")
             instr = SUMMARY_INSTRUCTION.format(a=a + 1, b=b + 1, words=int(budget * 0.55), anchors=anchors[:6000])
-            msgs = self.prompt.side(chat_id, instr, path=path[:b + 1])
             c = self.prompt.ctx(chat_id)
-            acc = self.llm.complete(msgs, kwargs=self.prompt.kwargs(c), sampling={"temperature": 0.6, "top_p": 0.95},
-                                    max_tokens=budget + think, tools=tools, stop=self.cancel, on_delta=on_delta)
-            if acc["finish"] == "stopped" or self.cancel.is_set():
-                return None
-            text = (acc["content"] or "").strip()
+            maxc = self.llm.max_context() or 0
+            # Same prefix as the chat (cache hits). If history + the answer would not fit, only the piece goes in.
+            msgs = self.prompt.side(chat_id, instr, path=path[:b + 1])
+            want = budget + think
+            used = self.llm.estimate(msgs)
+            if maxc and used + want > maxc - 1024:
+                msgs = self.prompt.side(chat_id, instr, path=path[a:b + 1])
+                used = self.llm.estimate(msgs)
+            max_tokens = max(2048, min(want, maxc - used - 1024)) if maxc else want
+            # Long thinking can eat the whole budget and leave no summary: think less here, and if the answer is
+            # still empty, write it again with thinking off.
+            kw = dict(self.prompt.kwargs(c))
+            if kw.get("reasoning_effort") in ("high", "xhigh") and "low" in c["preset"]["thinking"]:
+                kw["reasoning_effort"] = "low"
+            text, acc = "", None
+            for attempt in range(2):
+                acc = self.llm.complete(msgs, kwargs=kw, sampling={"temperature": 0.6, "top_p": 0.95},
+                                        max_tokens=max_tokens, tools=tools, stop=self.cancel, on_delta=on_delta)
+                if acc["finish"] == "stopped" or self.cancel.is_set():
+                    return None
+                text = (acc["content"] or "").strip()
+                if text:
+                    break
+                kw = {k: v for k, v in kw.items() if k != "reasoning_effort"}
+                kw["enable_thinking"] = False
+            if not text:
+                self.last_error = (f"jawaban kosong (finish={acc['finish']}, thinking {len(acc['reasoning'])} karakter, "
+                                   f"max_tokens {max_tokens}, prompt ≈{used} token)")
             if text and acc["finish"] == "length":
                 text += "\n\n(Ringkasan ini terpotong karena batas token; detail akhir potongan ada di summary_read/history_read.)"
             return text
@@ -4981,12 +5004,18 @@ def _(TXT, re, threading, time):
             old = chunks[:max(2, len(chunks) // 2)]
             label = f"Memadatkan {len(old)} ringkasan lama menjadi satu era…"
             phase(label)
-            msgs = self.prompt.side(chat_id, ERA_INSTRUCTION.format(texts="\n\n".join(s["text"] for s in old)))
+            instr = ERA_INSTRUCTION.format(texts="\n\n".join(s["text"] for s in old))
+            msgs = self.prompt.side(chat_id, instr)
             c = self.prompt.ctx(chat_id)
             limit = min(32768, maxc // 16)
-            acc = self.llm.complete(msgs, kwargs=self.prompt.kwargs(c), sampling={"temperature": 0.6},
-                                    max_tokens=limit + 12000, tools=tools, stop=self.cancel,
-                                    on_delta=self.progress(phase, label, limit))
+            if self.llm.estimate(msgs) + limit + 12000 > maxc - 1024:
+                msgs = self.prompt.side(chat_id, instr, path=[])  # the summaries alone, without the chat history
+            kw = {k: v for k, v in self.prompt.kwargs(c).items() if k != "reasoning_effort"}
+            if "low" in c["preset"]["thinking"]:
+                kw["reasoning_effort"] = "low"
+            acc = self.llm.complete(msgs, kwargs=kw, sampling={"temperature": 0.6},
+                                    max_tokens=max(2048, min(limit + 12000, maxc - self.llm.estimate(msgs) - 1024)),
+                                    tools=tools, stop=self.cancel, on_delta=self.progress(phase, label, limit))
             text = (acc["content"] or "").strip()
             if not text or acc["finish"] == "stopped" or self.cancel.is_set():
                 return
@@ -6083,6 +6112,7 @@ def _(
             self.bg_busy = False
             self.fact_jobs = []
             self.continuity_jobs = []
+            self.compact_backoff = {}  # chat id -> time before which idle compaction is not retried
             self.backfilled = False
             self.dead = False
             self.importing = False
@@ -7243,12 +7273,22 @@ def _(
                     self.compactor.cancel.clear()
                     if self.busy:
                         return
+                    if time.time() < self.compact_backoff.get(chat_id, 0):
+                        return  # it failed recently: wait instead of retrying every 30 s
                     self.emit("status", "Compaction saat diam…" + note)
                     c = self.prompt.ctx(chat_id)
-                    self.last_used[chat_id] = self.compactor.maybe(chat_id, self.tools.specs(c), self.tools,
-                                                                   lambda m: self.emit("status", m + note), force=False,
-                                                                   threshold=self.IDLE_COMPACT_AT, clear_cancel=False)
-                    self.emit("status", "")
+                    try:
+                        self.last_used[chat_id] = self.compactor.maybe(chat_id, self.tools.specs(c), self.tools,
+                                                                       lambda m: self.emit("status", m + note), force=False,
+                                                                       threshold=self.IDLE_COMPACT_AT, clear_cancel=False)
+                    except Exception as e:
+                        self.compact_backoff[chat_id] = time.time() + 15 * 60
+                        self.store.side_log("compaction_error", {"error": f"{type(e).__name__}: {e}"}, chat_id)
+                        self.emit("toast", {"text": f"Compaction saat diam gagal: {type(e).__name__}: {str(e)[:300]}. "
+                                                    f"Dicoba lagi 15 menit lagi (atau klik Compact).", "kind": "error", "long": True})
+                        return
+                    finally:
+                        self.emit("status", "")
                     self.emit("history", chat_id)
                     # only after a real compaction (new epoch), not every time the loop finds the context full
                     if chat["kind"] in ("rp", "group") and not self.busy and not self.bg_cancel.is_set() \

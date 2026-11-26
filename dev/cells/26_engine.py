@@ -92,6 +92,7 @@ class Engine(EngineView):
         self.bg_busy = False
         self.fact_jobs = []
         self.continuity_jobs = []
+        self.compact_backoff = {}  # chat id -> time before which idle compaction is not retried
         self.backfilled = False
         self.dead = False
         self.importing = False
@@ -1252,12 +1253,22 @@ class Engine(EngineView):
                 self.compactor.cancel.clear()
                 if self.busy:
                     return
+                if time.time() < self.compact_backoff.get(chat_id, 0):
+                    return  # it failed recently: wait instead of retrying every 30 s
                 self.emit("status", "Compaction saat diam…" + note)
                 c = self.prompt.ctx(chat_id)
-                self.last_used[chat_id] = self.compactor.maybe(chat_id, self.tools.specs(c), self.tools,
-                                                               lambda m: self.emit("status", m + note), force=False,
-                                                               threshold=self.IDLE_COMPACT_AT, clear_cancel=False)
-                self.emit("status", "")
+                try:
+                    self.last_used[chat_id] = self.compactor.maybe(chat_id, self.tools.specs(c), self.tools,
+                                                                   lambda m: self.emit("status", m + note), force=False,
+                                                                   threshold=self.IDLE_COMPACT_AT, clear_cancel=False)
+                except Exception as e:
+                    self.compact_backoff[chat_id] = time.time() + 15 * 60
+                    self.store.side_log("compaction_error", {"error": f"{type(e).__name__}: {e}"}, chat_id)
+                    self.emit("toast", {"text": f"Compaction saat diam gagal: {type(e).__name__}: {str(e)[:300]}. "
+                                                f"Dicoba lagi 15 menit lagi (atau klik Compact).", "kind": "error", "long": True})
+                    return
+                finally:
+                    self.emit("status", "")
                 self.emit("history", chat_id)
                 # only after a real compaction (new epoch), not every time the loop finds the context full
                 if chat["kind"] in ("rp", "group") and not self.busy and not self.bg_cancel.is_set() \
