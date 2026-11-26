@@ -92,6 +92,7 @@ class World:
         stats = {k: d["start"] for k, d in defs.items()}
         status = {}
         changes = {}
+        seen_at = {}  # subject -> field -> world time it was last set
 
         def clamp(k, v):
             d = defs.get(k)
@@ -120,6 +121,7 @@ class World:
                 changes[e["field"]] = {"delta": stats[e["field"]] - before, "reason": e["reason"], "message_id": e["message_id"]}
             else:
                 cur = status.setdefault(e["subject"], {})
+                seen_at.setdefault(e["subject"], {})[e["field"]] = now
                 items = val if isinstance(val, list) else [val]
                 old = cur.get(e["field"])
                 old = old if isinstance(old, list) else ([] if old in (None, "") else [old])
@@ -135,7 +137,7 @@ class World:
             turn = self.store.one(f"SELECT COUNT(*) AS n FROM messages WHERE id IN ({ids}) AND role = 'user' AND ooc = 0")["n"]
         return {"time": now, "time_text": self.fmt_time(now), "turn": turn,
                 "stats": [{**defs[k], "value": round(v, 1), "change": changes.get(k)} for k, v in stats.items()],
-                "status": status}
+                "status": status, "seen_at": seen_at}
 
     def add_event(self, chat_id, message_id, subject, field, value, op="set", reason=""):
         return self.store.x("INSERT INTO status_events (chat_id, message_id, subject, field, op, value, reason, created) "
@@ -263,6 +265,67 @@ class World:
         r = self.store.one("SELECT MAX(id) AS m FROM world_events WHERE chat_id = ?", (chat_id,))
         return (r or {}).get("m") or 0
 
+    # ---------- schedules and travel ----------
+
+    SCHEDULE_STALE_HOURS = 4
+
+    @staticmethod
+    def _hour_in(spec, hour):
+        """'8', '08-12', '22-06', '08:00-12:30' -> whether hour falls inside (end exclusive, wraps at midnight)."""
+        nums = [int(x) for x in re.findall(r"(\d{1,2})(?::\d{2})?", str(spec or ""))]
+        if not nums:
+            return False
+        a, b = (nums[0], nums[1]) if len(nums) > 1 else (nums[0], nums[0] + 1)
+        return a <= hour < b if a < b else (hour >= a or hour < b)
+
+    def with_schedule(self, st, cards):
+        """Status with locations from the characters' schedules where nobody has seen them for a few hours
+        (or ever). Those get location_from = 'jadwal'."""
+        out = {k: dict(v) for k, v in st["status"].items()}
+        now = st["time"]
+        for ch in (cards or {}).get("character", []):
+            rows = Cards.table_rows(ch["data"].get("schedule") or [], ["jam", "lokasi", "kegiatan"])
+            if not rows:
+                continue
+            seen = (st.get("seen_at") or {}).get(ch["name"], {}).get("location")
+            if seen and (now - seen).total_seconds() < self.SCHEDULE_STALE_HOURS * 3600:
+                continue
+            row = next((r for r in rows if self._hour_in(r[0], now.hour)), None)
+            if row and row[1]:
+                cur = out.setdefault(ch["name"], {})
+                cur.update(location=row[1], location_from="jadwal")
+                if row[2]:
+                    cur["activity"] = row[2]
+        return out
+
+    @staticmethod
+    def travel_minutes(cards, a, b):
+        """Minutes between two places from the world card, either direction; None if unknown."""
+        norm = lambda s: re.sub(r"\s+", " ", str(s or "").strip().lower())
+        a, b = norm(a), norm(b)
+        if not a or not b or a == b:
+            return None
+        rows = Cards.table_rows(((cards.get("world") or {}).get("data") or {}).get("locations") or [], ["dari", "ke", "menit"])
+        for r in rows:
+            x, y = norm(r[0]), norm(r[1])
+            if {x, y} == {a, b} or (x in a and y in b) or (x in b and y in a):
+                try:
+                    return int(float(str(r[2]).replace(",", ".")))
+                except ValueError:
+                    return None
+        return None
+
+    def travel_from(self, cards, here):
+        rows = Cards.table_rows(((cards.get("world") or {}).get("data") or {}).get("locations") or [], ["dari", "ke", "menit"])
+        norm = lambda s: re.sub(r"\s+", " ", str(s or "").strip().lower())
+        out = []
+        for r in rows:
+            if norm(r[0]) == norm(here):
+                out.append((r[1], r[2]))
+            elif norm(r[1]) == norm(here):
+                out.append((r[0], r[2]))
+        return out
+
     def mark_shown(self, ids, message_id):
         """Remember which reply told the player: a reroll on another branch still gets the news."""
         if ids:
@@ -335,4 +398,46 @@ class Threads:
 
 
 THREADS = Threads(STORE)
+
+
+class Relations:
+    """How characters feel about each other, as a running score (-100..100) with the reason for every change,
+    on the active branch. 'player' is the player's character."""
+
+    def __init__(self, store):
+        self.store = store
+
+    def change(self, chat_id, message_id, a, b, delta, reason="", world_time=""):
+        delta = max(-20.0, min(20.0, float(delta)))
+        return self.store.x("INSERT INTO relations_log (chat_id, message_id, a, b, delta, reason, world_time, created) "
+                            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (chat_id, message_id, a, b, delta, (reason or "")[:300],
+                                                                str(world_time or ""), time.time()))
+
+    def log(self, chat_id):
+        chats = self.store.lineage(chat_id)
+        if not chats:
+            return []
+        vis = self.store.visible_ids(chat_id)
+        rows = self.store.q(f"SELECT * FROM relations_log WHERE chat_id IN ({','.join('?' * len(chats))}) ORDER BY id",
+                            list(chats))
+        return [r for r in rows if not r["message_id"] or r["message_id"] in vis]
+
+    def scores(self, chat_id):
+        """{(a, b): {"score", "last"}}: a's feeling toward b, with the latest reason."""
+        out = {}
+        for r in self.log(chat_id):
+            cur = out.setdefault((r["a"], r["b"]), {"score": 0.0, "last": ""})
+            cur["score"] = max(-100.0, min(100.0, cur["score"] + r["delta"]))
+            cur["last"] = r["reason"]
+        return out
+
+    @staticmethod
+    def word(score):
+        for limit, w in ((-60, "benci"), (-25, "tidak suka"), (-5, "dingin"), (5, "netral"), (25, "ramah"), (60, "dekat")):
+            if score < limit:
+                return w
+        return "sangat dekat"
+
+
+RELATIONS = Relations(STORE)
 WORLD = World(STORE, CARDS, STORIES)

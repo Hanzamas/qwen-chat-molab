@@ -103,8 +103,10 @@ class EngineView:
                 "stats": [{"key": s["key"], "label": s["label"], "value": s["value"], "min": s["min"], "max": s["max"],
                            "change": s["change"]} for s in st["stats"]],
                 "status": {k: v for k, v in player.items() if k != "location"},
-                "characters": self._observable(st["status"], player.get("location")),
+                "characters": self._observable(self.world.with_schedule(st, c["cards"]), player.get("location")),
                 "gm_view": bool(chat["settings"].get("gm_view")),
+                "relations": [{"who": a, "score": v["score"], "word": Relations.word(v["score"]), "last": v["last"]}
+                              for (a, b), v in RELATIONS.scores(chat_id).items() if b == "player"],
                 "characters_gm": {k: v for k, v in st["status"].items() if k != "player"} if chat["settings"].get("gm_view") else {},
                 "weather": wthr["text"] if wthr else "", "events": [{"id": e["id"], "time": e["world_time"], "text": e["text"],
                                                                      "new": not e["shown"]} for e in events],

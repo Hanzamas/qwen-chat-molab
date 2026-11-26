@@ -536,6 +536,26 @@ class ChatApp:
         KNOW.forget(int(kid))
         self.c_knowledge(holder)
 
+    # card proposals
+    def c_proposals(self):
+        if self._cur():
+            self.w.aux = {"n": time.time(), "kind": "proposals", "data": self.engine.proposals(self._cur())}
+
+    def c_proposals_make(self):
+        cid = self._cur()
+
+        def job():
+            self.engine.propose_cards(cid)
+            self.c_proposals()
+        self.engine.run(job)
+
+    def c_proposal(self, pid, accept):
+        self.engine.decide_proposal(self._cur(), int(pid), bool(accept))
+        self.c_proposals()
+        chat = STORE.chat(self._cur())
+        if chat:
+            self.w.story = self.story_info(chat)
+
     # story threads
     def c_threads(self):
         cid = self._cur()

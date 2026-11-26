@@ -183,7 +183,8 @@ function render({ model, el }) {
     sp.innerHTML = `<div class="qr-sp-head">${icon("clock")}<b>${esc(p.time)}</b><span>·</span>${icon("map")}<span>${esc(p.location || "-")}</span>
         <span>·</span><span>Giliran ${p.turn}</span>${p.story ? `<span class="qr-muted">· ${esc(p.story)}</span>` : ""}</div>
       ${p.stats && p.stats.length ? `<div class="qr-stats">${p.stats.map(bar).join("")}</div>` : ""}
-      ${status ? `<div class="qr-tags">${status}</div>` : ""}${npcHTML}`;
+      ${status ? `<div class="qr-tags">${status}</div>` : ""}
+      ${(p.relations || []).length ? `<div class="qr-tags">${icon("users")}${p.relations.map((r) => `<span class="qr-tag" title="${esc(r.last)}">${esc(r.who)}: ${esc(r.word)} (${r.score > 0 ? "+" : ""}${Math.round(r.score)})</span>`).join("")}</div>` : ""}${npcHTML}`;
     const open = state.open.has("world");
     wp.innerHTML = `<button class="qr-world-head" data-act="toggle-world">${icon("globe")}<b>Dunia</b>
         <span class="qr-muted">${esc(p.weather || "")}</span>${(p.events || []).some((e) => e.new) ? '<i class="qr-dot ok"></i>' : ""}${icon(open ? "down" : "right")}</button>
@@ -535,6 +536,14 @@ function render({ model, el }) {
       <textarea data-system rows="5" placeholder="Biasanya kosong; prompt dirakit dari kartu.">${esc(c.system || "")}</textarea>
       <button class="qr-btn qr-sm" data-act="save-system">Simpan</button></details>`;
   }
+  function propsHTML() {
+    const ps = state.props;
+    if (!ps) { send("proposals"); return '<div class="qr-muted">Memuat…</div>'; }
+    return ps.map((p) => `<div class="qr-memrow" data-pid="${p.id}"><span class="qr-badge">${esc(p.card_name)} · ${esc(p.field)}</span>
+      <span>${esc(typeof p.value === "string" ? p.value : JSON.stringify(p.value))}<br><span class="qr-muted">${esc(p.reason)}</span></span>
+      ${p.status === "menunggu" ? `<button class="qr-btn qr-sm qr-primary" data-act="prop-yes">Terima</button><button class="qr-btn qr-sm" data-act="prop-no">Tolak</button>`
+        : `<span class="qr-muted">${esc(p.status)}</span>`}</div>`).join("") || '<div class="qr-muted">Belum ada usulan.</div>';
+  }
   function threadsHTML() {
     const t = state.threads;
     if (!t) { send("threads"); return '<div class="qr-muted">Memuat…</div>'; }
@@ -580,6 +589,8 @@ function render({ model, el }) {
         <button class="qr-btn qr-sm" data-act="canon-save">Simpan</button></div>`).join("")}
         <div class="qr-canon" data-sec=""><input class="qr-canon-new" placeholder="Bagian baru, misalnya: Alur terbuka"><textarea rows="2"></textarea><button class="qr-btn qr-sm" data-act="canon-save">${icon("plus")}Tambah</button></div></section>
       <section><h4>Benang cerita</h4><div class="qr-threads">${threadsHTML()}</div></section>
+      <section><h4>Usulan perubahan kartu</h4><div class="qr-help">Model mengusulkan perubahan kartu tokoh dari perkembangan cerita (otomatis setelah compaction). Kamu yang memutuskan.</div>
+        <div class="qr-props">${propsHTML()}</div><button class="qr-btn qr-sm" data-act="props-make">${icon("sparkles")}Minta usulan sekarang</button></section>
       <section><h4>Ingatan tokoh</h4><div class="qr-help">Yang diketahui atau diyakini tiap tokoh di chat ini (cabang aktif). Tokoh hanya bertindak berdasarkan ini.</div>
         <div class="qr-know">${knowHTML()}</div></section>
       <section><h4>Jangan pernah lupa</h4><textarea class="qr-nf" rows="4" placeholder="Satu fakta per baris">${esc((st.never_forget || []).join("\n"))}</textarea>
@@ -881,6 +892,8 @@ function render({ model, el }) {
       case "attach-card": { const cid = dbody.querySelector(".qr-attach-card").value; if (cid) send("story_attach", { card_id: Number(cid), role: dbody.querySelector(".qr-attach-role").value }); break; }
       case "detach": send("story_detach", { card_id: id, role: btn.dataset.role }); break;
       case "canon-save": { const box = btn.closest(".qr-canon"); const sec = box.dataset.sec || box.querySelector(".qr-canon-new").value.trim(); if (sec) send("canon", { section: sec, text: box.querySelector("textarea").value }); break; }
+      case "props-make": send("proposals_make"); toast("Menyusun usulan…"); break;
+      case "prop-yes": case "prop-no": send("proposal", { pid: Number(btn.closest("[data-pid]").dataset.pid), accept: act === "prop-yes" }); break;
       case "thread-add": { const box = btn.closest(".qr-threads"), title = box.querySelector(".qr-thread-title").value.trim();
         if (title) send("thread_add", { kind: box.querySelector(".qr-thread-kind").value, title, due: box.querySelector(".qr-thread-due").value.trim() }); break; }
       case "thread-close": send("thread_close", { tid: Number(btn.closest("[data-tid]").dataset.tid), status: btn.dataset.status }); break;
@@ -927,7 +940,12 @@ function render({ model, el }) {
     const a = model.get("aux") || {};
     if (!a.kind) return;
     const d = a.data;
-    if (a.kind === "threads") {
+    if (a.kind === "proposals") {
+      state.props = d;
+      const box = dbody.querySelector(".qr-props");
+      if (state.tab === "story" && box) box.innerHTML = propsHTML();
+    }
+    else if (a.kind === "threads") {
       state.threads = d;
       const box = dbody.querySelector(".qr-threads"), f = rootActive();
       if (state.tab === "story" && box && !(f && box.contains(f) && f.tagName === "INPUT")) box.innerHTML = threadsHTML();
@@ -998,7 +1016,7 @@ function render({ model, el }) {
     const c = get("chat");
     const learn = !!((c.settings || {}).learn);
     if (learn !== state.learn) { state.learn = learn; el.classList.toggle("learn", learn); els.clear(); list.innerHTML = ""; }
-    if (state.lastChat !== c.id) { state.lastChat = c.id; state.studioCard = null; state.imageIntent = false; state.know = null; state.threads = null; els.clear(); list.innerHTML = ""; fol.jump(); }
+    if (state.lastChat !== c.id) { state.lastChat = c.id; state.studioCard = null; state.imageIntent = false; state.know = null; state.threads = null; state.props = null; els.clear(); list.innerHTML = ""; fol.jump(); }
     renderTop(); renderChats(); renderStudio(); renderDrawer(); renderHistory();
   };
   const onCard = () => {
@@ -1041,6 +1059,7 @@ function render({ model, el }) {
       if (state.tab === "memory") send("memory", { q: (state.memory || {}).q || "" });
       if (state.tab === "story" && state.know) send("knowledge", { holder: state.know.holder });
       if (state.tab === "story" && state.threads) send("threads");
+      if (state.tab === "story" && state.props) send("proposals");
     },
     "change:aux": onAux, "change:notice": onNotice, "change:export": onExport, "change:compose": onCompose, "change:boot": renderDrawer,
   };

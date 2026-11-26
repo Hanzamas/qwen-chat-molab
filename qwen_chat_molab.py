@@ -1118,6 +1118,15 @@ def _(CFG, Path, json, os, sqlite3, threading, time):
         note TEXT NOT NULL DEFAULT '', created REAL NOT NULL
     );
     CREATE INDEX IF NOT EXISTS thread_events_thread ON thread_events (thread_id);
+    CREATE TABLE IF NOT EXISTS relations_log (
+        id INTEGER PRIMARY KEY, chat_id INTEGER NOT NULL, message_id INTEGER, a TEXT NOT NULL, b TEXT NOT NULL,
+        delta REAL NOT NULL, reason TEXT NOT NULL DEFAULT '', world_time TEXT NOT NULL DEFAULT '', created REAL NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS relations_chat ON relations_log (chat_id);
+    CREATE TABLE IF NOT EXISTS card_proposals (
+        id INTEGER PRIMARY KEY, chat_id INTEGER, card_id INTEGER NOT NULL, field TEXT NOT NULL, value TEXT NOT NULL,
+        reason TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'menunggu', created REAL NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS knowledge (
         id INTEGER PRIMARY KEY, chat_id INTEGER NOT NULL, message_id INTEGER, holder TEXT NOT NULL, text TEXT NOT NULL,
         kind TEXT NOT NULL DEFAULT 'fakta', source TEXT NOT NULL DEFAULT 'lihat sendiri', source_who TEXT NOT NULL DEFAULT '',
@@ -2864,6 +2873,7 @@ def _(
             stats = {k: d["start"] for k, d in defs.items()}
             status = {}
             changes = {}
+            seen_at = {}  # subject -> field -> world time it was last set
 
             def clamp(k, v):
                 d = defs.get(k)
@@ -2892,6 +2902,7 @@ def _(
                     changes[e["field"]] = {"delta": stats[e["field"]] - before, "reason": e["reason"], "message_id": e["message_id"]}
                 else:
                     cur = status.setdefault(e["subject"], {})
+                    seen_at.setdefault(e["subject"], {})[e["field"]] = now
                     items = val if isinstance(val, list) else [val]
                     old = cur.get(e["field"])
                     old = old if isinstance(old, list) else ([] if old in (None, "") else [old])
@@ -2907,7 +2918,7 @@ def _(
                 turn = self.store.one(f"SELECT COUNT(*) AS n FROM messages WHERE id IN ({ids}) AND role = 'user' AND ooc = 0")["n"]
             return {"time": now, "time_text": self.fmt_time(now), "turn": turn,
                     "stats": [{**defs[k], "value": round(v, 1), "change": changes.get(k)} for k, v in stats.items()],
-                    "status": status}
+                    "status": status, "seen_at": seen_at}
 
         def add_event(self, chat_id, message_id, subject, field, value, op="set", reason=""):
             return self.store.x("INSERT INTO status_events (chat_id, message_id, subject, field, op, value, reason, created) "
@@ -3035,6 +3046,67 @@ def _(
             r = self.store.one("SELECT MAX(id) AS m FROM world_events WHERE chat_id = ?", (chat_id,))
             return (r or {}).get("m") or 0
 
+        # ---------- schedules and travel ----------
+
+        SCHEDULE_STALE_HOURS = 4
+
+        @staticmethod
+        def _hour_in(spec, hour):
+            """'8', '08-12', '22-06', '08:00-12:30' -> whether hour falls inside (end exclusive, wraps at midnight)."""
+            nums = [int(x) for x in re.findall(r"(\d{1,2})(?::\d{2})?", str(spec or ""))]
+            if not nums:
+                return False
+            a, b = (nums[0], nums[1]) if len(nums) > 1 else (nums[0], nums[0] + 1)
+            return a <= hour < b if a < b else (hour >= a or hour < b)
+
+        def with_schedule(self, st, cards):
+            """Status with locations from the characters' schedules where nobody has seen them for a few hours
+            (or ever). Those get location_from = 'jadwal'."""
+            out = {k: dict(v) for k, v in st["status"].items()}
+            now = st["time"]
+            for ch in (cards or {}).get("character", []):
+                rows = Cards.table_rows(ch["data"].get("schedule") or [], ["jam", "lokasi", "kegiatan"])
+                if not rows:
+                    continue
+                seen = (st.get("seen_at") or {}).get(ch["name"], {}).get("location")
+                if seen and (now - seen).total_seconds() < self.SCHEDULE_STALE_HOURS * 3600:
+                    continue
+                row = next((r for r in rows if self._hour_in(r[0], now.hour)), None)
+                if row and row[1]:
+                    cur = out.setdefault(ch["name"], {})
+                    cur.update(location=row[1], location_from="jadwal")
+                    if row[2]:
+                        cur["activity"] = row[2]
+            return out
+
+        @staticmethod
+        def travel_minutes(cards, a, b):
+            """Minutes between two places from the world card, either direction; None if unknown."""
+            norm = lambda s: re.sub(r"\s+", " ", str(s or "").strip().lower())
+            a, b = norm(a), norm(b)
+            if not a or not b or a == b:
+                return None
+            rows = Cards.table_rows(((cards.get("world") or {}).get("data") or {}).get("locations") or [], ["dari", "ke", "menit"])
+            for r in rows:
+                x, y = norm(r[0]), norm(r[1])
+                if {x, y} == {a, b} or (x in a and y in b) or (x in b and y in a):
+                    try:
+                        return int(float(str(r[2]).replace(",", ".")))
+                    except ValueError:
+                        return None
+            return None
+
+        def travel_from(self, cards, here):
+            rows = Cards.table_rows(((cards.get("world") or {}).get("data") or {}).get("locations") or [], ["dari", "ke", "menit"])
+            norm = lambda s: re.sub(r"\s+", " ", str(s or "").strip().lower())
+            out = []
+            for r in rows:
+                if norm(r[0]) == norm(here):
+                    out.append((r[1], r[2]))
+                elif norm(r[1]) == norm(here):
+                    out.append((r[0], r[2]))
+            return out
+
         def mark_shown(self, ids, message_id):
             """Remember which reply told the player: a reroll on another branch still gets the news."""
             if ids:
@@ -3107,8 +3179,50 @@ def _(
 
 
     THREADS = Threads(STORE)
+
+
+    class Relations:
+        """How characters feel about each other, as a running score (-100..100) with the reason for every change,
+        on the active branch. 'player' is the player's character."""
+
+        def __init__(self, store):
+            self.store = store
+
+        def change(self, chat_id, message_id, a, b, delta, reason="", world_time=""):
+            delta = max(-20.0, min(20.0, float(delta)))
+            return self.store.x("INSERT INTO relations_log (chat_id, message_id, a, b, delta, reason, world_time, created) "
+                                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (chat_id, message_id, a, b, delta, (reason or "")[:300],
+                                                                    str(world_time or ""), time.time()))
+
+        def log(self, chat_id):
+            chats = self.store.lineage(chat_id)
+            if not chats:
+                return []
+            vis = self.store.visible_ids(chat_id)
+            rows = self.store.q(f"SELECT * FROM relations_log WHERE chat_id IN ({','.join('?' * len(chats))}) ORDER BY id",
+                                list(chats))
+            return [r for r in rows if not r["message_id"] or r["message_id"] in vis]
+
+        def scores(self, chat_id):
+            """{(a, b): {"score", "last"}}: a's feeling toward b, with the latest reason."""
+            out = {}
+            for r in self.log(chat_id):
+                cur = out.setdefault((r["a"], r["b"]), {"score": 0.0, "last": ""})
+                cur["score"] = max(-100.0, min(100.0, cur["score"] + r["delta"]))
+                cur["last"] = r["reason"]
+            return out
+
+        @staticmethod
+        def word(score):
+            for limit, w in ((-60, "benci"), (-25, "tidak suka"), (-5, "dingin"), (5, "netral"), (25, "ramah"), (60, "dekat")):
+                if score < limit:
+                    return w
+            return "sangat dekat"
+
+
+    RELATIONS = Relations(STORE)
     WORLD = World(STORE, CARDS, STORIES)
-    return THREADS, Threads, WORLD, World
+    return RELATIONS, Relations, THREADS, Threads, WORLD, World
 
 
 @app.cell(hide_code=True)
@@ -4055,6 +4169,8 @@ def _(
     LLM_CLIENT,
     MEM,
     PRESETS,
+    RELATIONS,
+    Relations,
     STORE,
     STORIES,
     STUDIO_EPHEMERAL,
@@ -4087,6 +4203,7 @@ def _(
     - Tiap tokoh (termasuk tokoh pemain) hanya tahu isi ingatannya di catatan sistem. Memory, buku cerita, dan lore adalah
       pengetahuan narator; jangan biarkan tokoh memakainya kalau tidak ada di ingatannya. Ingatan bertanda KELIRU dipercaya
       tokoh itu walaupun salah. Catat yang baru diketahui tokoh dengan knowledge_add atau tell.
+    - Hubungan: kalau kejadian mengubah perasaan tokoh terhadap tokoh lain atau pemain, catat dengan relationship.
     - Benang cerita: catat janji, janji temu (dengan tenggat), misteri, petunjuk, utang, dendam, dan rencana dengan thread_open;
       tutup dengan thread_close. Benang yang lewat tenggat harus punya akibat di dunia (orang menunggu, kesal, pergi).
     - Pesan pemain yang diawali [OOC] adalah percakapan di luar cerita: jawab di luar cerita, singkat, tanpa memerankan tokoh.
@@ -4350,10 +4467,20 @@ def _(
             if mine:
                 persona = (c["cards"].get("persona") or {}).get("name") or "pemain"
                 lines.append(f"Ingatan tokoh pemain ({persona}), yang ia tahu atau yakini:\n" + "\n".join(KNOW.line(r) for r in mine))
-            for ch in self.present_characters(c, recent, st["status"]):
+            where = self.world.with_schedule(st, c["cards"])
+            here = (st["status"].get("player") or {}).get("location")
+            trips = self.world.travel_from(c["cards"], here) if here else []
+            if trips:
+                lines.append(f"Waktu tempuh dari {here}: " + ", ".join(f"{p} {m} menit" for p, m in trips[:8])
+                             + " (pakai world_advance sesuai perjalanan)")
+            for ch in self.present_characters(c, recent, where):
                 bits = []
-                if st["status"].get(ch["name"]):
-                    bits.append("status " + json.dumps(st["status"][ch["name"]], ensure_ascii=False))
+                if where.get(ch["name"]):
+                    bits.append("status " + json.dumps(where[ch["name"]], ensure_ascii=False))
+                rel = [(b, v) for (a, b), v in RELATIONS.scores(chat_id).items() if a == ch["name"]]
+                if rel:
+                    bits.append("perasaan: " + "; ".join(f"ke {'pemain' if b == 'player' else b} {Relations.word(v['score'])} "
+                                                         f"({v['score']:+.0f}, terakhir: {v['last']})" for b, v in rel[:6]))
                 heads = KNOW.relevant(chat_id, ch["name"], recent, limit=6)
                 if heads:
                     bits.append("ingatan (yang ia tahu atau yakini):\n" + "\n".join(KNOW.line(r) for r in heads))
@@ -4746,6 +4873,8 @@ def _(
     Knowledge,
     MEM,
     Memory,
+    RELATIONS,
+    Relations,
     STORE,
     STORIES,
     THREADS,
@@ -4817,6 +4946,9 @@ def _(
              "who": {"type": "array", "items": _S}, "due": _S}, ["kind", "title"]),
         _fn("thread_close", "Close a story thread when it is resolved, failed or dropped.",
             {"id": _I, "status": {"type": "string", "enum": list(Threads.CLOSED)}, "note": _S}, ["id", "status"]),
+        _fn("relationship", "Change how a character feels about another (b: a name or 'player'). delta -20..20 with the reason "
+            "(what happened). Small, earned changes; big swings only for big events.",
+            {"a": _S, "b": _S, "delta": _N, "reason": _S}, ["a", "b", "delta", "reason"]),
         _fn("tell", "A character tells others something (true or a lie). It lands in the listeners' memory.",
             {"from": _S, "to": {"type": "array", "items": _S}, "text": _S, "truthful": _B}, ["from", "to", "text"]),
         _fn("canon_set", "Write a section of the story book (what is true now in this story). Empty text removes it.",
@@ -5128,6 +5260,15 @@ def _(
                            st["time_text"])
             return {"saved": ids, "who": holders}
 
+        def t_relationship(self, chat_id, mid, a, b, delta, reason=""):
+            ha, hb = self._holder(chat_id, a), self._holder(chat_id, b)
+            if not ha or not hb or ha == hb:
+                return {"error": "a dan b harus dua tokoh berbeda"}
+            st = self.world.state(chat_id, self.store.path_ids(chat_id))
+            RELATIONS.change(chat_id, mid, ha, hb, delta, reason, st["time_text"])
+            s = RELATIONS.scores(chat_id).get((ha, hb), {"score": 0})["score"]
+            return {"a": ha, "b": hb, "score": s, "feeling": Relations.word(s)}
+
         def t_thread_open(self, chat_id, mid, kind, title, text="", who=None, due=""):
             st = self.world.state(chat_id, self.store.path_ids(chat_id))
             tid = THREADS.open(chat_id, mid, kind, title, text, self._holders(chat_id, who or []) or (who or ""), due, st["time_text"])
@@ -5401,7 +5542,7 @@ def _(CFG, base64, io, subprocess, sys, zipfile):
 
 
 @app.cell(hide_code=True)
-def _(TXT, hashlib, io, json, re, time, zipfile):
+def _(RELATIONS, Relations, TXT, hashlib, io, json, re, time, zipfile):
     class EngineView:
         """Read-only views for the UI: history items, panels, branches, prompt inspector, story export."""
 
@@ -5507,8 +5648,10 @@ def _(TXT, hashlib, io, json, re, time, zipfile):
                     "stats": [{"key": s["key"], "label": s["label"], "value": s["value"], "min": s["min"], "max": s["max"],
                                "change": s["change"]} for s in st["stats"]],
                     "status": {k: v for k, v in player.items() if k != "location"},
-                    "characters": self._observable(st["status"], player.get("location")),
+                    "characters": self._observable(self.world.with_schedule(st, c["cards"]), player.get("location")),
                     "gm_view": bool(chat["settings"].get("gm_view")),
+                    "relations": [{"who": a, "score": v["score"], "word": Relations.word(v["score"]), "last": v["last"]}
+                                  for (a, b), v in RELATIONS.scores(chat_id).items() if b == "player"],
                     "characters_gm": {k: v for k, v in st["status"].items() if k != "player"} if chat["settings"].get("gm_view") else {},
                     "weather": wthr["text"] if wthr else "", "events": [{"id": e["id"], "time": e["world_time"], "text": e["text"],
                                                                          "new": not e["shown"]} for e in events],
@@ -5678,7 +5821,8 @@ def _(
     Tentukan apa yang dilakukan tokoh lain di luar layar selama itu dan kejadian dunia yang masuk akal (0-4 kejadian,
     sesuai kartu GM; peristiwa garis waktu yang jatuh tempo wajib terjadi). Untuk setiap kejadian panggil world_event dengan
     known_to yang tepat ('player' hanya kalau pemain bisa mengetahuinya). Catat perubahan lokasi/rencana tokoh dengan
-    status_update. Tokoh yang berada di tempat yang sama bisa saling bercerita atau bergosip: catat dengan tell (isinya bisa
+    status_update; luka ringan membaik atau sembuh dan suasana hati mereda seiring waktu (status_update, injuries
+    {{"remove": ...}}). Tokoh yang berada di tempat yang sama bisa saling bercerita atau bergosip: catat dengan tell (isinya bisa
     melenceng atau bohong; truthful=false). Jangan menulis narasi. Setelah selesai jawab "selesai"."""
 
     STATE_CHECK = """Pemeriksa keadaan. Baca narasi jawaban terakhir. Catat HANYA yang terjadi di narasi tetapi belum tercatat
@@ -5688,7 +5832,8 @@ def _(
       keadaan (status_update);
     - apa yang disaksikan atau didengar tokoh yang hadir, termasuk tokoh pemain (knowledge_add), dan apa yang diceritakan
       antar tokoh (tell);
-    - janji, janji temu, utang, atau misteri baru (thread_open), dan benang yang selesai (thread_close).
+    - janji, janji temu, utang, atau misteri baru (thread_open), dan benang yang selesai (thread_close);
+    - perubahan perasaan antar tokoh atau terhadap pemain karena kejadian di narasi (relationship).
     Sudah tercatat di giliran ini:
     {done}
     Jangan mengulang yang sudah tercatat dan jangan menebak hal yang tidak ada di narasi. Kalau tidak ada yang perlu dicatat,
@@ -5704,6 +5849,12 @@ def _(
     {{"issues": [{{"kind": "pengetahuan|lokasi|keadaan|dadu|suara", "who": "nama", "text": "apa yang salah", "fix": "seharusnya"}}]}}
 
     {data}"""
+
+    CARD_PROPOSALS = """Bandingkan kartu tokoh di system prompt dengan perkembangan cerita sejauh ini. Usulkan perubahan kartu
+    untuk hal yang sudah benar-benar berubah dan menetap: hubungan, sifat yang bergeser, penampilan, tujuan, rahasia yang sudah
+    terbongkar, umur. Bukan keadaan sesaat (itu status). Maksimal 6 usulan. Jawab HANYA JSON:
+    {{"proposals": [{{"card": "nama tokoh", "field": "kunci field di skema", "value": "isi baru lengkap", "reason": "kenapa"}}]}}
+    Skema kartu tokoh: {fields}"""
 
     FACTCHECK_CLAIMS = """Periksa jawaban terakhir. Daftarkan klaim fakta {kind} yang spesifik di dalamnya (tanggal, angka, nama
     satuan, senjata, pangkat, tempat, prosedur), bukan hal fiksi cerita. Maksimal 6. Jawab HANYA JSON: {{"claims": ["..."]}}"""
@@ -6344,7 +6495,8 @@ def _(
                         fn = tc.get("function") or {}
                         done_lines.append(f"- {fn.get('name')}: {(fn.get('arguments') or '')[:300]}")
                         advanced = advanced or fn.get("name") == "world_advance"
-            names = {"world_advance", "status_update", "knowledge_add", "tell", "world_event", "thread_open", "thread_close"}
+            names = {"world_advance", "status_update", "knowledge_add", "tell", "world_event", "thread_open", "thread_close",
+                     "relationship"}
             tools = [t for t in self.tools.specs(c) if t["function"]["name"] in names]
             kw = {k: v for k, v in self.prompt.kwargs(c).items() if k != "reasoning_effort"}
             kw["enable_thinking"] = False
@@ -6366,8 +6518,14 @@ def _(
                         advanced = advanced or cl["name"] == "world_advance"
             if not advanced and not self.stop.is_set():
                 minutes = max(2, min(30, round(len(full.split()) / 90)))
-                self.world.advance(chat_id, mid, minutes, "perkiraan dari panjang adegan (world_advance tidak dipanggil)")
-                recorded.append(f"world_advance: perkiraan {minutes} menit")
+                reason = "perkiraan dari panjang adegan (world_advance tidak dipanggil)"
+                before = (self.world.state(chat_id, ids[:start]).get("status", {}).get("player") or {}).get("location")
+                after = (self.world.state(chat_id, self.store.path_ids(chat_id, head=mid)).get("status", {}).get("player") or {}).get("location")
+                trip = self.world.travel_minutes(c["cards"], before, after) if before and after else None
+                if trip:
+                    minutes, reason = trip + max(0, minutes // 2), f"perjalanan {before} → {after} ({trip} menit) dan adegan"
+                self.world.advance(chat_id, mid, minutes, reason)
+                recorded.append(f"world_advance: {reason}, {minutes} menit")
             self.store.side_log("state_check", {"recorded": recorded,
                                                 "transcript": [x for x in msgs if x["role"] in ("assistant", "tool")]}, chat_id, mid)
             return recorded
@@ -6494,6 +6652,61 @@ def _(
                 self.emit("toast", {"text": f"Cek fakta: {len(warnings)} klaim salah." if warnings else "Cek fakta: tidak ada yang salah."})
             return warnings
 
+        # ---------- card change proposals ----------
+
+        def propose_cards(self, chat_id, stop=None):
+            """Ask the model which character cards should change after what happened; you approve each in the Story tab."""
+            c = self.prompt.ctx(chat_id)
+            if c["kind"] not in ("rp", "group") or not c["cards"]["character"]:
+                return []
+            fields = ", ".join(f["key"] for f in self.cards.schema("character")["fields"] if f.get("visibility") != "ui")
+            acc = self.llm.complete(self.prompt.side(chat_id, CARD_PROPOSALS.format(fields=fields)), kwargs=self.prompt.kwargs(c),
+                                    sampling={"temperature": 0.4}, max_tokens=8000, tools=self.tools.specs(c),
+                                    stop=stop or self.stop)
+            if acc["finish"] == "stopped":
+                return []
+            by_name = {}
+            for ch in c["cards"]["character"]:
+                for n in [ch["name"]] + list(ch["data"].get("aliases") or []):
+                    by_name[str(n).lower()] = ch
+            keys = {f["key"] for f in self.cards.schema("character")["fields"]}
+            out = []
+            for p in ((self._json(acc["content"]) or {}).get("proposals") or [])[:6]:
+                if not isinstance(p, dict):
+                    continue
+                ch = by_name.get(str(p.get("card", "")).lower())
+                field = str(p.get("field", ""))
+                if not ch or field not in keys or p.get("value") in (None, ""):
+                    continue
+                pid = self.store.x("INSERT INTO card_proposals (chat_id, card_id, field, value, reason, created) VALUES (?, ?, ?, ?, ?, ?)",
+                                   (chat_id, ch["id"], field, json.dumps(p["value"], ensure_ascii=False), str(p.get("reason", ""))[:500],
+                                    time.time()))
+                out.append(pid)
+            if out:
+                self.emit("toast", {"text": f"{len(out)} usulan perubahan kartu menunggu persetujuanmu (tab Cerita)."})
+            self.store.side_log("card_proposals", {"answer": acc["content"], "saved": out}, chat_id)
+            return out
+
+        def proposals(self, chat_id):
+            rows = self.store.q("SELECT p.*, c.name AS card_name FROM card_proposals p JOIN cards c ON c.id = p.card_id "
+                                "WHERE p.chat_id = ? ORDER BY p.id DESC LIMIT 50", (chat_id,))
+            for r in rows:
+                r["value"] = json.loads(r["value"])
+            return rows
+
+        def decide_proposal(self, chat_id, pid, accept):
+            p = self.store.one("SELECT * FROM card_proposals WHERE id = ? AND status = 'menunggu'", (int(pid),))
+            if not p:
+                return False
+            if accept:
+                self.cards.set_field(p["card_id"], p["field"], json.loads(p["value"]))
+                sid = (self.store.chat(chat_id) or {}).get("story_id")
+                card = self.cards.get(p["card_id"])
+                if sid and card:
+                    self.stories.pending(sid, chat_id, f"Kartu {card['name']} · {p['field']}: {json.loads(p['value'])}"[:600])
+            self.store.x("UPDATE card_proposals SET status = ? WHERE id = ?", ("diterima" if accept else "ditolak", p["id"]))
+            return True
+
         # ---------- continuity ----------
 
         def continuity_data(self, chat_id, mid):
@@ -6504,7 +6717,7 @@ def _(
             ids = [x["id"] for x in path]
             full, _ = self._turn_text(path, mid)
             st = self.world.state(chat_id, ids)
-            status = st["status"]
+            status = self.world.with_schedule(st, c["cards"])
             here = (status.get("player") or {}).get("location") or "?"
             low = full.lower()
             lines = [f"Lokasi pemain: {here}"]
@@ -6801,6 +7014,14 @@ def _(
                                                                    threshold=self.IDLE_COMPACT_AT, clear_cancel=False)
                     self.emit("status", "")
                     self.emit("history", chat_id)
+                    # only after a real compaction (new epoch), not every time the loop finds the context full
+                    if chat["kind"] in ("rp", "group") and not self.busy and not self.bg_cancel.is_set() \
+                            and (self.store.chat(chat_id) or {}).get("epoch") != chat.get("epoch"):
+                        self.emit("status", "Menyusun usulan perubahan kartu…")
+                        try:
+                            self.propose_cards(chat_id, stop=self.bg_cancel)
+                        finally:
+                            self.emit("status", "")
                 if chat["kind"] in ("rp", "group"):
                     c = self.prompt.ctx(chat_id)
                     gm = self.prompt.gm(c)
@@ -7347,7 +7568,8 @@ def _():
         sp.innerHTML = `<div class="qr-sp-head">${icon("clock")}<b>${esc(p.time)}</b><span>·</span>${icon("map")}<span>${esc(p.location || "-")}</span>
             <span>·</span><span>Giliran ${p.turn}</span>${p.story ? `<span class="qr-muted">· ${esc(p.story)}</span>` : ""}</div>
           ${p.stats && p.stats.length ? `<div class="qr-stats">${p.stats.map(bar).join("")}</div>` : ""}
-          ${status ? `<div class="qr-tags">${status}</div>` : ""}${npcHTML}`;
+          ${status ? `<div class="qr-tags">${status}</div>` : ""}
+          ${(p.relations || []).length ? `<div class="qr-tags">${icon("users")}${p.relations.map((r) => `<span class="qr-tag" title="${esc(r.last)}">${esc(r.who)}: ${esc(r.word)} (${r.score > 0 ? "+" : ""}${Math.round(r.score)})</span>`).join("")}</div>` : ""}${npcHTML}`;
         const open = state.open.has("world");
         wp.innerHTML = `<button class="qr-world-head" data-act="toggle-world">${icon("globe")}<b>Dunia</b>
             <span class="qr-muted">${esc(p.weather || "")}</span>${(p.events || []).some((e) => e.new) ? '<i class="qr-dot ok"></i>' : ""}${icon(open ? "down" : "right")}</button>
@@ -7699,6 +7921,14 @@ def _():
           <textarea data-system rows="5" placeholder="Biasanya kosong; prompt dirakit dari kartu.">${esc(c.system || "")}</textarea>
           <button class="qr-btn qr-sm" data-act="save-system">Simpan</button></details>`;
       }
+      function propsHTML() {
+        const ps = state.props;
+        if (!ps) { send("proposals"); return '<div class="qr-muted">Memuat…</div>'; }
+        return ps.map((p) => `<div class="qr-memrow" data-pid="${p.id}"><span class="qr-badge">${esc(p.card_name)} · ${esc(p.field)}</span>
+          <span>${esc(typeof p.value === "string" ? p.value : JSON.stringify(p.value))}<br><span class="qr-muted">${esc(p.reason)}</span></span>
+          ${p.status === "menunggu" ? `<button class="qr-btn qr-sm qr-primary" data-act="prop-yes">Terima</button><button class="qr-btn qr-sm" data-act="prop-no">Tolak</button>`
+            : `<span class="qr-muted">${esc(p.status)}</span>`}</div>`).join("") || '<div class="qr-muted">Belum ada usulan.</div>';
+      }
       function threadsHTML() {
         const t = state.threads;
         if (!t) { send("threads"); return '<div class="qr-muted">Memuat…</div>'; }
@@ -7744,6 +7974,8 @@ def _():
             <button class="qr-btn qr-sm" data-act="canon-save">Simpan</button></div>`).join("")}
             <div class="qr-canon" data-sec=""><input class="qr-canon-new" placeholder="Bagian baru, misalnya: Alur terbuka"><textarea rows="2"></textarea><button class="qr-btn qr-sm" data-act="canon-save">${icon("plus")}Tambah</button></div></section>
           <section><h4>Benang cerita</h4><div class="qr-threads">${threadsHTML()}</div></section>
+          <section><h4>Usulan perubahan kartu</h4><div class="qr-help">Model mengusulkan perubahan kartu tokoh dari perkembangan cerita (otomatis setelah compaction). Kamu yang memutuskan.</div>
+            <div class="qr-props">${propsHTML()}</div><button class="qr-btn qr-sm" data-act="props-make">${icon("sparkles")}Minta usulan sekarang</button></section>
           <section><h4>Ingatan tokoh</h4><div class="qr-help">Yang diketahui atau diyakini tiap tokoh di chat ini (cabang aktif). Tokoh hanya bertindak berdasarkan ini.</div>
             <div class="qr-know">${knowHTML()}</div></section>
           <section><h4>Jangan pernah lupa</h4><textarea class="qr-nf" rows="4" placeholder="Satu fakta per baris">${esc((st.never_forget || []).join("\n"))}</textarea>
@@ -8045,6 +8277,8 @@ def _():
           case "attach-card": { const cid = dbody.querySelector(".qr-attach-card").value; if (cid) send("story_attach", { card_id: Number(cid), role: dbody.querySelector(".qr-attach-role").value }); break; }
           case "detach": send("story_detach", { card_id: id, role: btn.dataset.role }); break;
           case "canon-save": { const box = btn.closest(".qr-canon"); const sec = box.dataset.sec || box.querySelector(".qr-canon-new").value.trim(); if (sec) send("canon", { section: sec, text: box.querySelector("textarea").value }); break; }
+          case "props-make": send("proposals_make"); toast("Menyusun usulan…"); break;
+          case "prop-yes": case "prop-no": send("proposal", { pid: Number(btn.closest("[data-pid]").dataset.pid), accept: act === "prop-yes" }); break;
           case "thread-add": { const box = btn.closest(".qr-threads"), title = box.querySelector(".qr-thread-title").value.trim();
             if (title) send("thread_add", { kind: box.querySelector(".qr-thread-kind").value, title, due: box.querySelector(".qr-thread-due").value.trim() }); break; }
           case "thread-close": send("thread_close", { tid: Number(btn.closest("[data-tid]").dataset.tid), status: btn.dataset.status }); break;
@@ -8091,7 +8325,12 @@ def _():
         const a = model.get("aux") || {};
         if (!a.kind) return;
         const d = a.data;
-        if (a.kind === "threads") {
+        if (a.kind === "proposals") {
+          state.props = d;
+          const box = dbody.querySelector(".qr-props");
+          if (state.tab === "story" && box) box.innerHTML = propsHTML();
+        }
+        else if (a.kind === "threads") {
           state.threads = d;
           const box = dbody.querySelector(".qr-threads"), f = rootActive();
           if (state.tab === "story" && box && !(f && box.contains(f) && f.tagName === "INPUT")) box.innerHTML = threadsHTML();
@@ -8162,7 +8401,7 @@ def _():
         const c = get("chat");
         const learn = !!((c.settings || {}).learn);
         if (learn !== state.learn) { state.learn = learn; el.classList.toggle("learn", learn); els.clear(); list.innerHTML = ""; }
-        if (state.lastChat !== c.id) { state.lastChat = c.id; state.studioCard = null; state.imageIntent = false; state.know = null; state.threads = null; els.clear(); list.innerHTML = ""; fol.jump(); }
+        if (state.lastChat !== c.id) { state.lastChat = c.id; state.studioCard = null; state.imageIntent = false; state.know = null; state.threads = null; state.props = null; els.clear(); list.innerHTML = ""; fol.jump(); }
         renderTop(); renderChats(); renderStudio(); renderDrawer(); renderHistory();
       };
       const onCard = () => {
@@ -8205,6 +8444,7 @@ def _():
           if (state.tab === "memory") send("memory", { q: (state.memory || {}).q || "" });
           if (state.tab === "story" && state.know) send("knowledge", { holder: state.know.holder });
           if (state.tab === "story" && state.threads) send("threads");
+          if (state.tab === "story" && state.props) send("proposals");
         },
         "change:aux": onAux, "change:notice": onNotice, "change:export": onExport, "change:compose": onCompose, "change:boot": renderDrawer,
       };
@@ -9111,6 +9351,26 @@ def _(
         def c_knowledge_delete(self, kid, holder):
             KNOW.forget(int(kid))
             self.c_knowledge(holder)
+
+        # card proposals
+        def c_proposals(self):
+            if self._cur():
+                self.w.aux = {"n": time.time(), "kind": "proposals", "data": self.engine.proposals(self._cur())}
+
+        def c_proposals_make(self):
+            cid = self._cur()
+
+            def job():
+                self.engine.propose_cards(cid)
+                self.c_proposals()
+            self.engine.run(job)
+
+        def c_proposal(self, pid, accept):
+            self.engine.decide_proposal(self._cur(), int(pid), bool(accept))
+            self.c_proposals()
+            chat = STORE.chat(self._cur())
+            if chat:
+                self.w.story = self.story_info(chat)
 
         # story threads
         def c_threads(self):

@@ -11,7 +11,8 @@ TICK_INSTRUCTION = """Waktu dunia maju {span} (dari {t0} ke {t1}). {why}
 Tentukan apa yang dilakukan tokoh lain di luar layar selama itu dan kejadian dunia yang masuk akal (0-4 kejadian,
 sesuai kartu GM; peristiwa garis waktu yang jatuh tempo wajib terjadi). Untuk setiap kejadian panggil world_event dengan
 known_to yang tepat ('player' hanya kalau pemain bisa mengetahuinya). Catat perubahan lokasi/rencana tokoh dengan
-status_update. Tokoh yang berada di tempat yang sama bisa saling bercerita atau bergosip: catat dengan tell (isinya bisa
+status_update; luka ringan membaik atau sembuh dan suasana hati mereda seiring waktu (status_update, injuries
+{{"remove": ...}}). Tokoh yang berada di tempat yang sama bisa saling bercerita atau bergosip: catat dengan tell (isinya bisa
 melenceng atau bohong; truthful=false). Jangan menulis narasi. Setelah selesai jawab "selesai"."""
 
 STATE_CHECK = """Pemeriksa keadaan. Baca narasi jawaban terakhir. Catat HANYA yang terjadi di narasi tetapi belum tercatat
@@ -21,7 +22,8 @@ di giliran ini:
   keadaan (status_update);
 - apa yang disaksikan atau didengar tokoh yang hadir, termasuk tokoh pemain (knowledge_add), dan apa yang diceritakan
   antar tokoh (tell);
-- janji, janji temu, utang, atau misteri baru (thread_open), dan benang yang selesai (thread_close).
+- janji, janji temu, utang, atau misteri baru (thread_open), dan benang yang selesai (thread_close);
+- perubahan perasaan antar tokoh atau terhadap pemain karena kejadian di narasi (relationship).
 Sudah tercatat di giliran ini:
 {done}
 Jangan mengulang yang sudah tercatat dan jangan menebak hal yang tidak ada di narasi. Kalau tidak ada yang perlu dicatat,
@@ -37,6 +39,12 @@ Jangan menandai hal yang masuk akal atau tidak pasti. Jawab HANYA JSON:
 {{"issues": [{{"kind": "pengetahuan|lokasi|keadaan|dadu|suara", "who": "nama", "text": "apa yang salah", "fix": "seharusnya"}}]}}
 
 {data}"""
+
+CARD_PROPOSALS = """Bandingkan kartu tokoh di system prompt dengan perkembangan cerita sejauh ini. Usulkan perubahan kartu
+untuk hal yang sudah benar-benar berubah dan menetap: hubungan, sifat yang bergeser, penampilan, tujuan, rahasia yang sudah
+terbongkar, umur. Bukan keadaan sesaat (itu status). Maksimal 6 usulan. Jawab HANYA JSON:
+{{"proposals": [{{"card": "nama tokoh", "field": "kunci field di skema", "value": "isi baru lengkap", "reason": "kenapa"}}]}}
+Skema kartu tokoh: {fields}"""
 
 FACTCHECK_CLAIMS = """Periksa jawaban terakhir. Daftarkan klaim fakta {kind} yang spesifik di dalamnya (tanggal, angka, nama
 satuan, senjata, pangkat, tempat, prosedur), bukan hal fiksi cerita. Maksimal 6. Jawab HANYA JSON: {{"claims": ["..."]}}"""
@@ -677,7 +685,8 @@ class Engine(EngineView):
                     fn = tc.get("function") or {}
                     done_lines.append(f"- {fn.get('name')}: {(fn.get('arguments') or '')[:300]}")
                     advanced = advanced or fn.get("name") == "world_advance"
-        names = {"world_advance", "status_update", "knowledge_add", "tell", "world_event", "thread_open", "thread_close"}
+        names = {"world_advance", "status_update", "knowledge_add", "tell", "world_event", "thread_open", "thread_close",
+                 "relationship"}
         tools = [t for t in self.tools.specs(c) if t["function"]["name"] in names]
         kw = {k: v for k, v in self.prompt.kwargs(c).items() if k != "reasoning_effort"}
         kw["enable_thinking"] = False
@@ -699,8 +708,14 @@ class Engine(EngineView):
                     advanced = advanced or cl["name"] == "world_advance"
         if not advanced and not self.stop.is_set():
             minutes = max(2, min(30, round(len(full.split()) / 90)))
-            self.world.advance(chat_id, mid, minutes, "perkiraan dari panjang adegan (world_advance tidak dipanggil)")
-            recorded.append(f"world_advance: perkiraan {minutes} menit")
+            reason = "perkiraan dari panjang adegan (world_advance tidak dipanggil)"
+            before = (self.world.state(chat_id, ids[:start]).get("status", {}).get("player") or {}).get("location")
+            after = (self.world.state(chat_id, self.store.path_ids(chat_id, head=mid)).get("status", {}).get("player") or {}).get("location")
+            trip = self.world.travel_minutes(c["cards"], before, after) if before and after else None
+            if trip:
+                minutes, reason = trip + max(0, minutes // 2), f"perjalanan {before} → {after} ({trip} menit) dan adegan"
+            self.world.advance(chat_id, mid, minutes, reason)
+            recorded.append(f"world_advance: {reason}, {minutes} menit")
         self.store.side_log("state_check", {"recorded": recorded,
                                             "transcript": [x for x in msgs if x["role"] in ("assistant", "tool")]}, chat_id, mid)
         return recorded
@@ -827,6 +842,61 @@ class Engine(EngineView):
             self.emit("toast", {"text": f"Cek fakta: {len(warnings)} klaim salah." if warnings else "Cek fakta: tidak ada yang salah."})
         return warnings
 
+    # ---------- card change proposals ----------
+
+    def propose_cards(self, chat_id, stop=None):
+        """Ask the model which character cards should change after what happened; you approve each in the Story tab."""
+        c = self.prompt.ctx(chat_id)
+        if c["kind"] not in ("rp", "group") or not c["cards"]["character"]:
+            return []
+        fields = ", ".join(f["key"] for f in self.cards.schema("character")["fields"] if f.get("visibility") != "ui")
+        acc = self.llm.complete(self.prompt.side(chat_id, CARD_PROPOSALS.format(fields=fields)), kwargs=self.prompt.kwargs(c),
+                                sampling={"temperature": 0.4}, max_tokens=8000, tools=self.tools.specs(c),
+                                stop=stop or self.stop)
+        if acc["finish"] == "stopped":
+            return []
+        by_name = {}
+        for ch in c["cards"]["character"]:
+            for n in [ch["name"]] + list(ch["data"].get("aliases") or []):
+                by_name[str(n).lower()] = ch
+        keys = {f["key"] for f in self.cards.schema("character")["fields"]}
+        out = []
+        for p in ((self._json(acc["content"]) or {}).get("proposals") or [])[:6]:
+            if not isinstance(p, dict):
+                continue
+            ch = by_name.get(str(p.get("card", "")).lower())
+            field = str(p.get("field", ""))
+            if not ch or field not in keys or p.get("value") in (None, ""):
+                continue
+            pid = self.store.x("INSERT INTO card_proposals (chat_id, card_id, field, value, reason, created) VALUES (?, ?, ?, ?, ?, ?)",
+                               (chat_id, ch["id"], field, json.dumps(p["value"], ensure_ascii=False), str(p.get("reason", ""))[:500],
+                                time.time()))
+            out.append(pid)
+        if out:
+            self.emit("toast", {"text": f"{len(out)} usulan perubahan kartu menunggu persetujuanmu (tab Cerita)."})
+        self.store.side_log("card_proposals", {"answer": acc["content"], "saved": out}, chat_id)
+        return out
+
+    def proposals(self, chat_id):
+        rows = self.store.q("SELECT p.*, c.name AS card_name FROM card_proposals p JOIN cards c ON c.id = p.card_id "
+                            "WHERE p.chat_id = ? ORDER BY p.id DESC LIMIT 50", (chat_id,))
+        for r in rows:
+            r["value"] = json.loads(r["value"])
+        return rows
+
+    def decide_proposal(self, chat_id, pid, accept):
+        p = self.store.one("SELECT * FROM card_proposals WHERE id = ? AND status = 'menunggu'", (int(pid),))
+        if not p:
+            return False
+        if accept:
+            self.cards.set_field(p["card_id"], p["field"], json.loads(p["value"]))
+            sid = (self.store.chat(chat_id) or {}).get("story_id")
+            card = self.cards.get(p["card_id"])
+            if sid and card:
+                self.stories.pending(sid, chat_id, f"Kartu {card['name']} · {p['field']}: {json.loads(p['value'])}"[:600])
+        self.store.x("UPDATE card_proposals SET status = ? WHERE id = ?", ("diterima" if accept else "ditolak", p["id"]))
+        return True
+
     # ---------- continuity ----------
 
     def continuity_data(self, chat_id, mid):
@@ -837,7 +907,7 @@ class Engine(EngineView):
         ids = [x["id"] for x in path]
         full, _ = self._turn_text(path, mid)
         st = self.world.state(chat_id, ids)
-        status = st["status"]
+        status = self.world.with_schedule(st, c["cards"])
         here = (status.get("player") or {}).get("location") or "?"
         low = full.lower()
         lines = [f"Lokasi pemain: {here}"]
@@ -1134,6 +1204,14 @@ class Engine(EngineView):
                                                                threshold=self.IDLE_COMPACT_AT, clear_cancel=False)
                 self.emit("status", "")
                 self.emit("history", chat_id)
+                # only after a real compaction (new epoch), not every time the loop finds the context full
+                if chat["kind"] in ("rp", "group") and not self.busy and not self.bg_cancel.is_set() \
+                        and (self.store.chat(chat_id) or {}).get("epoch") != chat.get("epoch"):
+                    self.emit("status", "Menyusun usulan perubahan kartu…")
+                    try:
+                        self.propose_cards(chat_id, stop=self.bg_cancel)
+                    finally:
+                        self.emit("status", "")
             if chat["kind"] in ("rp", "group"):
                 c = self.prompt.ctx(chat_id)
                 gm = self.prompt.gm(c)

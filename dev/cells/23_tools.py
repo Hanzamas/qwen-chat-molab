@@ -58,6 +58,9 @@ TOOL_RP = [
          "who": {"type": "array", "items": _S}, "due": _S}, ["kind", "title"]),
     _fn("thread_close", "Close a story thread when it is resolved, failed or dropped.",
         {"id": _I, "status": {"type": "string", "enum": list(Threads.CLOSED)}, "note": _S}, ["id", "status"]),
+    _fn("relationship", "Change how a character feels about another (b: a name or 'player'). delta -20..20 with the reason "
+        "(what happened). Small, earned changes; big swings only for big events.",
+        {"a": _S, "b": _S, "delta": _N, "reason": _S}, ["a", "b", "delta", "reason"]),
     _fn("tell", "A character tells others something (true or a lie). It lands in the listeners' memory.",
         {"from": _S, "to": {"type": "array", "items": _S}, "text": _S, "truthful": _B}, ["from", "to", "text"]),
     _fn("canon_set", "Write a section of the story book (what is true now in this story). Empty text removes it.",
@@ -368,6 +371,15 @@ class ToolBox:
         ids = KNOW.add(chat_id, mid, holders, text, kind, source, kw.get("from") or kw.get("start") or "", truth, importance,
                        st["time_text"])
         return {"saved": ids, "who": holders}
+
+    def t_relationship(self, chat_id, mid, a, b, delta, reason=""):
+        ha, hb = self._holder(chat_id, a), self._holder(chat_id, b)
+        if not ha or not hb or ha == hb:
+            return {"error": "a dan b harus dua tokoh berbeda"}
+        st = self.world.state(chat_id, self.store.path_ids(chat_id))
+        RELATIONS.change(chat_id, mid, ha, hb, delta, reason, st["time_text"])
+        s = RELATIONS.scores(chat_id).get((ha, hb), {"score": 0})["score"]
+        return {"a": ha, "b": hb, "score": s, "feeling": Relations.word(s)}
 
     def t_thread_open(self, chat_id, mid, kind, title, text="", who=None, due=""):
         st = self.world.state(chat_id, self.store.path_ids(chat_id))

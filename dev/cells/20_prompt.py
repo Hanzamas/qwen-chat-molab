@@ -16,6 +16,7 @@ Aturan tetap:
 - Tiap tokoh (termasuk tokoh pemain) hanya tahu isi ingatannya di catatan sistem. Memory, buku cerita, dan lore adalah
   pengetahuan narator; jangan biarkan tokoh memakainya kalau tidak ada di ingatannya. Ingatan bertanda KELIRU dipercaya
   tokoh itu walaupun salah. Catat yang baru diketahui tokoh dengan knowledge_add atau tell.
+- Hubungan: kalau kejadian mengubah perasaan tokoh terhadap tokoh lain atau pemain, catat dengan relationship.
 - Benang cerita: catat janji, janji temu (dengan tenggat), misteri, petunjuk, utang, dendam, dan rencana dengan thread_open;
   tutup dengan thread_close. Benang yang lewat tenggat harus punya akibat di dunia (orang menunggu, kesal, pergi).
 - Pesan pemain yang diawali [OOC] adalah percakapan di luar cerita: jawab di luar cerita, singkat, tanpa memerankan tokoh.
@@ -279,10 +280,20 @@ class Prompt:
         if mine:
             persona = (c["cards"].get("persona") or {}).get("name") or "pemain"
             lines.append(f"Ingatan tokoh pemain ({persona}), yang ia tahu atau yakini:\n" + "\n".join(KNOW.line(r) for r in mine))
-        for ch in self.present_characters(c, recent, st["status"]):
+        where = self.world.with_schedule(st, c["cards"])
+        here = (st["status"].get("player") or {}).get("location")
+        trips = self.world.travel_from(c["cards"], here) if here else []
+        if trips:
+            lines.append(f"Waktu tempuh dari {here}: " + ", ".join(f"{p} {m} menit" for p, m in trips[:8])
+                         + " (pakai world_advance sesuai perjalanan)")
+        for ch in self.present_characters(c, recent, where):
             bits = []
-            if st["status"].get(ch["name"]):
-                bits.append("status " + json.dumps(st["status"][ch["name"]], ensure_ascii=False))
+            if where.get(ch["name"]):
+                bits.append("status " + json.dumps(where[ch["name"]], ensure_ascii=False))
+            rel = [(b, v) for (a, b), v in RELATIONS.scores(chat_id).items() if a == ch["name"]]
+            if rel:
+                bits.append("perasaan: " + "; ".join(f"ke {'pemain' if b == 'player' else b} {Relations.word(v['score'])} "
+                                                     f"({v['score']:+.0f}, terakhir: {v['last']})" for b, v in rel[:6]))
             heads = KNOW.relevant(chat_id, ch["name"], recent, limit=6)
             if heads:
                 bits.append("ingatan (yang ia tahu atau yakini):\n" + "\n".join(KNOW.line(r) for r in heads))

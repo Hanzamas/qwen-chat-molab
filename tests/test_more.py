@@ -848,3 +848,64 @@ def test_dice_from_skill_and_condition(engine, nb):
     assert T.roll_odds(chat, "Lotte", "Berbohong")[0] == 0.0
     res, failed, _ = T.call(chat, head, "roll", json.dumps({"event": "membujuk", "skill": "Bahasa Jerman", "difficulty": "sedang"}))
     assert not failed and "peluang" in json.loads(res)["result"]
+
+
+def test_schedule_travel_and_healing(engine, nb, fake, monkeypatch):
+    chat, _ = _story(nb, engine)
+    S, W, C, P = nb["STORE"], nb["WORLD"], nb["CARDS"], nb["PROMPT"]
+    sid = S.chat(chat)["story_id"]
+    cards = nb["STORIES"].cards_of(sid)
+    lotte = cards["character"][0]["id"]
+    C.set_field(lotte, "schedule", [["20-23", "Dapur", "memasak"], ["23-07", "Kamar Lotte", "tidur"]])
+    C.set_field(cards["world"]["id"], "locations", "Dapur, Stasiun, 25")
+    nb["STORIES"].refresh_versions(sid)
+    head = S.chat(chat)["head_id"]  # world clock starts 2026-12-19 21:00
+    W.status_update(chat, head, "player", {"location": "Dapur"})
+    st = W.state(chat, S.path_ids(chat))
+    where = W.with_schedule(st, nb["STORIES"].cards_of(sid))
+    assert where["Lotte Braun"]["location"] == "Dapur" and where["Lotte Braun"]["location_from"] == "jadwal"
+    note, _ = P.ephemeral(chat, S.path(chat), "Halo.")
+    assert "Tokoh di adegan, Lotte Braun" in note and "Waktu tempuh dari Dapur: Stasiun 25 menit" in note
+    # a sighting is newer than the schedule
+    W.status_update(chat, head, "Lotte Braun", {"location": "Balkon"})
+    st = W.state(chat, S.path_ids(chat))
+    assert W.with_schedule(st, nb["STORIES"].cards_of(sid))["Lotte Braun"]["location"] == "Balkon"
+    assert W.travel_minutes(nb["STORIES"].cards_of(sid), "stasiun", "dapur") == 25
+    # a trip without world_advance moves the clock by the travel time
+    monkeypatch.setenv("QCHAT_STATE_CHECK", "1")
+    S.chat_settings(chat, length="pendek")
+    t0 = W.state(chat, S.path_ids(chat))["time"]
+    fake["script"] += [{"tool_calls": [{"name": "status_update", "arguments": json.dumps({"subject": "player",
+                                                                                          "changes": {"location": "Stasiun"}})}]},
+                       {"content": "Kamu berjalan ke stasiun."}, {"content": "selesai"}]
+    engine.send(chat, "Aku pergi ke stasiun.")
+    wait_idle(engine, 60)
+    t1 = W.state(chat, S.path_ids(chat))["time"]
+    assert (t1 - t0).total_seconds() >= 25 * 60
+
+
+def test_relationships_and_card_proposals(engine, nb, fake):
+    chat, _ = _story(nb, engine, fmt="game")
+    S, T, P = nb["STORE"], nb["TOOLS"], nb["PROMPT"]
+    engine.send(chat, "Halo.")
+    wait_idle(engine)
+    head = S.chat(chat)["head_id"]
+    T.call(chat, head, "relationship", json.dumps({"a": "Lotte", "b": "player", "delta": 12, "reason": "dibantu membawa belanjaan"}))
+    T.call(chat, head, "relationship", json.dumps({"a": "Lotte", "b": "Raka", "delta": 15, "reason": "ditolong saat jatuh"}))
+    sc = nb["RELATIONS"].scores(chat)[("Lotte Braun", "player")]
+    assert sc["score"] == 27 and sc["last"] == "ditolong saat jatuh"
+    assert engine.panels(chat)["relations"][0]["word"] == "dekat"
+    nb["WORLD"].status_update(chat, head, "player", {"location": "Dapur"})
+    nb["WORLD"].status_update(chat, head, "Lotte Braun", {"location": "Dapur"})
+    note, _ = P.ephemeral(chat, S.path(chat), "Halo.")
+    assert "ke pemain dekat (+27" in note
+    fake["script"].append({"content": json.dumps({"proposals": [
+        {"card": "Lotte", "field": "relations", "value": [["Raka", "teman dekat", "sejak insiden tangga"]], "reason": "makin akrab"},
+        {"card": "Nobody", "field": "age", "value": "30"}]})})
+    pids = engine.propose_cards(chat)
+    assert len(pids) == 1
+    rows = engine.proposals(chat)
+    assert rows[0]["card_name"] == "Lotte Braun" and rows[0]["status"] == "menunggu"
+    assert engine.decide_proposal(chat, pids[0], True)
+    lotte = nb["STORIES"].cards_of(S.chat(chat)["story_id"], latest=True)["character"][0]
+    assert lotte["data"]["relations"][0][0] == "Raka"

@@ -168,6 +168,15 @@ CREATE TABLE IF NOT EXISTS thread_events (
     note TEXT NOT NULL DEFAULT '', created REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS thread_events_thread ON thread_events (thread_id);
+CREATE TABLE IF NOT EXISTS relations_log (
+    id INTEGER PRIMARY KEY, chat_id INTEGER NOT NULL, message_id INTEGER, a TEXT NOT NULL, b TEXT NOT NULL,
+    delta REAL NOT NULL, reason TEXT NOT NULL DEFAULT '', world_time TEXT NOT NULL DEFAULT '', created REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS relations_chat ON relations_log (chat_id);
+CREATE TABLE IF NOT EXISTS card_proposals (
+    id INTEGER PRIMARY KEY, chat_id INTEGER, card_id INTEGER NOT NULL, field TEXT NOT NULL, value TEXT NOT NULL,
+    reason TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'menunggu', created REAL NOT NULL
+);
 CREATE TABLE IF NOT EXISTS knowledge (
     id INTEGER PRIMARY KEY, chat_id INTEGER NOT NULL, message_id INTEGER, holder TEXT NOT NULL, text TEXT NOT NULL,
     kind TEXT NOT NULL DEFAULT 'fakta', source TEXT NOT NULL DEFAULT 'lihat sendiri', source_who TEXT NOT NULL DEFAULT '',
