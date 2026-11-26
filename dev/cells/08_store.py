@@ -152,6 +152,10 @@ class Store:
         self.lock = threading.RLock()
         self.rev = 0
         self.listeners = []
+        # import_guards raise when the database must not be replaced now (a reply is being written);
+        # import_hooks(ok) run after every attempt (on success, caches holding ids of the old database are reset).
+        self.import_guards = []
+        self.import_hooks = []
         self._open()
 
     # ---------- connection ----------
@@ -274,7 +278,9 @@ class Store:
 
     def side_log(self, kind, data, chat_id=None, message_id=None):
         """Keep the output of side tasks (drafts, explanations, transcripts, server logs) so nothing is lost."""
-        text = json.dumps(data, ensure_ascii=False, default=str)[:400_000]
+        text = json.dumps(data, ensure_ascii=False, default=str)
+        if len(text) > 400_000:  # cut, but keep it valid JSON
+            text = json.dumps({"truncated": True, "text": text[:400_000]}, ensure_ascii=False)
         return self.x("INSERT INTO side_log (kind, chat_id, message_id, data, created) VALUES (?, ?, ?, ?, ?)",
                       (kind, chat_id, message_id, text, time.time()))
 
@@ -288,7 +294,10 @@ class Store:
             args.append(kind)
         rows = self.q(sql + " ORDER BY id DESC LIMIT ?", args + [limit])
         for r in rows:
-            r["data"] = json.loads(r["data"])
+            try:
+                r["data"] = json.loads(r["data"])
+            except ValueError:
+                r["data"] = {"truncated": True, "text": r["data"]}
         return rows
 
     # ---------- export / import ----------
@@ -308,18 +317,64 @@ class Store:
                 dst.close()
 
     def import_bytes(self, data):
-        """Replace the database with an uploaded one (old or new format) after checking it is ours."""
-        probe = sqlite3.connect(":memory:")
-        probe.deserialize(data)
-        names = {r[0] for r in probe.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
-        probe.close()
-        if not {"chats", "messages"} <= names:
-            raise ValueError("File bukan database Qwen Chat.")
+        """Replace the database with an uploaded one (old or new format). The upload is written to a separate file,
+        checked and migrated there first; the live database is replaced only when all of that worked, and the
+        previous file stays next to it as .before-import. (A file saved from a WAL database cannot be loaded with
+        sqlite3.deserialize, which is why this goes through a file.)"""
+        for fn in list(self.import_guards):
+            fn()
+        ok = False
+        try:
+            self._import(data)
+            ok = True
+        finally:
+            for fn in list(self.import_hooks):
+                try:
+                    fn(ok)
+                except Exception:
+                    pass
+
+    def _import(self, data):
+        tmp = self.file.with_name(self.file.name + ".import")
+        side = lambda p: [p, Path(str(p) + "-wal"), Path(str(p) + "-shm")]
+        for p in side(tmp):
+            p.unlink(missing_ok=True)
+        tmp.write_bytes(data)
+        try:
+            con = sqlite3.connect(tmp)
+            try:
+                check = con.execute("PRAGMA quick_check").fetchone()[0]
+                names = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+            finally:
+                con.close()
+            if check != "ok":
+                raise ValueError(f"Database rusak: {check}")
+            if not {"chats", "messages"} <= names:
+                raise ValueError("File bukan database Qwen Chat.")
+            probe = Store(tmp)  # runs the migrations on the copy; a failure leaves the live database untouched
+            probe.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            probe.conn.close()
+        except sqlite3.DatabaseError as e:
+            for p in side(tmp):
+                p.unlink(missing_ok=True)
+            raise ValueError(f"File bukan database SQLite yang bisa dibaca: {e}") from None
+        except Exception:
+            for p in side(tmp):
+                p.unlink(missing_ok=True)
+            raise
         with self.lock:
+            try:
+                self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except sqlite3.DatabaseError:
+                pass
             self.conn.close()
-            for suffix in ("-wal", "-shm"):
-                Path(str(self.file) + suffix).unlink(missing_ok=True)
-            self.file.write_bytes(data)
+            for p in side(self.file)[1:]:
+                p.unlink(missing_ok=True)
+            if self.file.exists():
+                os.replace(self.file, self.file.with_name(self.file.name + ".before-import"))
+            os.replace(tmp, self.file)
+            for p in side(tmp)[1:]:
+                p.unlink(missing_ok=True)
             self._open()
             self._changed()
 
@@ -352,7 +407,9 @@ class Store:
                 part = ids[i:i + 500]
                 marks = ",".join("?" * len(part))
                 self.conn.execute(f"DELETE FROM attachments WHERE message_id IN ({marks})", part)
-                self.conn.execute(f"DELETE FROM vectors WHERE kind = 'msg' AND ref_id IN ({marks})", part)
+                for m_id in part:  # message vectors are keyed mid*100 + chunk number
+                    self.conn.execute("DELETE FROM vectors WHERE kind = 'msg' AND ref_id BETWEEN ? AND ?",
+                                      (m_id * 100, m_id * 100 + 99))
             for table in ("messages", "summaries", "snapshots", "chapters", "status_events", "world_events",
                           "dice_log", "pending_changes", "memory_log", "side_log"):
                 self.conn.execute(f"DELETE FROM {table} WHERE chat_id = ?", (chat_id,))
@@ -388,7 +445,10 @@ class Store:
         if "tool_calls" in fields and isinstance(fields["tool_calls"], list):
             fields["tool_calls"] = json.dumps(fields["tool_calls"])
         sets = ", ".join(f"{k} = ?" for k in fields)
-        self.x(f"UPDATE messages SET {sets} WHERE id = ?", (*fields.values(), mid))
+        with self.lock:
+            self.x(f"UPDATE messages SET {sets} WHERE id = ?", (*fields.values(), mid))
+            if "content" in fields:  # changed text: its old vectors would match words that are gone
+                self.x("DELETE FROM vectors WHERE kind = 'msg' AND ref_id BETWEEN ? AND ?", (mid * 100, mid * 100 + 99))
 
     def msg(self, mid):
         m = self.one("SELECT * FROM messages WHERE id = ?", (mid,))

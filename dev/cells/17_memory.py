@@ -33,28 +33,45 @@ class Embedder:
         if self.np is None or not (text or "").strip():
             return
         with self.qlock:
+            pending = getattr(self, "pending", None)
+            if pending is None:
+                pending = self.pending = {}
+            if (kind, ref_id) in pending:
+                pending[(kind, ref_id)] = text  # already queued: embed the newest text once
+                self.queue = [(k, r, text if (k, r) == (kind, ref_id) else t) for k, r, t in self.queue]
+                return
+            pending[(kind, ref_id)] = text
             self.queue.append((kind, ref_id, text))
-        if self.worker is None or not self.worker.is_alive():
-            self.worker = threading.Thread(target=self._work, daemon=True)
-            self.worker.start()
+            # The worker decides to stop under the same lock, so an item added now is never left behind.
+            if not getattr(self, "working", False):
+                self.working = True
+                self.worker = threading.Thread(target=self._work, daemon=True)
+                self.worker.start()
 
     def _work(self):
         while True:
             with self.qlock:
                 batch, self.queue = self.queue[:32], self.queue[32:]
-            if not batch:
-                return
+                if not batch:
+                    self.working = False
+                    return
             if not self.ready():
                 time.sleep(2)
                 with self.qlock:
                     self.queue = batch + self.queue
                 if not self.servers.state.get("embed"):
+                    with self.qlock:
+                        self.working = False
                     return
                 continue
             try:
                 arr = self.embed([t for _, _, t in batch])
                 rows = [(k, r, arr.shape[1], arr[i].astype(self.np.float16).tobytes()) for i, (k, r, _) in enumerate(batch)]
                 self.store.many("INSERT OR REPLACE INTO vectors (kind, ref_id, dim, v) VALUES (?, ?, ?, ?)", rows)
+                with self.qlock:
+                    for k, r, t in batch:
+                        if self.pending.get((k, r)) == t:
+                            self.pending.pop((k, r), None)
                 for k, _, _ in batch:
                     self.cache.pop(k, None)
             except Exception:
@@ -208,16 +225,27 @@ class Memory:
         log = self.store.one("SELECT * FROM memory_log WHERE id = ? AND undone = 0", (log_id,))
         if not log:
             return False
+        cur = self.store.one("SELECT text FROM memories WHERE id = ?", (log["memory_id"],))
         if log["action"] == "save":
+            # ids are reused after a delete: only remove the row if it is still the memory this entry saved
+            if not cur or cur["text"] != log["after"]:
+                return False
             self.store.x("DELETE FROM memories WHERE id = ?", (log["memory_id"],))
+            self.store.x("DELETE FROM vectors WHERE kind = 'mem' AND ref_id = ?", (log["memory_id"],))
         elif log["action"] == "update":
+            if not cur or cur["text"] != log["after"]:
+                return False
             self.store.x("UPDATE memories SET text = ?, updated = ? WHERE id = ?", (log["before"], time.time(), log["memory_id"]))
+            self.emb.enqueue("mem", log["memory_id"], log["before"])
         elif log["action"] == "forget":
             r = json.loads(log["before"])
-            self.store.x("INSERT INTO memories (id, scope, card_id, story_id, chat_id, kind, text, created, updated) "
-                         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                         (r["id"], r["scope"], r["card_id"], r["story_id"], r["chat_id"], r["kind"], r["text"],
-                          r["created"], time.time()))
+            cols = "scope, card_id, story_id, chat_id, kind, text, created, updated"
+            vals = (r["scope"], r["card_id"], r["story_id"], r["chat_id"], r["kind"], r["text"], r["created"], time.time())
+            if cur is None:
+                new_id = self.store.x(f"INSERT INTO memories (id, {cols}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", (r["id"],) + vals)
+            else:  # the old id is taken by a newer memory: bring it back under a new id
+                new_id = self.store.x(f"INSERT INTO memories ({cols}) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", vals)
+            self.emb.enqueue("mem", new_id, r["text"])
         self.store.x("UPDATE memory_log SET undone = 1 WHERE id = ?", (log_id,))
         return True
 

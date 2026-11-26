@@ -127,7 +127,8 @@ class Prompt:
         if sums:
             parts.append("# Kronik (ringkasan bagian cerita yang sudah dipadatkan; aslinya bisa dibaca dengan "
                          "history_read)\n\n" + "\n\n".join(s["text"] for s in sums))
-        return "\n\n".join(parts)
+        persona = ((c.get("cards") or {}).get("persona") or {}).get("name") or "kamu"
+        return TXT.macros("\n\n".join(parts), user=persona)
 
     def frozen_memory_ids(self, chat_id):
         snap = self.system_text(chat_id)
@@ -206,7 +207,7 @@ class Prompt:
 
         def rng_of(s):
             m = re.match(r"\s*(\d+)\s*-\s*(\d+)", s or "")
-            return (int(m.group(1)), int(m.group(2))) if m else None
+            return tuple(sorted((int(m.group(1)), int(m.group(2))))) if m else None  # "6-3" reads as 3-6
         p, s = rng_of(paras), rng_of(sents)
         if not p:
             return None
@@ -293,17 +294,27 @@ class Prompt:
         path = path if path is not None else self.store.path(chat_id)
         msgs = [{"role": "system", "content": self.system_text(chat_id)}] + self.history(chat_id, path)
         used = {}
+        note, target = "", None
         if ephemeral and msgs[-1]["role"] == "user":
             user_text = path[-1]["content"] if path else ""
             note, used = self.ephemeral(chat_id, path, user_text, extra)
             used = {**used, "note": note}
-            if note:
-                block = "\n\n[Catatan sistem untuk giliran ini, bukan tulisan pemain]\n" + note
-                last = msgs[-1]
-                if isinstance(last["content"], list):
-                    last["content"] = last["content"] + [{"type": "text", "text": block}]
-                else:
-                    last["content"] = last["content"] + block
+            target = msgs[-1]
+        elif ephemeral:
+            # Later rounds of the same turn (after tool calls): the user message carries the exact note of the
+            # first round, so the model keeps its instructions and the prompt prefix stays identical (cache).
+            ui = max((i for i, m in enumerate(msgs) if m["role"] == "user"), default=None)
+            if ui is not None:
+                um = next((m for m in path if m["id"] == msgs[ui].get("_id")), None)
+                note = ((um or {}).get("meta") or {}).get("ephemeral") or ""
+                target = msgs[ui]
+        if note and target is not None:
+            persona = (((self.ctx(chat_id).get("cards") or {}).get("persona")) or {}).get("name") or "kamu"
+            block = "\n\n[Catatan sistem untuk giliran ini, bukan tulisan pemain]\n" + TXT.macros(note, user=persona)
+            if isinstance(target["content"], list):
+                target["content"] = target["content"] + [{"type": "text", "text": block}]
+            else:
+                target["content"] = target["content"] + block
         return [{k: v for k, v in m.items() if not k.startswith("_")} for m in msgs], used
 
     def side(self, chat_id, instruction, path=None):

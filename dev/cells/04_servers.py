@@ -217,6 +217,10 @@ class ServerManager:
             raise RuntimeError("Belum terpasang. Klik Install dulu.")
         with self.lock:
             self.stop(keep_embed=embed)
+            # Each start gets a number; stop() and a newer start change it, so a launch whose download
+            # finished too late is dropped instead of leaving a second server on the GPU.
+            self.gen = getattr(self, "gen", 0) + 1
+            gen = self.gen
             self.state.update(phase="downloading", preset=name, ctx=ctx, mtp=bool(mtp and p.get("mtp")),
                               embed=embed, warnings=[], error="", started=time.time())
             self._save()
@@ -234,12 +238,16 @@ class ServerManager:
             if embed:
                 self.embed_start(log=log)
         except Exception as e:
-            self.state.update(phase="failed", error=str(e))
-            self._save()
+            with self.lock:
+                if self.gen == gen:
+                    self.state.update(phase="failed", error=str(e))
+                    self._save()
             raise
         with self.lock:
+            if self.gen != gen:
+                return self.state  # stopped, or another start took over, while downloading
             self._launch(p, files, ctx, self.state["mtp"])
-        threading.Thread(target=self._watch, args=(p, files, ctx), daemon=True).start()
+        threading.Thread(target=self._watch, args=(p, files, ctx, gen), daemon=True).start()
         return self.state
 
     def _vllm_cmd(self, p, files, ctx, mtp):
@@ -346,11 +354,11 @@ class ServerManager:
             return "\n\nSaran: VRAM tidak cukup. Kecilkan konteks atau matikan embedder."
         return ""
 
-    def _watch(self, p, files, ctx):
+    def _watch(self, p, files, ctx, gen=None):
         backend = p["backend"]
         health = (f"http://127.0.0.1:{CFG.PORT}/health" if backend == "vllm"
                   else f"http://127.0.0.1:{CFG.LLAMA_PORT}/health")
-        while self.state.get("preset") and PRESETS.get(self.state["preset"]) is p:
+        while self.state.get("preset") and PRESETS.get(self.state["preset"]) is p and (gen is None or self.gen == gen):
             proc = self.procs.get(backend)
             if proc is not None and proc.poll() is not None:
                 log_tail = Sys.tail(self.logf[backend], 400)
@@ -369,6 +377,7 @@ class ServerManager:
 
     def stop(self, keep_embed=False):
         with self.lock:
+            self.gen = getattr(self, "gen", 0) + 1  # a start still downloading must not launch after this
             if self.proxy:
                 self.proxy.shutdown()
                 self.proxy.server_close()

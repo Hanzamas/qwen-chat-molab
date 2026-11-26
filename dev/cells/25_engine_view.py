@@ -45,6 +45,7 @@ class EngineView:
                 cur["ids"].append(m["id"])
                 cur["id"] = m["id"]
                 if m["role"] == "assistant":
+                    cur["answer_id"], cur["edit_text"] = m["id"], m["content"]
                     if m["reasoning"]:
                         cur["reasoning"] += ("\n\n" if cur["reasoning"] else "") + m["reasoning"]
                     if m["content"]:

@@ -16,14 +16,23 @@ class Files:
             importlib.invalidate_caches()
             return importlib.import_module(module)
 
+    IMAGE_OK = ("image/png", "image/jpeg", "image/jpg", "image/webp", "image/gif")
+
     @staticmethod
     def _text(data):
+        if data[:2] in (b"\xff\xfe", b"\xfe\xff"):
+            try:
+                return data.decode("utf-16")
+            except UnicodeDecodeError:
+                return None
         if b"\x00" in data[:4096]:
             return None
-        try:
-            return data.decode("utf-8")
-        except UnicodeDecodeError:
-            return data.decode("latin-1")
+        for enc in ("utf-8-sig", "cp1252"):
+            try:
+                return data.decode(enc)
+            except UnicodeDecodeError:
+                pass
+        return data.decode("latin-1")
 
     @classmethod
     def process(cls, files):
@@ -42,6 +51,14 @@ class Files:
                 continue
             try:
                 if mime.startswith("image/"):
+                    if mime not in cls.IMAGE_OK:
+                        # HEIC, BMP, TIFF...: convert to PNG, or the server would fail on every later turn
+                        try:
+                            fitz = cls._mod("fitz", "pymupdf")
+                            data, mime = fitz.Pixmap(data).tobytes("png"), "image/png"
+                        except Exception:
+                            notes.append(f"{name}: format gambar {mime} tidak didukung (pakai PNG/JPEG/WebP)")
+                            continue
                     media.append({"kind": "image", "mime": mime, "name": name, "data": data})
                 elif mime.startswith("video/"):
                     media.append({"kind": "video", "mime": mime, "name": name, "data": data})

@@ -11,6 +11,17 @@ class TXT:
     del _i, _names, _n
 
     @staticmethod
+    def macros(text, char="", user=""):
+        """SillyTavern {{char}} / {{user}} placeholders."""
+        if not isinstance(text, str) or "{{" not in text:
+            return text
+        if char:
+            text = re.sub(r"\{\{\s*char\s*\}\}", lambda _m: char, text, flags=re.I)
+        if user:
+            text = re.sub(r"\{\{\s*user\s*\}\}", lambda _m: user, text, flags=re.I)
+        return text
+
+    @staticmethod
     def parse_datetime(text):
         """A date and time from what models write: 2026-11-01 07:30, 2026-11-01T07:30, 01.11.2026 07:30,
         1 November 2026 pukul 07.30, 1. November 2026, um 7:30 Uhr. Returns None when there is no full date."""
@@ -114,7 +125,8 @@ class TXT:
             end = m.end()
             piece = t[start:end].strip()
             last = piece.split(" ")[-1].lower()
-            if last in TXT.ABBREV or re.search(r"\d\.\d*$", piece):
+            # "1." / "12." are ordinals or dates ("1. November"); "1916." ends a sentence
+            if last in TXT.ABBREV or re.search(r"(?<!\d)\d{1,2}\.\d*$", piece):
                 continue
             if piece:
                 out.append(piece)
@@ -179,7 +191,7 @@ class TXT:
     @staticmethod
     def narration_language(text, expected):
         """Share of stopwords per language outside quotes. Returns (dominant language, shares)."""
-        outside = re.sub(r"[\"“„«][^\"”“»]*[\"”»]", " ", text or "")
+        outside = re.sub(r"[\"“„«][^\"”“»]*[\"”“»]", " ", text or "")  # „German“ quotes close with “
         outside = re.sub(r"\([^()]*\)", " ", outside)
         w = TXT.words(outside)
         shares = {lang: sum(1 for x in w if x in stop) for lang, stop in TXT.STOP.items()}

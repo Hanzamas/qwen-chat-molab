@@ -122,7 +122,13 @@ def thinking_kwargs(preset, level):
     """chat_template_kwargs for a thinking level. Unknown keys are ignored by the other family's template."""
     levels = preset["thinking"]
     if level not in levels:
-        level = levels[-1]
+        # off stays off where possible; a named level becomes "on" for on/off models, "high" for Qwen levels
+        if level == "off":
+            level = "off" if "off" in levels else levels[0]
+        elif "on" in levels:
+            level = "on"
+        else:
+            level = "high" if "high" in levels else next((x for x in reversed(levels) if x != "off"), levels[-1])
     if preset["family"] == "gemma":
         return {"enable_thinking": level != "off", "preserve_thinking": True}
     if level == "off":

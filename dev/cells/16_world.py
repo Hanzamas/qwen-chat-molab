@@ -120,10 +120,13 @@ class World:
                 changes[e["field"]] = {"delta": stats[e["field"]] - before, "reason": e["reason"], "message_id": e["message_id"]}
             else:
                 cur = status.setdefault(e["subject"], {})
-                if e["op"] == "add" and isinstance(cur.get(e["field"]), list):
-                    cur[e["field"]] = cur[e["field"]] + (val if isinstance(val, list) else [val])
-                elif e["op"] == "remove" and isinstance(cur.get(e["field"]), list):
-                    cur[e["field"]] = [x for x in cur[e["field"]] if x not in (val if isinstance(val, list) else [val])]
+                items = val if isinstance(val, list) else [val]
+                old = cur.get(e["field"])
+                old = old if isinstance(old, list) else ([] if old in (None, "") else [old])
+                if e["op"] == "add":  # a list field that does not exist yet starts as a list
+                    cur[e["field"]] = old + [x for x in items if x not in old]
+                elif e["op"] == "remove":
+                    cur[e["field"]] = [x for x in old if x not in items]
                 else:
                     cur[e["field"]] = val
         turn = 0
@@ -147,20 +150,24 @@ class World:
         """changes: {field: value} for text fields, {stat: +n / -n} or {"stat": {"set": n}} for numbers."""
         _, cards = self._story_cards(chat_id)
         defs = {d["key"] for d in self.stat_defs(cards)}
-        done = []
-        for field, v in (changes or {}).items():
+        if not isinstance(changes, dict):
+            raise ValueError("changes harus objek {field: nilai}")
+        # Check everything first: a retry after an error must not apply the first half twice.
+        planned = []
+        for field, v in changes.items():
             if subject == "player" and field in defs:
                 if isinstance(v, dict) and "set" in v:
-                    self.add_event(chat_id, message_id, "player", field, float(v["set"]), "set", reason)
+                    planned.append(("player", field, float(str(v["set"]).replace(",", ".")), "set"))
                 else:
-                    self.add_event(chat_id, message_id, "player", field, float(v), "add", reason)
+                    planned.append(("player", field, float(str(v).replace(",", ".").replace("+", "")), "add"))
             elif isinstance(v, dict) and ("add" in v or "remove" in v):
                 op = "add" if "add" in v else "remove"
-                self.add_event(chat_id, message_id, subject, field, v[op], op, reason)
+                planned.append((subject, field, v[op], op))
             else:
-                self.add_event(chat_id, message_id, subject, field, v, "set", reason)
-            done.append(field)
-        return done
+                planned.append((subject, field, v, "set"))
+        for subj, field, value, op in planned:
+            self.add_event(chat_id, message_id, subj, field, value, op, reason)
+        return [p[1] for p in planned]
 
     # ---------- dice ----------
 
@@ -240,7 +247,8 @@ class World:
             known = json.loads(r["known_to"] or "[]")
             if who and not (r["public"] or who in known):
                 continue
-            if unseen_only and r["shown"]:
+            # shown = id of the reply that told the player (1 = shown before this was tracked per branch)
+            if unseen_only and r["shown"] and (r["shown"] == 1 or r["shown"] in on_path):
                 continue
             out.append({**r, "known_to": known})
             if len(out) >= limit:
@@ -255,9 +263,11 @@ class World:
         r = self.store.one("SELECT MAX(id) AS m FROM world_events WHERE chat_id = ?", (chat_id,))
         return (r or {}).get("m") or 0
 
-    def mark_shown(self, ids):
+    def mark_shown(self, ids, message_id):
+        """Remember which reply told the player: a reroll on another branch still gets the news."""
         if ids:
-            self.store.x(f"UPDATE world_events SET shown = 1 WHERE id IN ({','.join('?' * len(ids))})", list(ids))
+            self.store.x(f"UPDATE world_events SET shown = ? WHERE id IN ({','.join('?' * len(ids))})",
+                         [int(message_id) if message_id and int(message_id) != 1 else 2] + list(ids))
 
 
 WORLD = World(STORE, CARDS, STORIES)

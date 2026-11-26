@@ -21,10 +21,13 @@ def STUDIO_EPHEMERAL(c):
     lines = []
     for type_, ids in drafts.items():
         for cid in (ids if isinstance(ids, list) else [ids]):
-            card = CARDS.get(cid)
-            if not card:
+            try:
+                card = CARDS.get(cid)
+                sch = CARDS.schema(card["type"]) if card else None
+            except Exception:
+                card = None
+            if not card or not sch:
                 continue
-            sch = CARDS.schema(card["type"])
             filled = {k for k, v in card["data"].items() if v not in (None, "", [], {})}
             empty = [f["key"] for f in sch["fields"] if f["key"] not in filled]
             lines.append(f"[kartu #{cid}, jenis {type_}]\n{CARDS.render(card, mode='all', limit=4000)}\n"

@@ -188,13 +188,24 @@ def test_llama_install_skips_github_api_and_checks_sha(nb):
 
 def test_tool_rounds_have_no_cap(engine, nb, fake):
     chat, _ = _story(nb, engine)
-    call = {"tool_calls": [{"name": "fact_lookup", "arguments": json.dumps({"query": "x"})}]}
-    fake["script"] += [call] * 15 + [{"content": "Selesai setelah lima belas tool."}]
+    calls = [{"tool_calls": [{"name": "fact_lookup", "arguments": json.dumps({"query": f"x{i}"})}]} for i in range(15)]
+    fake["script"] += calls + [{"content": "Selesai setelah lima belas tool."}]
     engine.send(chat, "Cari terus.")
     wait_idle(engine, 60)
     last = engine.display(chat)["items"][-1]
     assert last["content"].startswith("Selesai") and not last.get("error"), last
     assert len(last["tools"]) >= 15
+
+
+def test_identical_tool_calls_are_not_repeated_forever(engine, nb, fake):
+    chat, _ = _story(nb, engine)
+    call = {"tool_calls": [{"name": "fact_lookup", "arguments": json.dumps({"query": "sama"})}]}
+    fake["script"] += [call] * 3 + [{"content": "Jawab dengan yang ada."}]
+    engine.send(chat, "Cari.")
+    wait_idle(engine, 60)
+    tools = [m for m in nb["STORE"].path(chat) if m["role"] == "tool"][-3:]
+    assert "sudah dilakukan 2 kali" in tools[-1]["content"] and "sudah dilakukan" not in tools[0]["content"]
+    assert engine.display(chat)["items"][-1]["content"].startswith("Jawab")
 
 
 def test_failed_camoufox_start_does_not_break_chromium_fallback(nb, monkeypatch):
@@ -407,3 +418,187 @@ def test_compaction_progress_and_clean_cancel(engine, nb, fake):
     comp.cancel.clear()
     before = S.q("SELECT COUNT(*) AS n FROM summaries WHERE chat_id = ?", (chat,))[0]["n"]
     assert before == 0  # nothing half-written was stored
+
+
+# ---------- regressions from the code review ----------
+
+def test_saved_database_loads_back(nb, tmp_path):
+    S = nb["STORE"]
+    cid = S.new_chat("simpan-muat")
+    S.add_message(cid, None, "user", "isi untuk diuji")
+    data = S.export_bytes()  # the live DB runs in WAL mode
+    before = S.q("SELECT COUNT(*) AS n FROM messages")[0]["n"]
+    S.import_bytes(data)
+    assert S.q("SELECT COUNT(*) AS n FROM messages")[0]["n"] == before
+    assert S.file.with_name(S.file.name + ".before-import").exists()
+    import pytest
+    with pytest.raises(ValueError):
+        S.import_bytes(b"bukan database sama sekali" * 100)
+    assert S.q("SELECT COUNT(*) AS n FROM messages")[0]["n"] == before  # a bad file changes nothing
+
+
+def test_import_refused_while_a_reply_is_written(engine, nb):
+    import pytest
+    S = nb["STORE"]
+    data = S.export_bytes()
+    engine.busy = True
+    try:
+        with pytest.raises(RuntimeError):
+            S.import_bytes(data)
+    finally:
+        engine.busy = False
+    assert not engine.importing
+
+
+def test_turn_note_is_kept_in_tool_rounds(engine, nb, fake):
+    chat, _ = _story(nb, engine)
+    fake["script"] += [{"tool_calls": [{"name": "world_advance", "arguments": json.dumps({"minutes": 5})}]},
+                       {"content": "Lotte tersenyum."}]
+    n0 = len(fake["log"])
+    engine.send(chat, "Aku duduk.")
+    wait_idle(engine)
+    reqs = [b for b in fake["log"][n0:] if any(m.get("role") == "tool" for m in b["messages"])]
+    assert reqs, "no request after the tool call"
+    user = [m for m in reqs[0]["messages"] if m["role"] == "user"][-1]
+    assert "Catatan sistem untuk giliran ini" in json.dumps(user, ensure_ascii=False)
+
+
+def test_turn_writes_under_its_own_head(engine, nb, fake):
+    import threading as _th
+    chat, _ = _story(nb, engine)
+    S = nb["STORE"]
+    engine.send(chat, "Pertama.")
+    wait_idle(engine)
+    other = S.chat(chat)["head_id"]
+    fake["script"].append({"content": "Jawaban lambat. " * 30, "slow": 0.05})
+    engine.send(chat, "Kedua.")
+    time.sleep(0.4)
+    uid = [m for m in S.path(chat) if m["role"] == "user"][-1]["id"]
+    S.set_head(chat, other)  # the UI moves the branch while the reply streams
+    wait_idle(engine, 60)
+    reply = [m for m in S.q("SELECT * FROM messages WHERE chat_id = ? AND role = 'assistant' ORDER BY id DESC LIMIT 1", (chat,))][0]
+    assert reply["parent_id"] == uid and reply["content"].startswith("Jawaban lambat")
+
+
+def test_reroll_while_busy_does_not_move_the_head(engine, nb):
+    chat, _ = _story(nb, engine)
+    engine.send(chat, "Halo.")
+    wait_idle(engine)
+    S = nb["STORE"]
+    head = S.chat(chat)["head_id"]
+    engine.busy = True
+    try:
+        engine.reroll(chat, head)
+    finally:
+        engine.busy = False
+    assert S.chat(chat)["head_id"] == head
+
+
+def test_stream_error_is_shown_once(engine, nb, fake):
+    chat = engine.new_chat("chat", "galat")
+    fake["script"].append({"stream_error": "CUDA out of memory"})
+    engine.send(chat, "Halo")
+    wait_idle(engine)
+    items = engine.display(chat)["items"]
+    bots = [i for i in items if i["kind"] == "bot"]
+    assert len(bots) == 1
+    msgs = [m for m in nb["STORE"].path(chat) if m["role"] == "assistant"]
+    assert len(msgs) == 1 and "CUDA out of memory" in (msgs[0]["meta"].get("error") or "")
+
+
+def test_status_list_fields(engine, nb):
+    chat, _ = _story(nb, engine)
+    W, S = nb["WORLD"], nb["STORE"]
+    head = S.chat(chat)["head_id"]
+    W.status_update(chat, head, "Lotte Braun", {"inventory": {"add": "pisau"}})
+    W.status_update(chat, head, "Lotte Braun", {"inventory": {"add": "perisai"}})
+    W.status_update(chat, head, "Lotte Braun", {"inventory": {"remove": "pisau"}})
+    st = W.state(chat, S.path_ids(chat))["status"]["Lotte Braun"]
+    assert st["inventory"] == ["perisai"]
+    import pytest
+    with pytest.raises(ValueError):  # nothing is applied when one change is bad
+        W.status_update(chat, head, "player", {"lapar": 5, "energi": "banyak"})
+    assert W.state(chat, S.path_ids(chat))["stats"][0]["value"] == 20
+
+
+def test_card_delete_and_memory_undo_with_reused_ids(nb):
+    C, M, S = nb["CARDS"], nb["MEM"], nb["STORE"]
+    w = C.save(None, "world", {"name": "Hapus aku"})
+    M.fact_save("Fakta milik dunia lama", "", "", w, 0.8)
+    C.delete(w)
+    assert not S.q("SELECT * FROM facts WHERE world_card_id = ?", (w,))
+    ctx = {"chat_id": None, "story_id": None, "card_ids": []}
+    a = M.save("Memory A unik untuk undo", "user", ctx)["saved"]
+    log_a = S.one("SELECT id FROM memory_log WHERE memory_id = ? AND action = 'save'", (a,))["id"]
+    M.forget(a, ctx)
+    b = M.save("Memory B yang lain sama sekali", "user", ctx)["saved"]
+    assert not M.undo(log_a)  # would have deleted B (same id)
+    assert S.one("SELECT text FROM memories WHERE id = ?", (b,))["text"].startswith("Memory B")
+
+
+def test_cancelled_background_fact_check_is_redone(engine, nb, fake):
+    chat, _ = _story(nb, engine)
+    engine.send(chat, "Halo.")
+    wait_idle(engine)
+    mid = nb["STORE"].chat(chat)["head_id"]
+    engine.bg_cancel.set()
+    try:
+        engine.fact_jobs.clear()
+        assert engine._fact_check(chat, mid, False) == []
+        assert engine.fact_jobs and engine.fact_jobs[0] == (chat, mid)
+        assert not nb["STORE"].msg(mid)["meta"].get("fact_checked")
+    finally:
+        engine.bg_cancel.clear()
+        engine.fact_jobs.clear()
+
+
+def test_json_and_ranges_never_raise(engine):
+    assert engine._json('{"a": 1} lalu {x}') == {"a": 1}
+    assert engine._json("tidak ada json {x}") is None
+    assert engine._range("6-3", (1, 2)) == (3, 6)
+
+
+def test_card_imports_odd_files(nb):
+    import base64 as _b64
+    import struct
+    import zlib
+    import pytest
+    C = nb["CARDS"]
+    st = {"spec": "chara_card_v2", "data": {"name": 7, "first_mes": "Halo {{user}}, aku {{char}}.",
+                                             "character_book": {"entries": [{"keys": "naga, api", "content": "{{char}} takut naga"}]}}}
+    cid = C.import_any(b"\xef\xbb\xbf" + json.dumps(st).encode())  # UTF-8 BOM, numeric name, keys as a string
+    card = C.get(cid)
+    assert card["name"] == "7" and card["data"]["greetings"][0] == "Halo {{user}}, aku 7."
+    assert C.lore(cid)[0]["keys"] == "naga, api" and C.lore(cid)[0]["text"] == "7 takut naga"
+    with pytest.raises(ValueError):
+        C.import_any(b"[1, 2]")
+
+    def chunk(t, d):
+        return struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d))
+    bomb = zlib.compress(b"A" * (80 * 1024 * 1024))
+    png = b"\x89PNG\r\n\x1a\n" + chunk(b"zTXt", b"chara\x00\x00" + bomb) + chunk(b"IEND", b"")
+    with pytest.raises(ValueError):
+        C.import_any(png)
+    good = _b64.b64encode(json.dumps({"data": {"name": "Zia"}}).encode())
+    png2 = b"\x89PNG\r\n\x1a\n" + chunk(b"iTXt", b"chara\x00\x01\x00\x00\x00" + zlib.compress(good)) + chunk(b"IEND", b"")
+    assert C.get(C.import_any(png2))["name"] == "Zia"
+
+
+def test_thinking_level_fallback(nb):
+    tk, P = nb["thinking_kwargs"], nb["PRESETS"]
+    gemma = next(p for p in P.values() if p["family"] == "gemma")
+    qwen = next(p for p in P.values() if p["family"] == "qwen" and "off" in p["thinking"])
+    assert tk(gemma, "high")["enable_thinking"] is True
+    assert tk(qwen, "on")["reasoning_effort"] == "high"
+    assert tk(qwen, "off")["enable_thinking"] is False
+
+
+def test_stop_returns_queued_text(engine, nb, fake):
+    chat = engine.new_chat("chat", "antrian")
+    fake["script"].append({"content": "Lambat sekali. " * 40, "slow": 0.05})
+    engine.send(chat, "pertama")
+    time.sleep(0.3)
+    engine.send(chat, "kedua yang diantrikan")
+    engine.stop_now()
+    wait_idle(engine, 30)
+    assert any("kedua yang diantrikan" in str(p) for p in engine.events.of("compose"))

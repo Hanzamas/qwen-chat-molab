@@ -161,6 +161,11 @@ class Handler(BaseHTTPRequestHandler):
                 send({"choices": [{"index": 0, "delta": {"reasoning_content": part + ("\n" if r.get("slow_think") else "")}}]})
                 if r.get("slow_think"):
                     time.sleep(r["slow_think"])
+        if r.get("stream_error"):  # vLLM-style error inside the stream, after some text
+            send({"choices": [{"index": 0, "delta": {"content": "Awal jawaban. "}}]})
+            send({"error": {"message": r["stream_error"], "code": 500}})
+            self.wfile.write(b"0\r\n\r\n")
+            return
         content = r.get("content", "")
         pieces = 40 if r.get("slow") else 3
         step = max(1, len(content) // pieces + 1)
@@ -180,7 +185,14 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(b"0\r\n\r\n")
 
 
+class _Server(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def handle_error(self, request, client_address):
+        pass  # the client closing a stream (Stop) is expected here
+
+
 def start(port=0):
-    srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    srv = _Server(("127.0.0.1", port), Handler)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     return srv

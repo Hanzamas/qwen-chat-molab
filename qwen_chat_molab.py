@@ -220,7 +220,13 @@ def _(Path, SimpleNamespace, json, os, secrets):
         """chat_template_kwargs for a thinking level. Unknown keys are ignored by the other family's template."""
         levels = preset["thinking"]
         if level not in levels:
-            level = levels[-1]
+            # off stays off where possible; a named level becomes "on" for on/off models, "high" for Qwen levels
+            if level == "off":
+                level = "off" if "off" in levels else levels[0]
+            elif "on" in levels:
+                level = "on"
+            else:
+                level = "high" if "high" in levels else next((x for x in reversed(levels) if x != "off"), levels[-1])
         if preset["family"] == "gemma":
             return {"enable_thinking": level != "off", "preserve_thinking": True}
         if level == "off":
@@ -610,6 +616,10 @@ def _(
                 raise RuntimeError("Belum terpasang. Klik Install dulu.")
             with self.lock:
                 self.stop(keep_embed=embed)
+                # Each start gets a number; stop() and a newer start change it, so a launch whose download
+                # finished too late is dropped instead of leaving a second server on the GPU.
+                self.gen = getattr(self, "gen", 0) + 1
+                gen = self.gen
                 self.state.update(phase="downloading", preset=name, ctx=ctx, mtp=bool(mtp and p.get("mtp")),
                                   embed=embed, warnings=[], error="", started=time.time())
                 self._save()
@@ -627,12 +637,16 @@ def _(
                 if embed:
                     self.embed_start(log=log)
             except Exception as e:
-                self.state.update(phase="failed", error=str(e))
-                self._save()
+                with self.lock:
+                    if self.gen == gen:
+                        self.state.update(phase="failed", error=str(e))
+                        self._save()
                 raise
             with self.lock:
+                if self.gen != gen:
+                    return self.state  # stopped, or another start took over, while downloading
                 self._launch(p, files, ctx, self.state["mtp"])
-            threading.Thread(target=self._watch, args=(p, files, ctx), daemon=True).start()
+            threading.Thread(target=self._watch, args=(p, files, ctx, gen), daemon=True).start()
             return self.state
 
         def _vllm_cmd(self, p, files, ctx, mtp):
@@ -739,11 +753,11 @@ def _(
                 return "\n\nSaran: VRAM tidak cukup. Kecilkan konteks atau matikan embedder."
             return ""
 
-        def _watch(self, p, files, ctx):
+        def _watch(self, p, files, ctx, gen=None):
             backend = p["backend"]
             health = (f"http://127.0.0.1:{CFG.PORT}/health" if backend == "vllm"
                       else f"http://127.0.0.1:{CFG.LLAMA_PORT}/health")
-            while self.state.get("preset") and PRESETS.get(self.state["preset"]) is p:
+            while self.state.get("preset") and PRESETS.get(self.state["preset"]) is p and (gen is None or self.gen == gen):
                 proc = self.procs.get(backend)
                 if proc is not None and proc.poll() is not None:
                     log_tail = Sys.tail(self.logf[backend], 400)
@@ -762,6 +776,7 @@ def _(
 
         def stop(self, keep_embed=False):
             with self.lock:
+                self.gen = getattr(self, "gen", 0) + 1  # a start still downloading must not launch after this
                 if self.proxy:
                     self.proxy.shutdown()
                     self.proxy.server_close()
@@ -932,7 +947,7 @@ def _(SERVERS, Sys, mo, time):
 
 
 @app.cell(hide_code=True)
-def _(CFG, Path, json, sqlite3, threading, time):
+def _(CFG, Path, json, os, sqlite3, threading, time):
     _SCHEMA_V1 = """
     CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
     CREATE TABLE IF NOT EXISTS stories (
@@ -1087,6 +1102,10 @@ def _(CFG, Path, json, sqlite3, threading, time):
             self.lock = threading.RLock()
             self.rev = 0
             self.listeners = []
+            # import_guards raise when the database must not be replaced now (a reply is being written);
+            # import_hooks(ok) run after every attempt (on success, caches holding ids of the old database are reset).
+            self.import_guards = []
+            self.import_hooks = []
             self._open()
 
         # ---------- connection ----------
@@ -1209,7 +1228,9 @@ def _(CFG, Path, json, sqlite3, threading, time):
 
         def side_log(self, kind, data, chat_id=None, message_id=None):
             """Keep the output of side tasks (drafts, explanations, transcripts, server logs) so nothing is lost."""
-            text = json.dumps(data, ensure_ascii=False, default=str)[:400_000]
+            text = json.dumps(data, ensure_ascii=False, default=str)
+            if len(text) > 400_000:  # cut, but keep it valid JSON
+                text = json.dumps({"truncated": True, "text": text[:400_000]}, ensure_ascii=False)
             return self.x("INSERT INTO side_log (kind, chat_id, message_id, data, created) VALUES (?, ?, ?, ?, ?)",
                           (kind, chat_id, message_id, text, time.time()))
 
@@ -1223,7 +1244,10 @@ def _(CFG, Path, json, sqlite3, threading, time):
                 args.append(kind)
             rows = self.q(sql + " ORDER BY id DESC LIMIT ?", args + [limit])
             for r in rows:
-                r["data"] = json.loads(r["data"])
+                try:
+                    r["data"] = json.loads(r["data"])
+                except ValueError:
+                    r["data"] = {"truncated": True, "text": r["data"]}
             return rows
 
         # ---------- export / import ----------
@@ -1243,18 +1267,64 @@ def _(CFG, Path, json, sqlite3, threading, time):
                     dst.close()
 
         def import_bytes(self, data):
-            """Replace the database with an uploaded one (old or new format) after checking it is ours."""
-            probe = sqlite3.connect(":memory:")
-            probe.deserialize(data)
-            names = {r[0] for r in probe.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
-            probe.close()
-            if not {"chats", "messages"} <= names:
-                raise ValueError("File bukan database Qwen Chat.")
+            """Replace the database with an uploaded one (old or new format). The upload is written to a separate file,
+            checked and migrated there first; the live database is replaced only when all of that worked, and the
+            previous file stays next to it as .before-import. (A file saved from a WAL database cannot be loaded with
+            sqlite3.deserialize, which is why this goes through a file.)"""
+            for fn in list(self.import_guards):
+                fn()
+            ok = False
+            try:
+                self._import(data)
+                ok = True
+            finally:
+                for fn in list(self.import_hooks):
+                    try:
+                        fn(ok)
+                    except Exception:
+                        pass
+
+        def _import(self, data):
+            tmp = self.file.with_name(self.file.name + ".import")
+            side = lambda p: [p, Path(str(p) + "-wal"), Path(str(p) + "-shm")]
+            for p in side(tmp):
+                p.unlink(missing_ok=True)
+            tmp.write_bytes(data)
+            try:
+                con = sqlite3.connect(tmp)
+                try:
+                    check = con.execute("PRAGMA quick_check").fetchone()[0]
+                    names = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+                finally:
+                    con.close()
+                if check != "ok":
+                    raise ValueError(f"Database rusak: {check}")
+                if not {"chats", "messages"} <= names:
+                    raise ValueError("File bukan database Qwen Chat.")
+                probe = Store(tmp)  # runs the migrations on the copy; a failure leaves the live database untouched
+                probe.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                probe.conn.close()
+            except sqlite3.DatabaseError as e:
+                for p in side(tmp):
+                    p.unlink(missing_ok=True)
+                raise ValueError(f"File bukan database SQLite yang bisa dibaca: {e}") from None
+            except Exception:
+                for p in side(tmp):
+                    p.unlink(missing_ok=True)
+                raise
             with self.lock:
+                try:
+                    self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                except sqlite3.DatabaseError:
+                    pass
                 self.conn.close()
-                for suffix in ("-wal", "-shm"):
-                    Path(str(self.file) + suffix).unlink(missing_ok=True)
-                self.file.write_bytes(data)
+                for p in side(self.file)[1:]:
+                    p.unlink(missing_ok=True)
+                if self.file.exists():
+                    os.replace(self.file, self.file.with_name(self.file.name + ".before-import"))
+                os.replace(tmp, self.file)
+                for p in side(tmp)[1:]:
+                    p.unlink(missing_ok=True)
                 self._open()
                 self._changed()
 
@@ -1287,7 +1357,9 @@ def _(CFG, Path, json, sqlite3, threading, time):
                     part = ids[i:i + 500]
                     marks = ",".join("?" * len(part))
                     self.conn.execute(f"DELETE FROM attachments WHERE message_id IN ({marks})", part)
-                    self.conn.execute(f"DELETE FROM vectors WHERE kind = 'msg' AND ref_id IN ({marks})", part)
+                    for m_id in part:  # message vectors are keyed mid*100 + chunk number
+                        self.conn.execute("DELETE FROM vectors WHERE kind = 'msg' AND ref_id BETWEEN ? AND ?",
+                                          (m_id * 100, m_id * 100 + 99))
                 for table in ("messages", "summaries", "snapshots", "chapters", "status_events", "world_events",
                               "dice_log", "pending_changes", "memory_log", "side_log"):
                     self.conn.execute(f"DELETE FROM {table} WHERE chat_id = ?", (chat_id,))
@@ -1323,7 +1395,10 @@ def _(CFG, Path, json, sqlite3, threading, time):
             if "tool_calls" in fields and isinstance(fields["tool_calls"], list):
                 fields["tool_calls"] = json.dumps(fields["tool_calls"])
             sets = ", ".join(f"{k} = ?" for k in fields)
-            self.x(f"UPDATE messages SET {sets} WHERE id = ?", (*fields.values(), mid))
+            with self.lock:
+                self.x(f"UPDATE messages SET {sets} WHERE id = ?", (*fields.values(), mid))
+                if "content" in fields:  # changed text: its old vectors would match words that are gone
+                    self.x("DELETE FROM vectors WHERE kind = 'msg' AND ref_id BETWEEN ? AND ?", (mid * 100, mid * 100 + 99))
 
         def msg(self, mid):
             m = self.one("SELECT * FROM messages WHERE id = ?", (mid,))
@@ -1435,7 +1510,10 @@ def _(CFG, Path, STORE, os, threading, time):
             while self.status["enabled"]:
                 time.sleep(self.interval)
                 if self.store.rev != self.saved_rev:
-                    self.backup_now()
+                    try:
+                        self.backup_now()
+                    except Exception:
+                        pass  # recorded in status["last_error"]; the next interval tries again
 
         def backup_now(self):
             if not self.token:
@@ -1448,6 +1526,9 @@ def _(CFG, Path, STORE, os, threading, time):
                     self.store.backup_to(tmp)
                     api = self._api()
                     api.create_repo(self.repo, repo_type="dataset", private=True, exist_ok=True)
+                    # exist_ok keeps an existing repo as it is: never upload chats to a public one
+                    if not getattr(api.repo_info(self.repo, repo_type="dataset"), "private", False):
+                        raise RuntimeError(f"Repo {self.repo} publik. Jadikan private dulu di Hugging Face; backup tidak diunggah.")
                     stamp = time.strftime("%Y%m%d-%H%M%S")
                     from huggingface_hub import CommitOperationAdd, CommitOperationDelete
                     ops = [CommitOperationAdd(f"backups/qwen-chat-{stamp}.sqlite", str(tmp)),
@@ -1535,6 +1616,17 @@ def _(datetime, re):
             for _n in _names.split():
                 MONTH_NAMES[_n] = _i + 1
         del _i, _names, _n
+
+        @staticmethod
+        def macros(text, char="", user=""):
+            """SillyTavern {{char}} / {{user}} placeholders."""
+            if not isinstance(text, str) or "{{" not in text:
+                return text
+            if char:
+                text = re.sub(r"\{\{\s*char\s*\}\}", lambda _m: char, text, flags=re.I)
+            if user:
+                text = re.sub(r"\{\{\s*user\s*\}\}", lambda _m: user, text, flags=re.I)
+            return text
 
         @staticmethod
         def parse_datetime(text):
@@ -1640,7 +1732,8 @@ def _(datetime, re):
                 end = m.end()
                 piece = t[start:end].strip()
                 last = piece.split(" ")[-1].lower()
-                if last in TXT.ABBREV or re.search(r"\d\.\d*$", piece):
+                # "1." / "12." are ordinals or dates ("1. November"); "1916." ends a sentence
+                if last in TXT.ABBREV or re.search(r"(?<!\d)\d{1,2}\.\d*$", piece):
                     continue
                 if piece:
                     out.append(piece)
@@ -1705,7 +1798,7 @@ def _(datetime, re):
         @staticmethod
         def narration_language(text, expected):
             """Share of stopwords per language outside quotes. Returns (dominant language, shares)."""
-            outside = re.sub(r"[\"“„«][^\"”“»]*[\"”»]", " ", text or "")
+            outside = re.sub(r"[\"“„«][^\"”“»]*[\"”“»]", " ", text or "")  # „German“ quotes close with “
             outside = re.sub(r"\([^()]*\)", " ", outside)
             w = TXT.words(outside)
             shares = {lang: sum(1 for x in w if x in stop) for lang, stop in TXT.STOP.items()}
@@ -2014,7 +2107,8 @@ def _(DEFAULT_CARDS, DEFAULT_SCHEMAS, STORE, TXT, base64, json, re, time):
             line = re.sub(r"^\s*(?:[*\u2022]|-(?=\s)|\d+[.)](?=\s))\s*", "", line).strip()
             if not line or re.fullmatch(r"[|:\-\s]+", line):  # empty, or a markdown separator row
                 return None
-            for sep in ("|", "\t", ";", ","):
+            # ", " before ",": a decimal comma ("0,5") is not a column break
+            for sep in ("|", "\t", ";", ", ", ","):
                 if sep in line:
                     return [c.strip() for c in line.strip("|").split(sep)] if sep == "|" else [c.strip() for c in line.split(sep)]
             return [line]
@@ -2178,6 +2272,14 @@ def _(DEFAULT_CARDS, DEFAULT_SCHEMAS, STORE, TXT, base64, json, re, time):
             return self.save(card_id, c["type"], data, name=c["name"] if key not in ("name", "title") else None)
 
         def delete(self, card_id):
+            # SQLite reuses the highest id after a delete, so everything that points at this card goes with it.
+            for kind, sql in (("lore", "SELECT id FROM lore_entries WHERE card_id = ?"),
+                              ("fact", "SELECT id FROM facts WHERE world_card_id = ?"),
+                              ("mem", "SELECT id FROM memories WHERE scope = 'card' AND card_id = ?")):
+                for r in self.store.q(sql, (card_id,)):
+                    self.store.x("DELETE FROM vectors WHERE kind = ? AND ref_id = ?", (kind, r["id"]))
+            self.store.x("DELETE FROM facts WHERE world_card_id = ?", (card_id,))
+            self.store.x("DELETE FROM memories WHERE scope = 'card' AND card_id = ?", (card_id,))
             for t in ("cards", "card_versions"):
                 self.store.x(f"DELETE FROM {t} WHERE {'id' if t == 'cards' else 'card_id'} = ?", (card_id,))
             self.store.x("DELETE FROM lore_entries WHERE card_id = ?", (card_id,))
@@ -2219,6 +2321,9 @@ def _(DEFAULT_CARDS, DEFAULT_SCHEMAS, STORE, TXT, base64, json, re, time):
 
         def render(self, card, mode="core", keys=None, limit=6000):
             """Text for the prompt. mode: core (frozen part), detail (the rest), all. 'ui' fields never render."""
+            return TXT.macros(self._render(card, mode, keys, limit), char=card.get("name", ""))
+
+        def _render(self, card, mode="core", keys=None, limit=6000):
             sch = self.schema(card["type"])
             out, section = [f"## {sch.get('label', card['type'])}: {card['name']}"], None
             for f in sch["fields"]:
@@ -2303,14 +2408,28 @@ def _(DEFAULT_CARDS, DEFAULT_SCHEMAS, STORE, TXT, base64, json, re, time):
             if isinstance(data, (bytes, bytearray)) and data[:8] == b"\x89PNG\r\n\x1a\n":
                 obj, avatar = self._png_card(bytes(data)), bytes(data)
             else:
-                obj, avatar = json.loads(data if isinstance(data, str) else bytes(data).decode("utf-8")), None
+                text = data if isinstance(data, str) else bytes(data).decode("utf-8-sig")
+                obj, avatar = json.loads(text.lstrip("﻿")), None
+            if not isinstance(obj, dict):
+                raise ValueError("File kartu harus berisi satu objek JSON.")
             if obj.get("format") == "qcard":
                 return self._import_qcard(obj)
             return self._import_st(obj, avatar)
 
         def _import_qcard(self, obj):
             avatar = base64.b64decode(obj["avatar"]) if obj.get("avatar") else None
-            cid = self.save(None, obj["type"], obj.get("data") or {}, name=obj.get("name"), avatar=avatar)
+            type_ = str(obj.get("type") or "")
+            if not type_:
+                raise ValueError("qcard tanpa jenis kartu.")
+            known = self.store.one("SELECT 1 AS x FROM card_schemas WHERE type = ?", (type_,)) or type_ in DEFAULT_SCHEMAS
+            if not known:  # a custom type brings its own schema
+                sch = obj.get("schema")
+                if not isinstance(sch, dict):
+                    raise ValueError(f"Jenis kartu '{type_}' tidak dikenal dan qcard ini tidak membawa skemanya.")
+                self.save_schema({**sch, "type": type_})
+            data = {k: v for k, v in (obj.get("data") or {}).items() if re.match(r"^[A-Za-z_][\w-]{0,63}$", str(k))}
+            name = obj.get("name")
+            cid = self.save(None, type_, data, name=str(name) if name is not None else None, avatar=avatar)
             for e in obj.get("lore") or []:
                 self.lore_save(cid, e.get("title", ""), e.get("text", ""), e.get("keys", ""), e.get("kind", "istilah"),
                                bool(e.get("core")))
@@ -2332,22 +2451,39 @@ def _(DEFAULT_CARDS, DEFAULT_SCHEMAS, STORE, TXT, base64, json, re, time):
             d = obj.get("data") if isinstance(obj.get("data"), dict) else obj
             if not d.get("name"):
                 raise ValueError("Bukan kartu karakter yang dikenali (tidak ada nama).")
-            data = {"name": d["name"]}
+            name = str(d["name"]).strip()
+            data = {"name": name}
+            # {{char}} becomes the name now; {{user}} stays and is replaced with the persona's name in the prompt
+            fix = lambda v: TXT.macros(v, char=name) if isinstance(v, str) else (
+                [TXT.macros(x, char=name) if isinstance(x, str) else x for x in v] if isinstance(v, list) else v)
             for src, dst in self.ST_MAP.items():
                 if d.get(src):
-                    data[dst] = d[src]
-            greet = [g for g in [d.get("first_mes")] + list(d.get("alternate_greetings") or []) if g]
+                    data[dst] = fix(d[src])
+            greet = [fix(g) for g in [d.get("first_mes")] + list(d.get("alternate_greetings") or []) if isinstance(g, str) and g]
             if greet:
                 data["greetings"] = greet
             for k in ("system_prompt", "post_history_instructions"):
                 if d.get(k):
-                    data[f"st_{k}"] = d[k]
+                    data[f"st_{k}"] = fix(d[k])
             cid = self.save(None, "character", data, avatar=avatar)
-            for e in ((d.get("character_book") or {}).get("entries") or []):
-                keys = ", ".join(e.get("keys") or [])
-                self.lore_save(cid, e.get("name") or e.get("comment") or (keys[:40] or "Lore"), e.get("content", ""),
+            book = d.get("character_book") if isinstance(d.get("character_book"), dict) else {}
+            for e in book.get("entries") or []:
+                if not isinstance(e, dict):
+                    continue
+                raw_keys = e.get("keys") or []
+                keys = ", ".join(k.strip() for k in (raw_keys.split(",") if isinstance(raw_keys, str) else map(str, raw_keys)) if k.strip())
+                self.lore_save(cid, str(e.get("name") or e.get("comment") or (keys[:40] or "Lore")), fix(str(e.get("content", ""))),
                                keys, "lore", bool(e.get("constant")))
             return cid
+
+        @staticmethod
+        def _inflate(raw, limit=50 * 1024 * 1024):
+            """zlib with a size limit: a few MB of crafted data must not expand into gigabytes."""
+            d = _zlib.decompressobj()
+            out = d.decompress(raw, limit)
+            if d.unconsumed_tail:
+                raise ValueError("Data kartu di PNG terlalu besar.")
+            return out
 
         @staticmethod
         def _png_card(data):
@@ -2357,11 +2493,16 @@ def _(DEFAULT_CARDS, DEFAULT_SCHEMAS, STORE, TXT, base64, json, re, time):
                 chunk = data[pos + 8:pos + 8 + length]
                 if ctype in (b"tEXt", b"iTXt", b"zTXt"):
                     key, _, rest = chunk.partition(b"\x00")
-                    if ctype == b"zTXt":
-                        rest = _zlib.decompress(rest[1:])
-                    elif ctype == b"iTXt":
-                        rest = rest[2:].split(b"\x00", 2)[-1]
-                    found[key.decode("latin-1").lower()] = rest
+                    key = key.decode("latin-1").lower()
+                    if key in ("chara", "ccv3"):  # other text chunks are never decompressed
+                        if ctype == b"zTXt":
+                            rest = Cards._inflate(rest[1:])
+                        elif ctype == b"iTXt":
+                            compressed = rest[:1] == b"\x01"
+                            rest = rest[2:].split(b"\x00", 2)[-1]
+                            if compressed:
+                                rest = Cards._inflate(rest)
+                        found[key] = rest
                 pos += 12 + length
             raw = found.get("ccv3") or found.get("chara")
             if raw is None:
@@ -2644,10 +2785,13 @@ def _(
                     changes[e["field"]] = {"delta": stats[e["field"]] - before, "reason": e["reason"], "message_id": e["message_id"]}
                 else:
                     cur = status.setdefault(e["subject"], {})
-                    if e["op"] == "add" and isinstance(cur.get(e["field"]), list):
-                        cur[e["field"]] = cur[e["field"]] + (val if isinstance(val, list) else [val])
-                    elif e["op"] == "remove" and isinstance(cur.get(e["field"]), list):
-                        cur[e["field"]] = [x for x in cur[e["field"]] if x not in (val if isinstance(val, list) else [val])]
+                    items = val if isinstance(val, list) else [val]
+                    old = cur.get(e["field"])
+                    old = old if isinstance(old, list) else ([] if old in (None, "") else [old])
+                    if e["op"] == "add":  # a list field that does not exist yet starts as a list
+                        cur[e["field"]] = old + [x for x in items if x not in old]
+                    elif e["op"] == "remove":
+                        cur[e["field"]] = [x for x in old if x not in items]
                     else:
                         cur[e["field"]] = val
             turn = 0
@@ -2671,20 +2815,24 @@ def _(
             """changes: {field: value} for text fields, {stat: +n / -n} or {"stat": {"set": n}} for numbers."""
             _, cards = self._story_cards(chat_id)
             defs = {d["key"] for d in self.stat_defs(cards)}
-            done = []
-            for field, v in (changes or {}).items():
+            if not isinstance(changes, dict):
+                raise ValueError("changes harus objek {field: nilai}")
+            # Check everything first: a retry after an error must not apply the first half twice.
+            planned = []
+            for field, v in changes.items():
                 if subject == "player" and field in defs:
                     if isinstance(v, dict) and "set" in v:
-                        self.add_event(chat_id, message_id, "player", field, float(v["set"]), "set", reason)
+                        planned.append(("player", field, float(str(v["set"]).replace(",", ".")), "set"))
                     else:
-                        self.add_event(chat_id, message_id, "player", field, float(v), "add", reason)
+                        planned.append(("player", field, float(str(v).replace(",", ".").replace("+", "")), "add"))
                 elif isinstance(v, dict) and ("add" in v or "remove" in v):
                     op = "add" if "add" in v else "remove"
-                    self.add_event(chat_id, message_id, subject, field, v[op], op, reason)
+                    planned.append((subject, field, v[op], op))
                 else:
-                    self.add_event(chat_id, message_id, subject, field, v, "set", reason)
-                done.append(field)
-            return done
+                    planned.append((subject, field, v, "set"))
+            for subj, field, value, op in planned:
+                self.add_event(chat_id, message_id, subj, field, value, op, reason)
+            return [p[1] for p in planned]
 
         # ---------- dice ----------
 
@@ -2764,7 +2912,8 @@ def _(
                 known = json.loads(r["known_to"] or "[]")
                 if who and not (r["public"] or who in known):
                     continue
-                if unseen_only and r["shown"]:
+                # shown = id of the reply that told the player (1 = shown before this was tracked per branch)
+                if unseen_only and r["shown"] and (r["shown"] == 1 or r["shown"] in on_path):
                     continue
                 out.append({**r, "known_to": known})
                 if len(out) >= limit:
@@ -2779,9 +2928,11 @@ def _(
             r = self.store.one("SELECT MAX(id) AS m FROM world_events WHERE chat_id = ?", (chat_id,))
             return (r or {}).get("m") or 0
 
-        def mark_shown(self, ids):
+        def mark_shown(self, ids, message_id):
+            """Remember which reply told the player: a reroll on another branch still gets the news."""
             if ids:
-                self.store.x(f"UPDATE world_events SET shown = 1 WHERE id IN ({','.join('?' * len(ids))})", list(ids))
+                self.store.x(f"UPDATE world_events SET shown = ? WHERE id IN ({','.join('?' * len(ids))})",
+                             [int(message_id) if message_id and int(message_id) != 1 else 2] + list(ids))
 
 
     WORLD = World(STORE, CARDS, STORIES)
@@ -2838,28 +2989,45 @@ def _(
             if self.np is None or not (text or "").strip():
                 return
             with self.qlock:
+                pending = getattr(self, "pending", None)
+                if pending is None:
+                    pending = self.pending = {}
+                if (kind, ref_id) in pending:
+                    pending[(kind, ref_id)] = text  # already queued: embed the newest text once
+                    self.queue = [(k, r, text if (k, r) == (kind, ref_id) else t) for k, r, t in self.queue]
+                    return
+                pending[(kind, ref_id)] = text
                 self.queue.append((kind, ref_id, text))
-            if self.worker is None or not self.worker.is_alive():
-                self.worker = threading.Thread(target=self._work, daemon=True)
-                self.worker.start()
+                # The worker decides to stop under the same lock, so an item added now is never left behind.
+                if not getattr(self, "working", False):
+                    self.working = True
+                    self.worker = threading.Thread(target=self._work, daemon=True)
+                    self.worker.start()
 
         def _work(self):
             while True:
                 with self.qlock:
                     batch, self.queue = self.queue[:32], self.queue[32:]
-                if not batch:
-                    return
+                    if not batch:
+                        self.working = False
+                        return
                 if not self.ready():
                     time.sleep(2)
                     with self.qlock:
                         self.queue = batch + self.queue
                     if not self.servers.state.get("embed"):
+                        with self.qlock:
+                            self.working = False
                         return
                     continue
                 try:
                     arr = self.embed([t for _, _, t in batch])
                     rows = [(k, r, arr.shape[1], arr[i].astype(self.np.float16).tobytes()) for i, (k, r, _) in enumerate(batch)]
                     self.store.many("INSERT OR REPLACE INTO vectors (kind, ref_id, dim, v) VALUES (?, ?, ?, ?)", rows)
+                    with self.qlock:
+                        for k, r, t in batch:
+                            if self.pending.get((k, r)) == t:
+                                self.pending.pop((k, r), None)
                     for k, _, _ in batch:
                         self.cache.pop(k, None)
                 except Exception:
@@ -3013,16 +3181,27 @@ def _(
             log = self.store.one("SELECT * FROM memory_log WHERE id = ? AND undone = 0", (log_id,))
             if not log:
                 return False
+            cur = self.store.one("SELECT text FROM memories WHERE id = ?", (log["memory_id"],))
             if log["action"] == "save":
+                # ids are reused after a delete: only remove the row if it is still the memory this entry saved
+                if not cur or cur["text"] != log["after"]:
+                    return False
                 self.store.x("DELETE FROM memories WHERE id = ?", (log["memory_id"],))
+                self.store.x("DELETE FROM vectors WHERE kind = 'mem' AND ref_id = ?", (log["memory_id"],))
             elif log["action"] == "update":
+                if not cur or cur["text"] != log["after"]:
+                    return False
                 self.store.x("UPDATE memories SET text = ?, updated = ? WHERE id = ?", (log["before"], time.time(), log["memory_id"]))
+                self.emb.enqueue("mem", log["memory_id"], log["before"])
             elif log["action"] == "forget":
                 r = json.loads(log["before"])
-                self.store.x("INSERT INTO memories (id, scope, card_id, story_id, chat_id, kind, text, created, updated) "
-                             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                             (r["id"], r["scope"], r["card_id"], r["story_id"], r["chat_id"], r["kind"], r["text"],
-                              r["created"], time.time()))
+                cols = "scope, card_id, story_id, chat_id, kind, text, created, updated"
+                vals = (r["scope"], r["card_id"], r["story_id"], r["chat_id"], r["kind"], r["text"], r["created"], time.time())
+                if cur is None:
+                    new_id = self.store.x(f"INSERT INTO memories (id, {cols}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", (r["id"],) + vals)
+                else:  # the old id is taken by a newer memory: bring it back under a new id
+                    new_id = self.store.x(f"INSERT INTO memories ({cols}) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", vals)
+                self.emb.enqueue("mem", new_id, r["text"])
             self.store.x("UPDATE memory_log SET undone = 1 WHERE id = ?", (log_id,))
             return True
 
@@ -3399,7 +3578,11 @@ def _(Sys, json, os, random, re, threading, time, urllib):
 
 
 @app.cell(hide_code=True)
-def _(CFG, SERVERS, Sys, json, time, urllib):
+def _(CFG, SERVERS, Sys, json, threading, time, urllib):
+    import http.client as _http_client
+    import socket as _socket
+
+
     class LLM:
         """OpenAI-compatible client for the running server (vLLM, or llama.cpp behind the proxy)."""
 
@@ -3428,7 +3611,8 @@ def _(CFG, SERVERS, Sys, json, time, urllib):
                 if not val:
                     return cur["ctx"] or 0
                 self._ctx_cache = {key: val}
-            return self._ctx_cache[key]
+                return val
+            return self._ctx_cache.get(key) or cur["ctx"] or 0
 
         def tokenize(self, messages, tools=None, kwargs=None):
             cur = self.servers.current()
@@ -3471,18 +3655,33 @@ def _(CFG, SERVERS, Sys, json, time, urllib):
             req = urllib.request.Request(cur["base_url"] + "/chat/completions", data=json.dumps(body).encode(), headers=self._hdr())
             acc = {"content": "", "reasoning": "", "calls": {}, "usage": None, "finish": None, "t_think": None, "t_answer": None}
             resp = urllib.request.urlopen(req, timeout=timeout)
+            done = threading.Event()
+            if stop is not None:
+                # Stop must also work while the server is still reading a long prompt and sends nothing:
+                # shutting the socket down ends the blocked read, and the server aborts the request.
+                def watch():
+                    while not done.wait(0.25):
+                        if stop.is_set():
+                            LLM._abort(resp)
+                            return
+                threading.Thread(target=watch, daemon=True).start()
             try:
                 for raw in resp:
                     if stop is not None and stop.is_set():
                         acc["finish"] = "stopped"
                         break
                     line = raw.decode("utf-8", "replace").strip()
+                    if line.startswith("error:"):  # llama.cpp reports some failures as an SSE error line
+                        raise RuntimeError("Server error: " + line[6:].strip()[:500])
                     if not line.startswith("data:"):
                         continue
                     data = line[5:].strip()
                     if data == "[DONE]":
                         break
                     chunk = json.loads(data)
+                    if isinstance(chunk, dict) and chunk.get("error"):  # vLLM sends errors inside the stream
+                        err = chunk["error"]
+                        raise RuntimeError("Server error: " + str(err.get("message") if isinstance(err, dict) else err)[:500])
                     if chunk.get("usage"):
                         acc["usage"] = chunk["usage"]
                     for choice in chunk.get("choices") or []:
@@ -3504,10 +3703,27 @@ def _(CFG, SERVERS, Sys, json, time, urllib):
                             acc["finish"] = choice["finish_reason"]
                         if (r or delta.get("content")) and on_delta:
                             on_delta(acc)
+            except (OSError, ValueError, AttributeError, _http_client.HTTPException):
+                if stop is not None and stop.is_set():
+                    acc["finish"] = "stopped"
+                else:
+                    raise
             finally:
+                done.set()
                 # Closing the stream makes the server abort the request when Stop is pressed.
                 resp.close()
             return acc
+
+        @staticmethod
+        def _abort(resp):
+            try:
+                resp.fp.raw._sock.shutdown(_socket.SHUT_RDWR)
+            except Exception:
+                pass
+            try:
+                resp.close()
+            except Exception:
+                pass
 
         def complete(self, messages, kwargs=None, sampling=None, max_tokens=4000, tools=None, timeout=7200, stop=None,
                      on_delta=None):
@@ -3530,6 +3746,7 @@ def _(
     STORIES,
     STUDIO_EPHEMERAL,
     STUDIO_SYSTEM,
+    TXT,
     WORLD,
     base64,
     json,
@@ -3667,7 +3884,8 @@ def _(
             if sums:
                 parts.append("# Kronik (ringkasan bagian cerita yang sudah dipadatkan; aslinya bisa dibaca dengan "
                              "history_read)\n\n" + "\n\n".join(s["text"] for s in sums))
-            return "\n\n".join(parts)
+            persona = ((c.get("cards") or {}).get("persona") or {}).get("name") or "kamu"
+            return TXT.macros("\n\n".join(parts), user=persona)
 
         def frozen_memory_ids(self, chat_id):
             snap = self.system_text(chat_id)
@@ -3746,7 +3964,7 @@ def _(
 
             def rng_of(s):
                 m = re.match(r"\s*(\d+)\s*-\s*(\d+)", s or "")
-                return (int(m.group(1)), int(m.group(2))) if m else None
+                return tuple(sorted((int(m.group(1)), int(m.group(2))))) if m else None  # "6-3" reads as 3-6
             p, s = rng_of(paras), rng_of(sents)
             if not p:
                 return None
@@ -3833,17 +4051,27 @@ def _(
             path = path if path is not None else self.store.path(chat_id)
             msgs = [{"role": "system", "content": self.system_text(chat_id)}] + self.history(chat_id, path)
             used = {}
+            note, target = "", None
             if ephemeral and msgs[-1]["role"] == "user":
                 user_text = path[-1]["content"] if path else ""
                 note, used = self.ephemeral(chat_id, path, user_text, extra)
                 used = {**used, "note": note}
-                if note:
-                    block = "\n\n[Catatan sistem untuk giliran ini, bukan tulisan pemain]\n" + note
-                    last = msgs[-1]
-                    if isinstance(last["content"], list):
-                        last["content"] = last["content"] + [{"type": "text", "text": block}]
-                    else:
-                        last["content"] = last["content"] + block
+                target = msgs[-1]
+            elif ephemeral:
+                # Later rounds of the same turn (after tool calls): the user message carries the exact note of the
+                # first round, so the model keeps its instructions and the prompt prefix stays identical (cache).
+                ui = max((i for i, m in enumerate(msgs) if m["role"] == "user"), default=None)
+                if ui is not None:
+                    um = next((m for m in path if m["id"] == msgs[ui].get("_id")), None)
+                    note = ((um or {}).get("meta") or {}).get("ephemeral") or ""
+                    target = msgs[ui]
+            if note and target is not None:
+                persona = (((self.ctx(chat_id).get("cards") or {}).get("persona")) or {}).get("name") or "kamu"
+                block = "\n\n[Catatan sistem untuk giliran ini, bukan tulisan pemain]\n" + TXT.macros(note, user=persona)
+                if isinstance(target["content"], list):
+                    target["content"] = target["content"] + [{"type": "text", "text": block}]
+                else:
+                    target["content"] = target["content"] + block
             return [{k: v for k, v in m.items() if not k.startswith("_")} for m in msgs], used
 
         def side(self, chat_id, instruction, path=None):
@@ -3890,10 +4118,13 @@ def _(CARDS, Cards):
         lines = []
         for type_, ids in drafts.items():
             for cid in (ids if isinstance(ids, list) else [ids]):
-                card = CARDS.get(cid)
-                if not card:
+                try:
+                    card = CARDS.get(cid)
+                    sch = CARDS.schema(card["type"]) if card else None
+                except Exception:
+                    card = None
+                if not card or not sch:
                     continue
-                sch = CARDS.schema(card["type"])
                 filled = {k for k, v in card["data"].items() if v not in (None, "", [], {})}
                 empty = [f["key"] for f in sch["fields"] if f["key"] not in filled]
                 lines.append(f"[kartu #{cid}, jenis {type_}]\n{CARDS.render(card, mode='all', limit=4000)}\n"
@@ -4160,7 +4391,20 @@ def _(TXT, re, threading, time):
 
 
 @app.cell(hide_code=True)
-def _(CARDS, MEM, Memory, STORE, STORIES, TXT, WEB, WORLD, World, json):
+def _(
+    CARDS,
+    Cards,
+    MEM,
+    Memory,
+    STORE,
+    STORIES,
+    TXT,
+    WEB,
+    WORLD,
+    World,
+    json,
+    re,
+):
     def _fn(name, description, properties, required=()):
         return {"type": "function", "function": {"name": name, "description": description,
                 "parameters": {"type": "object", "properties": properties, "required": list(required)}}}
@@ -4239,8 +4483,13 @@ def _(CARDS, MEM, Memory, STORE, STORIES, TXT, WEB, WORLD, World, json):
                 out += TOOL_STUDIO
             return out
 
-        def call(self, chat_id, message_id, name, raw_args):
-            """Run one tool. Returns (result text, failed, media list)."""
+        FIELD_KEY = re.compile(r"^[A-Za-z_][\w-]{0,63}$")
+
+        def call(self, chat_id, message_id, name, raw_args, allowed=None):
+            """Run one tool. Returns (result text, failed, media list). allowed: names offered to the model;
+            a tool it was not offered is refused even if it exists."""
+            if allowed is not None and name not in allowed:
+                return json.dumps({"error": f"tool {name} tidak tersedia di sini"}), True, []
             try:
                 args = json.loads(raw_args or "{}")
                 if not isinstance(args, dict):
@@ -4443,7 +4692,7 @@ def _(CARDS, MEM, Memory, STORE, STORIES, TXT, WEB, WORLD, World, json):
             if not target:
                 return {"error": f"kartu '{card}' tidak dipakai cerita ini. Pilihan: {', '.join(c['name'] for c in pool)}"}
             keys = {f["key"] for f in self.cards.schema(target["type"])["fields"]}
-            if field not in keys and field not in target["data"]:
+            if not self.FIELD_KEY.match(str(field or "")) or (field not in keys and field not in target["data"]):
                 return {"error": f"field '{field}' tidak ada di skema {target['type']}. Field: {', '.join(sorted(keys))}"}
             self.cards.set_field(target["id"], field, value)
             report = self._field_report(target["id"], field, value)
@@ -4477,6 +4726,10 @@ def _(CARDS, MEM, Memory, STORE, STORIES, TXT, WEB, WORLD, World, json):
             return st.setdefault("drafts", {}), st
 
         def t_card_draft_update(self, chat_id, mid, type, field, value, card_id=None):
+            if type not in Cards.TYPE_ORDER:
+                return {"error": f"jenis kartu '{type}' tidak ada. Pilihan: {', '.join(Cards.TYPE_ORDER)}"}
+            if not self.FIELD_KEY.match(str(field or "")):
+                return {"error": "nama field hanya huruf, angka, _ atau - (lihat skema)"}
             drafts, st = self._drafts(chat_id)
             if card_id:
                 card = self.cards.get(int(card_id))
@@ -4551,14 +4804,23 @@ def _(CFG, base64, io, subprocess, sys, zipfile):
                 importlib.invalidate_caches()
                 return importlib.import_module(module)
 
+        IMAGE_OK = ("image/png", "image/jpeg", "image/jpg", "image/webp", "image/gif")
+
         @staticmethod
         def _text(data):
+            if data[:2] in (b"\xff\xfe", b"\xfe\xff"):
+                try:
+                    return data.decode("utf-16")
+                except UnicodeDecodeError:
+                    return None
             if b"\x00" in data[:4096]:
                 return None
-            try:
-                return data.decode("utf-8")
-            except UnicodeDecodeError:
-                return data.decode("latin-1")
+            for enc in ("utf-8-sig", "cp1252"):
+                try:
+                    return data.decode(enc)
+                except UnicodeDecodeError:
+                    pass
+            return data.decode("latin-1")
 
         @classmethod
         def process(cls, files):
@@ -4577,6 +4839,14 @@ def _(CFG, base64, io, subprocess, sys, zipfile):
                     continue
                 try:
                     if mime.startswith("image/"):
+                        if mime not in cls.IMAGE_OK:
+                            # HEIC, BMP, TIFF...: convert to PNG, or the server would fail on every later turn
+                            try:
+                                fitz = cls._mod("fitz", "pymupdf")
+                                data, mime = fitz.Pixmap(data).tobytes("png"), "image/png"
+                            except Exception:
+                                notes.append(f"{name}: format gambar {mime} tidak didukung (pakai PNG/JPEG/WebP)")
+                                continue
                         media.append({"kind": "image", "mime": mime, "name": name, "data": data})
                     elif mime.startswith("video/"):
                         media.append({"kind": "video", "mime": mime, "name": name, "data": data})
@@ -4692,6 +4962,7 @@ def _(TXT, hashlib, io, json, re, time, zipfile):
                     cur["ids"].append(m["id"])
                     cur["id"] = m["id"]
                     if m["role"] == "assistant":
+                        cur["answer_id"], cur["edit_text"] = m["id"], m["content"]
                         if m["reasoning"]:
                             cur["reasoning"] += ("\n\n" if cur["reasoning"] else "") + m["reasoning"]
                         if m["content"]:
@@ -4864,6 +5135,7 @@ def _(
     SERVERS,
     STORE,
     STORIES,
+    SimpleNamespace,
     TOOLS,
     TOOL_CARD_EDIT,
     TXT,
@@ -4874,6 +5146,7 @@ def _(
     os,
     random,
     re,
+    sys,
     threading,
     time,
     timedelta,
@@ -4936,6 +5209,16 @@ def _(
             self.bg_busy = False
             self.fact_jobs = []
             self.backfilled = False
+            self.dead = False
+            self.importing = False
+            # Re-running a cell makes a new Engine; the old one's idle loop and hooks must not keep working on the
+            # same database next to it. The registry lives in sys.modules, which survives cell re-runs.
+            reg = sys.modules.setdefault("_qchat_runtime", SimpleNamespace(engines=[]))
+            for old in list(reg.engines):
+                old.shutdown()
+            reg.engines = [self]
+            self.store.import_guards.append(self._import_guard)
+            self.store.import_hooks.append(self._after_import)
             # QCHAT_IDLE=0 turns the background loop off (tests run several engines against one fake server).
             if os.environ.get("QCHAT_IDLE", "1") != "0":
                 self.idle_thread = threading.Thread(target=self._idle_loop, daemon=True)
@@ -4948,7 +5231,7 @@ def _(
             with self.lock:
                 if self.busy:
                     if queue_text is not None:
-                        self.queue.append((fn, args))
+                        self.queue.append((fn, args, queue_text))
                         self.emit("toast", {"text": f"Masuk antrian ({len(self.queue)})."})
                         self.emit("queue", len(self.queue))
                     else:
@@ -4969,16 +5252,21 @@ def _(
                 self.emit("toast", {"text": f"{type(e).__name__}: {e}", "kind": "error"})
             finally:
                 self.last_activity = time.time()
-                nxt = None
+                nxt, dropped = None, []
                 with self.lock:
                     if self.queue and not self.stop.is_set():
                         nxt = self.queue.pop(0)
                     else:
+                        dropped = [q[2] for q in self.queue if q[2]]
                         self.queue.clear()
                         self.busy = False
                 self.emit("queue", len(self.queue))
+                if dropped:  # Stop cancels the queue, but the typed text goes back to the composer
+                    self.emit("compose", "\n\n".join(dropped))
+                    self.emit("toast", {"text": f"{len(dropped)} pesan di antrian dibatalkan; teksnya dikembalikan ke kotak pesan.",
+                                        "kind": "warn"})
                 if nxt:
-                    self._job(*nxt)
+                    self._job(nxt[0], nxt[1])
                 else:
                     self.emit("busy", False)
 
@@ -4986,6 +5274,38 @@ def _(
             self.stop.set()
             self.compactor.cancel.set()
             self.bg_cancel.set()
+
+        def shutdown(self):
+            """Retire this engine (a newer one took over): stop its work and its background loop."""
+            self.dead = True
+            self.stop_now()
+            for lst, fn in ((self.store.import_guards, self._import_guard), (self.store.import_hooks, self._after_import)):
+                if fn in lst:
+                    lst.remove(fn)
+
+        def _import_guard(self):
+            """Loading or restoring a database while a reply is written would put it into another chat of the new file."""
+            if self.busy:
+                raise RuntimeError("Tunggu balasan selesai (atau klik Stop) sebelum memuat database.")
+            self.importing = True
+            self.bg_cancel.set()
+            self.compactor.cancel.set()
+            for _ in range(150):
+                if not self.bg_busy:
+                    return
+                time.sleep(0.1)
+            self.importing = False
+            raise RuntimeError("Tugas latar belakang masih berjalan. Coba lagi sebentar lagi.")
+
+        def _after_import(self, ok):
+            if ok:
+                with self.lock:
+                    self.queue.clear()
+                self.fact_jobs.clear()
+                self.last_used.clear()
+                self.active_chat = 0
+                EMB.cache.clear()
+            self.importing = False
 
         # ---------- chats and stories ----------
 
@@ -5018,6 +5338,8 @@ def _(
                 if greet:
                     opening = greet[min(greeting_index, len(greet) - 1)]
             if opening:
+                persona = self.cards.get(card_ids["persona"]) if card_ids.get("persona") else None
+                opening = TXT.macros(opening, char=(first_char or {}).get("name", ""), user=(persona or {}).get("name") or "kamu")
                 self.store.add_message(chat_id, None, "assistant", opening, meta={"opening": True})
             self.emit("chats")
             return chat_id
@@ -5110,6 +5432,8 @@ def _(
             extra = []
             if chat["kind"] in ("rp", "group") and parsed["kind"] != "ooc":
                 extra += self._catch_up(chat_id, uid)
+                if self.stop.is_set():
+                    return
             pending = len(full) // 3 + 1500 * len(media)
             self._turn(chat_id, extra=extra, pending_estimate=pending)
 
@@ -5131,7 +5455,7 @@ def _(
             t0 = self.world.state(chat_id, ids)["time"]
             before = self.world.last_event_id(chat_id)
             self.world.advance(chat_id, uid, minutes, "AFK")
-            self._tick(chat_id, t0, minutes, "Pemain sedang tidak ada (AFK).", head=uid)
+            self._tick(chat_id, t0, minutes, "Pemain sedang tidak ada (AFK).", head=uid, stop=self.stop)
             self._away_notice(chat_id, before, minutes)
             return [f"Pemain baru kembali setelah {World.fmt_span(minutes)} waktu dunia berlalu. Kejadian selama itu ada di atas."]
 
@@ -5148,6 +5472,9 @@ def _(
                 raise RuntimeError("Server model belum READY. Klik Start dan tunggu status READY.")
             c = self.prompt.ctx(chat_id)
             tools = self.tools.specs(c)
+            allowed = {t["function"]["name"] for t in tools}
+            # The turn writes under its own head. Re-reading chats.head_id would follow the UI to another branch.
+            turn = {"head": (self.store.chat(chat_id) or {}).get("head_id")}
             live = {"active": True, "content": "", "reasoning": "", "tools": [], "phase": "", "chat_id": chat_id,
                     "thinking": False}
             self.emit("live", live)
@@ -5156,11 +5483,11 @@ def _(
                 live["phase"] = msg
                 self.emit("live", live)
 
-            used = self.compactor.maybe(chat_id, tools, self.tools, phase, last_used=self.last_used.get(chat_id, 0),
-                                        pending_estimate=pending_estimate, clear_cancel=not self.stop.is_set())
-            if used:
-                self.last_used[chat_id] = used
-            phase("")
+            def add(role, *args, **kw):
+                mid = self.store.add_message(chat_id, turn["head"], role, *args, **kw)
+                turn["head"] = mid
+                return mid
+
             t0 = time.time()
             totals = {"tokens": 0, "think_s": 0.0, "tools": 0, "gen_s": 0.0}
             usage, final_id, used_info = {}, None, {}
@@ -5170,8 +5497,14 @@ def _(
             avoid = c["settings"].get("avoid") or []
             if avoid:
                 extra.append("Hindari frasa yang sudah berulang ini: " + "; ".join(f'"{p}"' for p in avoid[:8]))
-            error = None
+            error, state = None, None
+            seen_calls, fails_in_row = {}, 0
             try:
+                used = self.compactor.maybe(chat_id, tools, self.tools, phase, last_used=self.last_used.get(chat_id, 0),
+                                            pending_estimate=pending_estimate, clear_cancel=not self.stop.is_set())
+                if used:
+                    self.last_used[chat_id] = used
+                phase("")
                 _round = -1
                 while True:
                     _round += 1
@@ -5182,11 +5515,11 @@ def _(
                         if used:
                             self.last_used[chat_id] = used
                         phase("")
-                    path = self.store.path(chat_id)
+                    path = self.store.path(chat_id, head=turn["head"])
                     msgs, used_round = self.prompt.build(chat_id, path, extra=extra if _round == 0 else None)
                     if _round == 0:
                         used_info = used_round
-                        # keep the exact temporary block of this turn with the user message
+                        # keep the exact temporary block of this turn with the user message (later rounds resend it)
                         if used_round.get("note") and path and path[-1]["role"] == "user":
                             um = path[-1]
                             self.store.update_message(um["id"], meta={**um["meta"], "ephemeral": used_round["note"]})
@@ -5202,15 +5535,15 @@ def _(
                         if now - state["saved"] > 3:
                             state["saved"] = now
                             if state["mid"] is None:
-                                head = self.store.chat(chat_id)["head_id"]
-                                state["mid"] = self.store.add_message(chat_id, head, "assistant", acc["content"], acc["reasoning"],
-                                                                      status="partial")
+                                state["mid"] = add("assistant", acc["content"], acc["reasoning"], status="partial")
                             else:
                                 self.store.update_message(state["mid"], content=acc["content"], reasoning=acc["reasoning"])
 
+                    # After many failed tool calls in a row the model must answer with what it has.
+                    force_answer = fails_in_row >= 6
                     acc = self.llm.chat(msgs, tools=tools, kwargs=self.prompt.kwargs(c), sampling=self.prompt.sampling(c),
                                         max_tokens=c["settings"].get("max_tokens") or self._default_max_tokens(c),
-                                        on_delta=on_delta, stop=self.stop)
+                                        on_delta=on_delta, stop=self.stop, tool_choice="none" if force_answer else None)
                     live["thinking"] = False
                     usage = acc["usage"] or usage
                     if acc["usage"]:
@@ -5221,17 +5554,17 @@ def _(
                         totals["gen_s"] += time.time() - start
                     if acc["t_think"]:
                         totals["think_s"] += (acc["t_answer"] or time.time()) - acc["t_think"]
-                    calls = [] if self.stop.is_set() else [
+                    calls = [] if self.stop.is_set() or force_answer else [
                         {"id": cl["id"] or f"call_{int(time.time())}_{i}", "type": "function",
                          "function": {"name": cl["name"], "arguments": cl["arguments"] or "{}"}}
                         for i, cl in sorted(acc["calls"].items())]
+                    if force_answer:
+                        fails_in_row = 0
                     content = TXT.dedupe_parens(acc["content"]) if c["kind"] in ("rp", "group") else acc["content"]
                     status = "partial" if acc["finish"] in ("stopped", "length") and not calls else "final"
                     if state["mid"] is None:
-                        head = self.store.chat(chat_id)["head_id"]
                         if content or acc["reasoning"] or calls:
-                            state["mid"] = self.store.add_message(chat_id, head, "assistant", content, acc["reasoning"],
-                                                                  calls or None, status=status)
+                            state["mid"] = add("assistant", content, acc["reasoning"], calls or None, status=status)
                     else:
                         self.store.update_message(state["mid"], content=content, reasoning=acc["reasoning"],
                                                   tool_calls=calls or None, status=status)
@@ -5239,17 +5572,26 @@ def _(
                     if not calls:
                         break
                     for tc in calls:
+                        name, args = tc["function"]["name"], tc["function"]["arguments"]
                         if self.stop.is_set():
-                            break
-                        entry = {"name": tc["function"]["name"], "args": tc["function"]["arguments"], "result": "", "running": True}
-                        live["tools"].append(entry)
-                        self.emit("live", live)
-                        res, failed, media = self.tools.call(chat_id, state["mid"], entry["name"], entry["args"])
-                        entry.update(result=res[:4000], running=False, error=failed)
-                        totals["tools"] += 1
-                        self.emit("live", live)
-                        self.store.add_message(chat_id, self.store.chat(chat_id)["head_id"], "tool", res, tool_call_id=tc["id"],
-                                               meta={"error": failed}, media=media)
+                            # every tool call needs a result, or the next request has an unanswered call
+                            res, failed, media = json.dumps({"error": "dibatalkan (Stop)"}), True, []
+                        else:
+                            key = (name, re.sub(r"\s+", "", args or ""))
+                            seen_calls[key] = seen_calls.get(key, 0) + 1
+                            entry = {"name": name, "args": args, "result": "", "running": True}
+                            live["tools"].append(entry)
+                            self.emit("live", live)
+                            if seen_calls[key] > 2:
+                                res, failed, media = json.dumps({"error": "Panggilan ini sudah dilakukan 2 kali dengan argumen yang "
+                                                                          "sama. Jangan diulang; pakai hasil sebelumnya dan lanjutkan."}), True, []
+                            else:
+                                res, failed, media = self.tools.call(chat_id, state["mid"], name, args, allowed=allowed)
+                            entry.update(result=res[:4000], running=False, error=failed)
+                            totals["tools"] += 1
+                            self.emit("live", live)
+                            fails_in_row = fails_in_row + 1 if failed else 0
+                        add("tool", res, tool_call_id=tc["id"], meta={"error": failed}, media=media)
                         if self.last_used.get(chat_id):
                             self.last_used[chat_id] += len(res) // 3 + 1500 * len(media)
                     if self.stop.is_set():
@@ -5258,6 +5600,9 @@ def _(
                 error = f"Server menolak request (HTTP {e.code}): {e.read().decode('utf-8', 'replace')[:400]}"
             except Exception as e:
                 error = f"{type(e).__name__}: {e}"
+            if final_id is None and state and state.get("mid"):
+                final_id = state["mid"]  # the error came mid-stream: keep what was written as one cut-off reply
+                self.store.update_message(final_id, status="partial")
             stats = {"tokens": totals["tokens"], "tps": totals["tokens"] / totals["gen_s"] if totals["tokens"] and totals["gen_s"] else None,
                      "think_s": totals["think_s"] or None, "tools": totals["tools"] or None, "total_s": time.time() - t0,
                      "stopped": self.stop.is_set(), "model": self.servers.state.get("preset"), "ctx": self.servers.state.get("ctx"),
@@ -5265,8 +5610,7 @@ def _(
             live["active"] = False
             self.emit("live", {})
             if final_id is None:
-                head = self.store.chat(chat_id)["head_id"]
-                final_id = self.store.add_message(chat_id, head, "assistant", "", meta={"stats": stats, "error": error})
+                final_id = add("assistant", "", meta={"stats": stats, "error": error})
             else:
                 m = self.store.msg(final_id)
                 meta = {**m["meta"], "stats": stats}
@@ -5274,7 +5618,11 @@ def _(
                     meta["error"] = error
                 self.store.update_message(final_id, meta=meta)
             if not error and not self.stop.is_set() and c["kind"] in ("rp", "group"):
-                self._after_turn(chat_id, final_id, c, used_info)
+                try:
+                    self._after_turn(chat_id, final_id, c, used_info)
+                except Exception as e:
+                    self.emit("live", {})
+                    self.emit("toast", {"text": f"Pemeriksaan setelah giliran gagal: {type(e).__name__}: {e}", "kind": "warn"})
             self.emit("history", chat_id)
             self.emit("panels", chat_id)
             self.emit("ctx", {"used": self.last_used.get(chat_id, 0), "max": self.llm.max_context()})
@@ -5302,23 +5650,34 @@ def _(
 
         # ---------- after the turn ----------
 
+        @staticmethod
+        def _turn_text(path, mid):
+            """All narration of the turn that ends at mid (rounds before and after tool calls), and the earlier replies."""
+            ids = [x["id"] for x in path]
+            end = ids.index(mid) if mid in ids else len(path) - 1
+            start = end
+            while start > 0 and path[start - 1]["role"] != "user":
+                start -= 1
+            text = "\n\n".join(x["content"] for x in path[start:end + 1] if x["role"] == "assistant" and x["content"].strip())
+            before = [x["content"] for x in path[:start] if x["role"] == "assistant" and x["content"]]
+            return text, before
+
         def _after_turn(self, chat_id, mid, c, used):
             m = self.store.msg(mid)
-            if not m or not m["content"].strip():
+            path = self.store.path(chat_id, head=mid)
+            full, before = self._turn_text(path, mid)
+            if not m or not full.strip():
                 return
-            path = self.store.path(chat_id)
-            ids = [x["id"] for x in path]
-            # world: mark events the player has now been told about, fire due timeline entries
+            # world: mark events the player has now been told about (by this reply), fire due timeline entries
             if used.get("events"):
-                self.world.mark_shown(used["events"])
-            st = self.world.state(chat_id, ids)
+                self.world.mark_shown(used["events"], mid)
             for e in used.get("timeline") or []:
                 self.world.add_world_event(chat_id, mid, e["at"], f"{e['title']}. {e['text']}", ["player"], True, f"timeline:{e['id']}")
             flags = []
             # length: continue once if clearly short
             tgt = used.get("length")
             if tgt:
-                paras, sents = TXT.shape(m["content"])
+                paras, sents = TXT.shape(full)
                 if paras < tgt["paragraphs"] - 1 and not self.stop.is_set():
                     add = tgt["paragraphs"] - paras
                     self.emit("live", {"active": True, "content": m["content"], "phase": "Menambah paragraf…", "reasoning": "",
@@ -5333,27 +5692,28 @@ def _(
                     if more:
                         self.store.update_message(mid, content=m["content"].rstrip() + "\n\n" + more)
                         m = self.store.msg(mid)
+                        full = full.rstrip() + "\n\n" + more
                     self.emit("live", {})
-                paras, sents = TXT.shape(m["content"])
+                paras, sents = TXT.shape(full)
                 m["meta"]["shape"] = {"target": tgt, "paragraphs": paras, "sentences": sents}
-            # quality checks
-            prev = [x["content"] for x in path if x["role"] == "assistant" and x["id"] != mid and x["content"]][-4:]
-            rep = TXT.repeated_phrases(m["content"], prev)
+            # quality checks over the whole turn
+            prev = before[-4:]
+            rep = TXT.repeated_phrases(full, prev)
             self.store.chat_settings(chat_id, avoid=rep)
             if rep:
                 flags.append({"kind": "repeat", "text": "Frasa berulang: " + "; ".join(rep[:4])})
-            banned = TXT.banned_hits(m["content"], self.prompt.style(c).get("banned") or [])
+            banned = TXT.banned_hits(full, self.prompt.style(c).get("banned") or [])
             if banned:
                 flags.append({"kind": "banned", "text": "Frasa terlarang: " + ", ".join(banned)})
             lang = (self.prompt.style(c).get("narration_lang") or "Indonesia").lower()
             expected = "id" if lang.startswith(("indo", "id")) else "de" if lang.startswith(("jer", "deu", "ger", "de")) else "en"
-            dom, shares = TXT.narration_language(m["content"], expected)
+            dom, shares = TXT.narration_language(full, expected)
             if dom != expected and shares.get(dom, 0) > 0.5:
                 flags.append({"kind": "language", "text": f"Narasi tampaknya berbahasa {dom}, bukan {expected}."})
-            if TXT.split_dialogue(m["content"]) >= 3:
+            if TXT.split_dialogue(full) >= 3:
                 flags.append({"kind": "split", "text": "Dialog tampak terpecah per kata dengan terjemahan pendek."})
             persona = (c["cards"].get("persona") or {}).get("name", "")
-            acts = TXT.acts_for_user(m["content"], persona)
+            acts = TXT.acts_for_user(full, persona)
             if acts:
                 flags.append({"kind": "acts_for_user", "text": "Narasi tampaknya memutuskan ucapan/tindakan pemain: "
                                                                + "; ".join(acts[:3])})
@@ -5401,13 +5761,23 @@ def _(
         @staticmethod
         def _range(text, default):
             m = re.match(r"\s*(\d+)\s*-\s*(\d+)", str(text or ""))
-            return (int(m.group(1)), int(m.group(2))) if m else default
+            return tuple(sorted((int(m.group(1)), int(m.group(2))))) if m else default
 
         def _json(self, text):
+            """The first JSON object in a model answer, or None (never raises on bad JSON)."""
             t = (text or "").strip()
             t = re.sub(r"^```(?:json)?\s*|\s*```$", "", t)
-            m = re.search(r"\{.*\}", t, re.S)
-            return json.loads(m.group(0)) if m else None
+            dec = json.JSONDecoder()
+            for n, mt in enumerate(re.finditer(r"\{", t)):
+                if n >= 50:
+                    break
+                try:
+                    obj, _ = dec.raw_decode(t[mt.start():])
+                except ValueError:
+                    continue
+                if isinstance(obj, dict):
+                    return obj
+            return None
 
         def _choices(self, chat_id, c, path):
             gm = self.prompt.gm(c)
@@ -5464,10 +5834,16 @@ def _(
                                                      path=path),
                                     kwargs=self.prompt.kwargs(c), sampling={"temperature": 0.3}, max_tokens=6000,
                                     tools=self.tools.specs(c), stop=stop)
+            if acc["finish"] == "stopped" or stop.is_set():
+                if not announce:
+                    self.fact_jobs.insert(0, (chat_id, mid))  # interrupted by a new message: check it again later
+                return []
             data = self._json(acc["content"]) or {}
             warnings = []
             for claim in (data.get("claims") or [])[:6]:
                 if stop.is_set():
+                    if not announce:
+                        self.fact_jobs.insert(0, (chat_id, mid))
                     return []
                 known = self.mem.fact_lookup(claim, world["id"] if world else None, limit=3)
                 if any(TXT.jaccard(claim, k["claim"]) >= 0.5 for k in known):
@@ -5518,9 +5894,13 @@ def _(
             if u is None:
                 self.emit("toast", {"text": "Tidak ada pesan pengguna untuk dijawab ulang.", "kind": "warn"})
                 return
-            self.store.set_head(chat_id, u["id"])
+            self.run(self._turn_from, chat_id, u["id"])
+
+        def _turn_from(self, chat_id, head):
+            """Answer from a given message (reroll, a stopped turn, a failed turn)."""
+            self.store.set_head(chat_id, head)
             self.emit("history", chat_id)
-            self.run(self._turn, chat_id)
+            self._turn(chat_id)
 
         def swipe(self, chat_id, mid, direction):
             m = self.store.msg(mid)
@@ -5544,20 +5924,49 @@ def _(
 
         def edit(self, chat_id, mid, text):
             m = self.store.msg(mid)
+            if not m:
+                return None
             if m["role"] == "user":
-                meta = {**m["meta"], "typed": text}
-                nid = self.store.add_message(chat_id, m["parent_id"], "user", text, meta=meta, ooc=bool(m["ooc"]))
-                self.emit("history", chat_id)
-                self.run(self._turn, chat_id)
-            else:
-                nid = self.store.add_message(chat_id, m["parent_id"], m["role"], text, m["reasoning"], meta={"edited": True})
-                self.emit("history", chat_id)
+                self.run(self._edit_user, chat_id, mid, text)
+                return None
+            if m["role"] != "assistant":
+                self.emit("toast", {"text": "Hasil tool tidak bisa diedit.", "kind": "warn"})
+                return None
+            # the edited text is a plain answer: a copied tool call without its results would be cut from the prompt
+            nid = self.store.add_message(chat_id, m["parent_id"], "assistant", text, m["reasoning"], meta={"edited": True})
+            self.emit("history", chat_id)
             return nid
 
+        def _edit_user(self, chat_id, mid, text):
+            m = self.store.msg(mid)
+            typed = m["meta"].get("typed", m["content"])
+            # keep what the attachments added: their text blocks after the typed text, and the images/videos
+            tail = m["content"][len(typed):] if m["content"].startswith(typed) else ""
+            media = [{k: a[k] for k in ("kind", "mime", "name", "data")} for a in self.store.attachments([mid]).get(mid, [])]
+            meta = {k: v for k, v in m["meta"].items() if k != "ephemeral"}
+            meta["typed"] = text
+            self.store.add_message(chat_id, m["parent_id"], "user", text + tail, meta=meta, ooc=bool(m["ooc"]), media=media)
+            self.emit("history", chat_id)
+            self._turn(chat_id)
+
         def continue_msg(self, chat_id, mid):
+            m = self.store.msg(mid)
+            if not m:
+                return
+            if m["role"] in ("user", "tool"):
+                # Nothing to continue yet: answer from here. A turn stopped after a tool call goes on with its tool loop.
+                self.run(self._turn_from, chat_id, mid)
+                return
             self.run(self._continue, chat_id, mid)
 
         def _continue(self, chat_id, mid):
+            try:
+                self._continue_inner(chat_id, mid)
+            finally:
+                self.emit("live", {})
+                self.emit("history", chat_id)
+
+        def _continue_inner(self, chat_id, mid):
             c = self.prompt.ctx(chat_id)
             m = self.store.msg(mid)
             self.store.set_head(chat_id, mid)
@@ -5578,8 +5987,6 @@ def _(
             if more:
                 joiner = "\n\n" if acc["content"].startswith("\n") or base.endswith((".", "!", "?", "”", '"', "»")) else " "
                 self.store.update_message(mid, content=TXT.dedupe_parens(base + joiner + more), status="final")
-            self.emit("live", {})
-            self.emit("history", chat_id)
 
         def delete_msg(self, chat_id, mid):
             m = self.store.msg(mid)
@@ -5597,6 +6004,9 @@ def _(
                     for t, col in (("attachments", "message_id"), ("status_events", "message_id"), ("world_events", "message_id"),
                                    ("dice_log", "message_id"), ("chapters", "message_id"), ("summaries", "node_id"), ("messages", "id")):
                         self.store.conn.execute(f"DELETE FROM {t} WHERE {col} IN ({marks})", part)
+                    for m_id in part:
+                        self.store.conn.execute("DELETE FROM vectors WHERE kind = 'msg' AND ref_id BETWEEN ? AND ?",
+                                                (m_id * 100, m_id * 100 + 99))
                 self.store.conn.commit()
             head = (self.store.chat(chat_id) or {}).get("head_id")
             if head in sub or head is None:
@@ -5648,20 +6058,20 @@ def _(
                 acc = self.llm.chat(msgs, tools=tools, kwargs=self.prompt.kwargs(c), sampling=self.prompt.sampling(c),
                                     max_tokens=12000, stop=stop or self.stop)
                 calls = [v for _, v in sorted(acc["calls"].items())]
-                if not calls or (stop and stop.is_set()):
+                if not calls or (stop or self.stop).is_set() or acc["finish"] == "stopped":
                     break
                 msgs.append({"role": "assistant", "content": acc["content"], "tool_calls": [
                     {"id": cl["id"] or f"t{i}", "type": "function", "function": {"name": cl["name"], "arguments": cl["arguments"] or "{}"}}
                     for i, cl in enumerate(calls)]})
                 for i, cl in enumerate(calls):
-                    res, _, _ = self.tools.call(chat_id, head, cl["name"], cl["arguments"])
+                    res, _, _ = self.tools.call(chat_id, head, cl["name"], cl["arguments"], allowed=allowed)
                     msgs.append({"role": "tool", "tool_call_id": cl["id"] or f"t{i}", "content": res})
             self.store.side_log("world_tick", {"why": why, "from": str(t0), "minutes": minutes,
                                                "transcript": [m for m in msgs if m["role"] in ("assistant", "tool")]},
                                 chat_id, head)
 
         def _idle_loop(self):
-            while True:
+            while not self.dead:
                 time.sleep(30)
                 try:
                     self._idle_once()
@@ -5669,7 +6079,7 @@ def _(
                     pass
 
         def _idle_once(self):
-            if self.busy or self.bg_busy or not self.servers.ready():
+            if self.dead or self.importing or self.busy or self.bg_busy or not self.servers.ready():
                 return
             # Embed whatever is new (messages, summaries, lore, events...) every few minutes while idle.
             if EMB.ready() and time.time() - (self.backfilled or 0) > 300:
@@ -5678,7 +6088,7 @@ def _(
             self.bg_cancel.clear()
             self.bg_busy = True
             try:
-                while self.fact_jobs and not self.busy:
+                while self.fact_jobs and not self.busy and not self.bg_cancel.is_set():
                     chat_id, mid = self.fact_jobs.pop(0)
                     self._fact_check(chat_id, mid, False)
                 chat_id = self.active_chat
@@ -5750,11 +6160,16 @@ def _(
                                              f"Kalau yang berubah adalah sifat tetap tokoh/dunia/gaya, pakai card_update (kartu). Kalau yang "
                                              f"berubah keadaan cerita, pakai canon_set / status_update / memory_save. Jawab singkat apa yang diubah.")
             head = self.store.chat(chat_id)["head_id"]
+            names = {t["function"]["name"] for t in tools}
+            answered = False
             for _ in range(3):
                 acc = self.llm.chat(msgs, tools=tools, kwargs=self.prompt.kwargs(c), sampling=self.prompt.sampling(c), max_tokens=8000,
                                     stop=self.stop)
                 calls = [v for _, v in sorted(acc["calls"].items())]
+                if self.stop.is_set():
+                    break
                 if not calls:
+                    answered = True
                     self.store.side_log("studio_change", {"request": request, "answer": acc["content"],
                                                           "transcript": [m for m in msgs if m["role"] in ("assistant", "tool")]},
                                         chat_id, head)
@@ -5764,8 +6179,15 @@ def _(
                     {"id": cl["id"] or f"s{i}", "type": "function", "function": {"name": cl["name"], "arguments": cl["arguments"] or "{}"}}
                     for i, cl in enumerate(calls)]})
                 for i, cl in enumerate(calls):
-                    res, _, _ = self.tools.call(chat_id, head, cl["name"], cl["arguments"])
+                    res, _, _ = self.tools.call(chat_id, head, cl["name"], cl["arguments"], allowed=names)
                     msgs.append({"role": "tool", "tool_call_id": cl["id"] or f"s{i}", "content": res})
+            if not answered:
+                done = [m["tool_calls"][0]["function"]["name"] for m in msgs if m.get("tool_calls")]
+                self.store.side_log("studio_change", {"request": request, "answer": "",
+                                                      "transcript": [m for m in msgs if m["role"] in ("assistant", "tool")]},
+                                    chat_id, head)
+                self.emit("toast", {"text": "Perubahan diproses" + (f" ({', '.join(done)})" if done else "") + ". Cek kartu/buku cerita.",
+                                    "long": True})
             self.emit("panels", chat_id)
 
         def variations(self, chat_id, card_id, field):
@@ -6134,10 +6556,13 @@ def _():
       const $ = (q) => el.querySelector(q);
       const scroll = $(".qr-scroll"), list = $(".qr-list"), liveBox = $(".qr-live"), input = $(".qr-input");
       const drawer = $(".qr-drawer"), dbody = $(".qr-drawer-body"), modal = $(".qr-modal");
-      const state = { tab: "chat", pending: [], open: new Set(), cardView: null, learn: false, studioCard: null, libFilter: "" };
+      const state = { tab: "chat", pending: [], open: new Set(), cardView: null, learn: false, studioCard: null, libFilter: "",
+        cards: new Map() };
+      const rootActive = () => el.getRootNode().activeElement || document.activeElement;
       const els = new Map();
       const fol = follower(scroll, (on) => { $(".qr-jump").hidden = on; });
-      new ResizeObserver(() => fol.stick()).observe($(".qr-col"));
+      const ro1 = new ResizeObserver(() => fol.stick());
+      ro1.observe($(".qr-col"));
 
       const send = (action, extra = {}) => { model.set("command", { n: Date.now() + Math.random(), action, ...extra }); model.save_changes(); };
       const get = (k) => model.get(k) || {};
@@ -6149,8 +6574,8 @@ def _():
         $(".qr-toasts").appendChild(t);
         setTimeout(() => t.remove(), long ? 12000 : 4500);
       };
-      const openModal = (title, html) => { $(".qr-modal-title").textContent = title; $(".qr-modal-body").innerHTML = html; modal.hidden = false; };
-      const closeModal = () => { modal.hidden = true; $(".qr-modal-body").innerHTML = ""; };
+      const openModal = (title, html, wizard = false) => { state.wizard = wizard; $(".qr-modal-title").textContent = title; $(".qr-modal-body").innerHTML = html; modal.hidden = false; };
+      const closeModal = () => { state.wizard = false; modal.hidden = true; $(".qr-modal-body").innerHTML = ""; };
 
       // theme follows marimo (dark class on the page) or the OS
       const syncTheme = () => {
@@ -6265,9 +6690,10 @@ def _():
       function actionsBar(it) {
         const sw = it.swipe && it.swipe[1] > 1
           ? `<span class="qr-swipe"><button class="qr-icon qr-xs" data-act="swipe" data-id="${it.id}" data-dir="-1">${icon("left")}</button>${it.swipe[0]}/${it.swipe[1]}<button class="qr-icon qr-xs" data-act="swipe" data-id="${it.id}" data-dir="1">${icon("right")}</button></span>` : "";
-        const b = (act, ic, title) => `<button class="qr-icon qr-xs" data-act="${act}" data-id="${it.id}" title="${title}">${icon(ic)}</button>`;
+        const b = (act, ic, title, id = it.id) => `<button class="qr-icon qr-xs" data-act="${act}" data-id="${id}" title="${title}">${icon(ic)}</button>`;
+        const ba = (act, ic, title) => b(act, ic, title, it.answer_id || it.id);
         if (it.kind === "user") return `<div class="qr-actions">${sw}${it.has_note ? b("note-view", "eye", "Catatan sistem giliran ini") : ""}${b("copy", "copy", "Salin")}${b("edit", "edit", "Edit (membuat cabang)")}${b("pin", "pin", it.pinned ? "Lepas pin" : "Pin")}${b("branch", "branch", "Cabang dari sini")}${b("delete", "trash", "Hapus")}</div>`;
-        return `<div class="qr-actions">${sw}${b("copy", "copy", "Salin")}${b("reroll", "refresh", "Jawab ulang")}${b("continue", "forward", "Lanjutkan")}${b("edit", "edit", "Edit")}${b("pin", "pin", it.pinned ? "Lepas pin" : "Pin")}${b("chapter", "bookmark", "Tandai bab")}${b("fact-check", "flag", "Cek fakta")}${b("branch", "branch", "Cabang dari sini")}${b("delete", "trash", "Hapus")}</div>`;
+        return `<div class="qr-actions">${sw}${b("copy", "copy", "Salin")}${b("reroll", "refresh", "Jawab ulang")}${b("continue", "forward", "Lanjutkan")}${ba("edit", "edit", "Edit")}${ba("pin", "pin", it.pinned ? "Lepas pin" : "Pin")}${ba("chapter", "bookmark", "Tandai bab")}${ba("fact-check", "flag", "Cek fakta")}${b("branch", "branch", "Cabang dari sini")}${b("delete", "trash", "Hapus")}</div>`;
       }
       function statsLine(st) {
         if (!st) return "";
@@ -6426,53 +6852,59 @@ def _():
         const cards = st.studio ? st.cards || [] : [];
         // only a card that belongs to this studio session may be shown
         if (!cards.some((x) => x.id === state.studioCard)) state.studioCard = cards.length ? cards[0].id : null;
-        // keep a form with unsaved edits; onCard shows a reload notice instead
-        const keep = state.formDirty && state.formDirty === state.studioCard ? pane.querySelector(".qr-studio-form") : null;
+        // A form with unsaved edits, or one the user is typing in, is left alone: only the tabs are refreshed.
+        const oldForm = pane.querySelector(".qr-studio-form");
+        const keep = oldForm && oldForm.querySelector(".qr-card-form") &&
+          ((state.formDirty && state.formDirty === state.studioCard) || oldForm.contains(rootActive())) ? oldForm : null;
+        const tabsHTML = cards.map((x) => `<button class="qr-tabbtn ${x.id === state.studioCard ? "on" : ""}" data-act="studio-card" data-id="${x.id}">${esc((get("boot").types || {})[x.type] || x.type)}: ${esc(x.name)}</button>`).join("") || '<span class="qr-muted">Belum ada kartu. Mulai ngobrol di kiri.</span>';
+        if (keep && pane.querySelector(".qr-studio-tabs")) { pane.querySelector(".qr-studio-tabs").innerHTML = tabsHTML; return; }
         const quick = [["Lengkapi yang kosong", "Lengkapi field kartu yang masih kosong dengan usulan yang konsisten."],
           ["Cek konsistensi", "Cek konsistensi antar kartu (dan anakronisme kalau dunia berbasis dunia nyata), lalu perbaiki."],
           ["Uji adegan", "Uji adegan: tulis satu paragraf pembuka dengan kartu Gaya dan GM yang sekarang."],
           ["Uji suara", "Uji suara tokoh utama: balas tiga situasi (santai, marah, sedih) sebagai tokoh itu."],
           ["Wawancara", "Aku mau mewawancarai tokoh utama. Jawab sebagai tokoh itu mulai sekarang sampai aku bilang selesai."]];
-        const card = get("card");
+        const card = state.cards.get(state.studioCard) || {};
         pane.innerHTML = `<div class="qr-studio-head"><b>Kartu di Studio</b>
             <button class="qr-btn qr-sm qr-primary" data-act="studio-finish" ${cards.length ? "" : "disabled"}>${icon("book")}Mulai RP</button></div>
           <div class="qr-studio-quick">${quick.map(([l, t]) => `<button class="qr-btn qr-sm" data-act="quick" data-text="${esc(t)}">${esc(l)}</button>`).join("")}</div>
           <div class="qr-studio-quick">
             <button class="qr-btn qr-sm" data-act="studio-image">${icon("upload")}Dari gambar</button>
             <button class="qr-btn qr-sm" data-act="studio-tidy">${icon("edit")}Rapikan teks</button></div>
-          <div class="qr-studio-tabs">${cards.map((x) => `<button class="qr-tabbtn ${x.id === state.studioCard ? "on" : ""}" data-act="studio-card" data-id="${x.id}">${esc((get("boot").types || {})[x.type] || x.type)}: ${esc(x.name)}</button>`).join("") || '<span class="qr-muted">Belum ada kartu. Mulai ngobrol di kiri.</span>'}</div>
+          <div class="qr-studio-tabs">${tabsHTML}</div>
           ${state.studioCard && card.id === state.studioCard ? `<div class="qr-row qr-var"><select class="qr-var-field">${(card.fields || [])
             .filter((f) => f.visibility !== "ui" || ["greetings", "opening"].includes(f.key)).map((f) => `<option value="${esc(f.key)}">${esc(f.label)}</option>`).join("")}</select>
             <button class="qr-btn qr-sm" data-act="variations">${icon("sparkles")}Variasi</button></div>` : ""}
           <div class="qr-studio-form">${state.studioCard && card.id === state.studioCard ? cardForm(card, true) : ""}</div>`;
-        if (keep) pane.querySelector(".qr-studio-form").replaceWith(keep);
         if (state.studioCard && card.id !== state.studioCard) send("card_open", { card_id: state.studioCard });
       }
 
       // ---------- card form ----------
       function fieldInput(f, v) {
-        const name = `f-${f.key}`;
+        const key = esc(f.key);  // keys come from cards the model or an import wrote: never trust them in markup
+        const name = `f-${String(f.key).replace(/[^\w-]/g, "_")}`;
         const badge = `${f.core ? '<span class="qr-badge" title="Masuk prompt beku">inti</span>' : ""}${f.visibility === "secret" ? `<span class="qr-badge">${icon("lock")}rahasia</span>` : ""}${f.visibility === "ui" ? '<span class="qr-badge">hanya UI</span>' : ""}`;
         const label = `<label class="qr-flabel" for="${name}">${esc(f.label)} ${badge}</label>${f.help ? `<div class="qr-help">${esc(f.help)}</div>` : ""}`;
-        if (f.type === "longtext") return `${label}<textarea id="${name}" data-field="${f.key}" data-type="longtext" rows="3">${esc(v ?? "")}</textarea>`;
-        if (f.type === "list") return `${label}<textarea id="${name}" data-field="${f.key}" data-type="list" rows="3" placeholder="Satu per baris">${esc((Array.isArray(v) ? v : v ? [v] : []).join("\n"))}</textarea>`;
-        if (f.type === "tags") return `${label}<input id="${name}" data-field="${f.key}" data-type="tags" value="${esc((Array.isArray(v) ? v : v ? [v] : []).join(", "))}" placeholder="Pisahkan dengan koma">`;
+        if (v !== null && typeof v === "object" && !["list", "tags", "table"].includes(f.type))
+          return `${label}<textarea id="${name}" data-field="${key}" data-type="json" rows="4">${esc(JSON.stringify(v, null, 1))}</textarea>`;
+        if (f.type === "longtext") return `${label}<textarea id="${name}" data-field="${key}" data-type="longtext" rows="3">${esc(v ?? "")}</textarea>`;
+        if (f.type === "list") return `${label}<textarea id="${name}" data-field="${key}" data-type="list" rows="3" placeholder="Satu per baris">${esc((Array.isArray(v) ? v : v ? [v] : []).join("\n"))}</textarea>`;
+        if (f.type === "tags") return `${label}<input id="${name}" data-field="${key}" data-type="tags" value="${esc((Array.isArray(v) ? v : v ? [v] : []).join(", "))}" placeholder="Pisahkan dengan koma">`;
         if (f.type === "select") {
           const opts = [...(f.options || [])];
           if (v && !opts.includes(v)) opts.push(v);
-          return `${label}<select id="${name}" data-field="${f.key}" data-type="text"><option value=""></option>${opts.map((o) => `<option ${o === v ? "selected" : ""}>${esc(o)}</option>`).join("")}</select>`;
+          return `${label}<select id="${name}" data-field="${key}" data-type="text"><option value=""></option>${opts.map((o) => `<option ${o === v ? "selected" : ""}>${esc(o)}</option>`).join("")}</select>`;
         }
-        if (f.type === "number" && v !== undefined && v !== null && v !== "" && isNaN(Number(v))) return `${label}<input id="${name}" data-field="${f.key}" data-type="text" value="${esc(v)}">`;
-        if (f.type === "number") return `${label}<input id="${name}" type="number" data-field="${f.key}" data-type="number" value="${esc(v ?? "")}">`;
+        if (f.type === "number" && v !== undefined && v !== null && v !== "" && isNaN(Number(v))) return `${label}<input id="${name}" data-field="${key}" data-type="text" value="${esc(v)}">`;
+        if (f.type === "number") return `${label}<input id="${name}" type="number" data-field="${key}" data-type="number" value="${esc(v ?? "")}">`;
         if (f.type === "table") {
           const cols = f.columns || ["nilai"];
           const rows = Array.isArray(v) ? v : [];
-          return `${label}<div class="qr-table" data-field="${f.key}" data-type="table" data-cols="${cols.length}">
+          return `${label}<div class="qr-table" data-field="${key}" data-type="table" data-cols="${cols.length}">
             <div class="qr-trow qr-thead">${cols.map((c) => `<span>${esc(c)}</span>`).join("")}<span></span></div>
             ${rows.map((r) => `<div class="qr-trow">${cols.map((c, ci) => `<input value="${esc(Array.isArray(r) ? r[ci] ?? "" : (r || {})[c] ?? "")}">`).join("")}<button class="qr-icon qr-xs" data-act="row-del">${icon("x")}</button></div>`).join("")}
             <button class="qr-btn qr-sm" data-act="row-add">${icon("plus")}Baris</button></div>`;
         }
-        return `${label}<input id="${name}" data-field="${f.key}" data-type="text" value="${esc(v ?? "")}">`;
+        return `${label}<input id="${name}" data-field="${key}" data-type="text" value="${esc(v ?? "")}">`;
       }
       function cardForm(c, compact) {
         const sections = {};
@@ -6510,7 +6942,8 @@ def _():
           const k = n.dataset.field, t = n.dataset.type;
           if (t === "table") {
             data[k] = [...n.querySelectorAll(".qr-trow:not(.qr-thead)")].map((r) => [...r.querySelectorAll("input")].map((i) => i.value.trim())).filter((r) => r.some((x) => x));
-          } else if (t === "list") data[k] = n.value.split("\n").map((x) => x.trim()).filter(Boolean);
+          } else if (t === "json") { try { data[k] = JSON.parse(n.value); } catch (e) { data[k] = n.value; } }
+          else if (t === "list") data[k] = n.value.split("\n").map((x) => x.trim()).filter(Boolean);
           else if (t === "tags") data[k] = n.value.split(",").map((x) => x.trim()).filter(Boolean);
           else if (t === "number") data[k] = n.value === "" ? "" : Number(n.value);
           else data[k] = n.value;
@@ -6582,7 +7015,7 @@ def _():
             <span class="qr-muted">${esc((get("boot").types || {})[x.role] || x.role)}</span><b>${esc(x.name)}</b>
             ${x.latest > x.version ? '<span class="qr-badge" title="Berlaku setelah Terapkan sekarang atau compaction">versi baru</span>' : ""}
             <button class="qr-icon qr-xs" data-act="open-card" data-id="${x.id}" title="Buka">${icon("edit")}</button>
-            <button class="qr-icon qr-xs" data-act="detach" data-id="${x.id}" data-role="${x.role}" title="Lepas">${icon("x")}</button></div>`).join("")}
+            <button class="qr-icon qr-xs" data-act="detach" data-id="${x.id}" data-role="${esc(x.role)}" title="Lepas">${icon("x")}</button></div>`).join("")}
           <div class="qr-row"><select class="qr-attach-role">${roles.map((r) => `<option value="${r}">${esc((get("boot").types || {})[r] || r)}</option>`).join("")}</select>
             <select class="qr-attach-card"><option value="">Pasang kartu…</option>${(lib.cards || []).map((x) => `<option value="${x.id}">${esc(x.type)} · ${esc(x.name)}</option>`).join("")}</select>
             <button class="qr-btn qr-sm" data-act="attach-card">Pasang</button></div></section>
@@ -6595,7 +7028,8 @@ def _():
             <button class="qr-btn qr-sm" data-act="apply-now">${icon("refresh")}Terapkan sekarang</button></section>` : ""}`;
       }
       function tabCards() {
-        const lib = get("library"), card = get("card"), types = get("boot").types || {};
+        const lib = get("library"), types = get("boot").types || {};
+        const card = state.cards.get(state.cardView) || {};
         if (state.cardView && card.id === state.cardView) {
           return `<button class="qr-btn qr-sm" data-act="cards-back">${icon("left")}Perpustakaan</button>${cardForm(card, false)}`;
         }
@@ -6625,12 +7059,12 @@ def _():
         return `<section><h4>Server</h4><div class="qr-srv"><i class="qr-dot ${s.phase === "ready" ? "ok" : s.phase === "failed" ? "bad" : s.phase === "idle" ? "off" : "wait"}"></i>
             <b>${esc(s.preset || "Tidak ada")}</b> <span class="qr-muted">${esc(s.phase || "")}${s.ctx ? ` · ${fmtN(s.ctx)} token` : ""}${s.mtp ? " · MTP" : ""}${s.embed ? ` · embedder ${s.embed_ready ? "siap" : "memuat"}` : ""}</span></div>
           ${(s.warnings || []).map((w) => `<div class="qr-flag">${icon("warn")}${esc(w)}</div>`).join("")}${s.error ? `<pre class="qr-error">${esc(s.error)}</pre>` : ""}
-          ${s.gpu ? `<div class="qr-muted">GPU ${s.gpu.util.toFixed(0)}% · VRAM ${s.gpu.used_gb.toFixed(1)} / ${s.gpu.total_gb.toFixed(0)} GB</div>` : ""}
+          <div class="qr-muted qr-gpu">${s.gpu ? `GPU ${s.gpu.util.toFixed(0)}% · VRAM ${s.gpu.used_gb.toFixed(1)} / ${s.gpu.total_gb.toFixed(0)} GB` : ""}</div>
           ${s.installed ? "" : `<div class="qr-flag">${icon("warn")}Belum terpasang. Klik Install di sel Server model.</div>`}</section>
           <section><h4>Ganti model</h4><label>Model<select class="qr-model-sel">${boot.presets.map((x) => `<option ${x.name === sel ? "selected" : ""}>${esc(x.name)}</option>`).join("")}</select></label>
-          <label>Konteks<select class="qr-ctx-sel">${ctxs.map(([k, v]) => `<option value="${v}" ${v === (s.ctx || 524288) ? "selected" : ""}>${esc(k)}</option>`).join("")}</select></label>
+          <label>Konteks<select class="qr-ctx-sel">${ctxs.map(([k, v]) => `<option value="${v}" ${v === (state.modelCtx || s.ctx || 524288) ? "selected" : ""}>${esc(k)}</option>`).join("")}</select></label>
           ${p.yarn_exp ? '<div class="qr-help">Di atas 262K memakai YaRN tanpa resep resmi untuk model ini (eksperimental).</div>' : ""}
-          <label class="qr-check"><input type="checkbox" class="qr-mtp" checked> MTP</label><label class="qr-check"><input type="checkbox" class="qr-emb" checked> Embedder</label>
+          <label class="qr-check"><input type="checkbox" class="qr-mtp" ${state.modelMtp === false ? "" : "checked"}> MTP</label><label class="qr-check"><input type="checkbox" class="qr-emb" ${state.modelEmb === false ? "" : "checked"}> Embedder</label>
           <div class="qr-help">Ganti model membuat seluruh konteks diproses ulang di giliran berikutnya (bisa beberapa menit untuk chat panjang).</div>
           <div class="qr-row"><button class="qr-btn qr-primary" data-act="model-start">${icon("cpu")}Start</button><button class="qr-btn qr-danger" data-act="model-stop">Stop</button></div></section>`;
       }
@@ -6653,6 +7087,11 @@ def _():
       }
       function renderWizard() {
         if (!state.wizard) return;
+        // keep what the user already picked when the card list changes underneath
+        const body = $(".qr-modal-body"), prev = body.querySelector(".qr-wizard") ? {
+          title: body.querySelector(".wz-title")?.value || "", greet: body.querySelector(".wz-greet")?.value || "1",
+          roles: Object.fromEntries([...body.querySelectorAll("select[data-role]")].map((x) => [x.dataset.role, x.value])),
+          chars: new Set([...body.querySelectorAll(".qr-wz-chars input:checked")].map((x) => x.value)) } : null;
         const lib = get("library"), types = get("boot").types || {};
         const opt = (t) => (lib.cards || []).filter((c) => c.type === t).map((c) => `<option value="${c.id}">${esc(c.name)}</option>`).join("");
         openModal("Mulai cerita", `<div class="qr-wizard">
@@ -6660,7 +7099,13 @@ def _():
           ${["world", "scenario", "persona", "style", "gm"].map((t) => `<label>${esc(types[t] || t)}<select data-role="${t}"><option value="">${t === "style" || t === "gm" ? "default" : "tidak ada"}</option>${opt(t)}</select></label>`).join("")}
           <div class="qr-flabel">Tokoh</div><div class="qr-wz-chars">${(lib.cards || []).filter((c) => c.type === "character").map((c) => `<label class="qr-check"><input type="checkbox" value="${c.id}"> ${esc(c.name)}</label>`).join("") || '<span class="qr-muted">Belum ada kartu tokoh. Buat di Studio atau impor.</span>'}</div>
           <label>Pesan pembuka ke-<input class="wz-greet" type="number" min="1" value="1"></label>
-          <div class="qr-row"><button class="qr-btn qr-primary" data-act="wizard-go">${icon("book")}Mulai</button><button class="qr-btn" data-act="studio">${icon("sparkles")}Susun di Studio dulu</button></div></div>`);
+          <div class="qr-row"><button class="qr-btn qr-primary" data-act="wizard-go">${icon("book")}Mulai</button><button class="qr-btn" data-act="studio">${icon("sparkles")}Susun di Studio dulu</button></div></div>`, true);
+        if (prev) {
+          body.querySelector(".wz-title").value = prev.title;
+          body.querySelector(".wz-greet").value = prev.greet;
+          for (const x of body.querySelectorAll("select[data-role]")) if (prev.roles[x.dataset.role] !== undefined) x.value = prev.roles[x.dataset.role];
+          for (const x of body.querySelectorAll(".qr-wz-chars input")) x.checked = prev.chars.has(x.value);
+        }
       }
 
       // ---------- events ----------
@@ -6678,21 +7123,35 @@ def _():
         box.innerHTML = state.pending.map((f, i) => `<span class="qr-att">${icon("clip")}${esc(f.name)} <span class="qr-muted">${kb(f.size)}</span><button class="qr-icon qr-xs" data-act="unpend" data-i="${i}">${icon("x")}</button></span>`).join("");
       }
       const LONG_PH = input.placeholder;
-      new ResizeObserver(() => { input.placeholder = el.clientWidth < 640 ? "Kirim pesan" : LONG_PH; }).observe(el);
+      const ro2 = new ResizeObserver(() => { input.placeholder = el.clientWidth < 640 ? "Kirim pesan" : LONG_PH; });
+      ro2.observe(el);
+      listen("keydown", (e) => { if (e.key === "Escape" && !modal.hidden) closeModal(); });
       const grow = () => { input.style.height = "auto"; input.style.height = `${Math.min(input.scrollHeight, 240)}px`; };
       input.addEventListener("input", grow);
-      input.addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); $(".qr-form").requestSubmit(); } });
+      input.addEventListener("keydown", (e) => {
+        if (e.key !== "Enter" || e.shiftKey || e.isComposing || e.keyCode === 229) return;  // 229: Enter that ends IME input
+        e.preventDefault();
+        if (!input.value.trim() && !state.pending.length) return;  // an empty Enter never stops a reply (Stop is the button)
+        $(".qr-form").requestSubmit();
+      });
       input.addEventListener("paste", (e) => { const fs = [...(e.clipboardData?.files || [])]; if (fs.length) { e.preventDefault(); addFiles(fs); } });
       $(".qr-form").addEventListener("submit", async (e) => {
         e.preventDefault();
         const text = input.value.trim();
         if (model.get("busy") && !text && !state.pending.length) { send("stop"); return; }
         if (!text && !state.pending.length) return;
+        if (state.sending) return;
+        // clear first: a second Enter while big files are read must not send the same message twice
+        const pending = state.pending;
+        state.sending = true; input.value = ""; state.pending = []; renderPending(); grow();
         try {
-          const files = await Promise.all(state.pending.map(async (f) => ({ name: f.name, mime: f.type || "", b64: await readB64(f) })));
+          const files = await Promise.all(pending.map(async (f) => ({ name: f.name, mime: f.type || "", b64: await readB64(f) })));
           send("send", { text, files });
-          input.value = ""; state.pending = []; renderPending(); grow(); fol.jump();
-        } catch (err) { toast(`Gagal membaca lampiran: ${err}`, "error"); }
+          fol.jump();
+        } catch (err) {
+          input.value = text; state.pending = pending; renderPending(); grow();
+          toast(`Gagal membaca lampiran: ${err}`, "error");
+        } finally { state.sending = false; }
       });
       const main = $(".qr-main");
       let depth = 0;
@@ -6714,22 +7173,34 @@ def _():
       $(".qr-file-att").addEventListener("change", (e) => {
         addFiles([...(e.target.files || [])]);
         e.target.value = "";
-        if (state.imageIntent && state.pending.length) {
+        if (state.imageIntent && state.pending.length && get("chat").kind === "studio") {
           state.imageIntent = false;
           input.value = "Isi penampilan tokoh dari gambar terlampir (card_draft_update, field appearance), lalu jelaskan singkat apa yang kamu isi.";
           $(".qr-form").requestSubmit();
         }
       });
+      $(".qr-file-att").addEventListener("cancel", () => { state.imageIntent = false; });
       $(".qr-file-card").addEventListener("change", async (e) => { const f = e.target.files?.[0]; e.target.value = ""; if (f) send("card_import", { b64: await readB64(f), name: f.name }); });
       $(".qr-file-avatar").addEventListener("change", async (e) => {
         const f = e.target.files?.[0]; e.target.value = "";
         const form = el.querySelector(".qr-drawer .qr-card-form");
-        if (f && form) send("card_save", { card_id: Number(form.dataset.card), data: collectCard(form), avatar: await readB64(f) });
+        if (f && form) send("card_save", { card_id: Number(form.dataset.card), data: collectCard(form), avatar: await readB64(f), version: Number(form.dataset.version) });
       });
       // typing in a card form marks it as having unsaved edits
-      const markDirty = (e) => { const f = e.target.closest && e.target.closest(".qr-card-form"); if (f && !e.target.closest(".qr-lore-edit, .qr-tl")) state.formDirty = Number(f.dataset.card); };
+      const markDirty = (e) => { const f = e.target.closest && e.target.closest(".qr-card-form"); if (f && !e.target.closest(".qr-lore-edit, .qr-tl, .qr-version-sel")) state.formDirty = Number(f.dataset.card); };
+      const leaveForm = () => {
+        if (state.formDirty && state.formDirty === state.cardView && !confirm("Perubahan kartu belum disimpan. Tinggalkan dan buang perubahan?")) return false;
+        if (state.formDirty === state.cardView) state.formDirty = null;
+        return true;
+      };
       listen("input", markDirty);
       listen("change", markDirty);
+      dbody.addEventListener("change", (e) => {
+        const t = e.target;
+        if (t.classList.contains("qr-ctx-sel")) state.modelCtx = Number(t.value);
+        else if (t.classList.contains("qr-mtp")) state.modelMtp = t.checked;
+        else if (t.classList.contains("qr-emb")) state.modelEmb = t.checked;
+      });
       dbody.addEventListener("input", (e) => {
         const t = e.target;
         if (t.dataset.smp && t.type === "range") t.nextElementSibling.textContent = t.value;
@@ -6778,14 +7249,15 @@ def _():
           case "compact": if (confirm("Padatkan konteks lama sekarang? Bisa makan waktu beberapa menit untuk chat panjang.")) send("compact"); break;
           case "open-tab": openDrawer(btn.dataset.tab); break;
           case "close-drawer": drawer.hidden = true; break;
-          case "tab": openDrawer(btn.dataset.tab); break;
+          case "tab": if (btn.dataset.tab !== state.tab && state.tab === "cards" && !leaveForm()) break; openDrawer(btn.dataset.tab); break;
           case "close-modal": closeModal(); state.wizard = false; break;
           case "toggle-world": state.open.has("world") ? state.open.delete("world") : state.open.add("world"); renderPanels(); break;
           case "time-skip": if (confirm(`Lompat waktu ${btn.dataset.label}?`)) send("time_skip", { label: btn.dataset.label }); break;
-          case "copy": { const it = (model.get("history").items || []).find((x) => x.id === mid || (x.ids || []).includes(mid)); navigator.clipboard?.writeText(it ? it.content : ""); toast("Disalin."); break; }
+          case "copy": { const it = (model.get("history").items || []).find((x) => x.id === mid || (x.ids || []).includes(mid)); Promise.resolve(navigator.clipboard?.writeText(it ? it.content : "")).then(() => toast("Disalin."), () => toast("Gagal menyalin.", "warn")); break; }
           case "edit": {
-            const it = (model.get("history").items || []).find((x) => x.id === mid);
-            openModal("Edit pesan", `<textarea class="qr-edit-text" rows="10">${esc(it ? it.content : "")}</textarea>
+            const it = (model.get("history").items || []).find((x) => x.id === mid || x.answer_id === mid);
+            const text = it ? (it.kind === "bot" ? (it.edit_text ?? it.content) : it.content) : "";
+            openModal("Edit pesan", `<textarea class="qr-edit-text" rows="10">${esc(text)}</textarea>
               <div class="qr-help">${it && it.kind === "user" ? "Membuat cabang baru dan menjawab ulang dari sini." : "Menyimpan versi baru pesan ini."}</div>
               <button class="qr-btn qr-primary" data-act="edit-save" data-id="${mid}">Simpan</button>`);
             break;
@@ -6796,7 +7268,7 @@ def _():
           case "swipe": send("swipe", { mid: id, dir: Number(btn.dataset.dir) }); break;
           case "delete": if (confirm("Hapus pesan ini dan semua balasan setelahnya di cabang ini?")) send("delete_msg", { mid }); break;
           case "branch": send("branch", { mid }); break;
-          case "pin": { const it = (model.get("history").items || []).find((x) => x.id === mid); send("pin", { mid, on: !(it && it.pinned) }); break; }
+          case "pin": { const it = (model.get("history").items || []).find((x) => x.id === mid || x.answer_id === mid); send("pin", { mid, on: !(it && it.pinned) }); break; }
           case "chapter": { const t = prompt("Judul bab:"); if (t) send("chapter", { mid, title: t }); break; }
           case "fact-check": send("fact_check", { mid }); toast("Memeriksa fakta…"); break;
           case "choose": send("choose", { text: btn.dataset.text }); fol.jump(); break;
@@ -6824,14 +7296,14 @@ def _():
           case "side-logs": send("side_logs"); break;
           case "notice-close": send("notice_clear"); break;
           case "compare": { const ids = [...el.querySelectorAll(".qr-cmp:checked")].map((i) => Number(i.value)); if (ids.length === 2) send("compare", { a: ids[0], b: ids[1] }); else toast("Pilih tepat 2 cabang.", "warn"); break; }
-          case "card-save": { const form = btn.closest(".qr-card-form"); state.formDirty = null; send("card_save", { card_id: Number(form.dataset.card), data: collectCard(form) }); break; }
+          case "card-save": { const form = btn.closest(".qr-card-form"); state.formDirty = null; send("card_save", { card_id: Number(form.dataset.card), data: collectCard(form), version: Number(form.dataset.version) }); break; }
           case "card-avatar": $(".qr-file-avatar").click(); break;
           case "card-export": { const form = btn.closest(".qr-card-form"); send("card_export", { card_id: Number(form.dataset.card), fmt: btn.dataset.fmt }); break; }
           case "card-delete": { const form = btn.closest(".qr-card-form"); if (confirm("Hapus kartu ini beserta lore dan garis waktunya?")) { send("card_delete", { card_id: Number(form.dataset.card) }); state.cardView = null; } break; }
           case "card-new": send("card_new", { type: btn.dataset.type }); state.cardView = "new"; break;
           case "card-import": $(".qr-file-card").click(); break;
-          case "open-card": state.formDirty = null; state.tab = "cards"; state.cardView = id; drawer.hidden = false; send("card_open", { card_id: id }); renderDrawer(); break;
-          case "cards-back": state.formDirty = null; state.cardView = null; send("library"); renderDrawer(); break;
+          case "open-card": if (!leaveForm()) break; state.formDirty = null; state.tab = "cards"; state.cardView = id; drawer.hidden = false; send("card_open", { card_id: id }); renderDrawer(); break;
+          case "cards-back": if (!leaveForm()) break; state.formDirty = null; state.cardView = null; send("library"); renderDrawer(); break;
           case "schema": send("schema_get", { type: btn.dataset.type }); break;
           case "schema-save": send("schema_save", { schema: el.querySelector(".qr-schema-text").value }); break;
           case "row-add": { const tbl = btn.closest(".qr-table"); state.formDirty = Number(btn.closest(".qr-card-form").dataset.card); const n = Number(tbl.dataset.cols); const r = document.createElement("div"); r.className = "qr-trow"; r.innerHTML = Array(n).fill("<input>").join("") + `<button class="qr-icon qr-xs" data-act="row-del">${icon("x")}</button>`; tbl.insertBefore(r, btn); break; }
@@ -6882,7 +7354,16 @@ def _():
         const a = model.get("aux") || {};
         if (!a.kind) return;
         const d = a.data;
-        if (a.kind === "memory") { state.memory = d; if (state.tab === "memory") { const f = document.activeElement; dbody.innerHTML = tabMemory(); if (f && f.classList.contains("qr-mem-q")) dbody.querySelector(".qr-mem-q").focus(); } }
+        if (a.kind === "memory") {
+          state.memory = d;
+          const f = rootActive();
+          const typing = f && dbody.contains(f) && (f.tagName === "TEXTAREA" || (f.tagName === "INPUT" && !f.classList.contains("qr-mem-q")));
+          if (state.tab === "memory" && !typing) {
+            const q = f && f.classList.contains("qr-mem-q") ? f.value : null, pos = q !== null ? f.selectionStart : 0;
+            dbody.innerHTML = tabMemory();
+            if (q !== null) { const n = dbody.querySelector(".qr-mem-q"); n.value = q; n.focus(); n.setSelectionRange(pos, pos); }
+          }
+        }
         else if (a.kind === "vocab") { state.vocab = d; if (state.tab === "learn") dbody.innerHTML = tabLearn(); }
         else if (a.kind === "branches") openModal("Pohon cabang", (d.map((b) => `<div class="qr-branch ${b.active ? "on" : ""}"><input type="checkbox" class="qr-cmp" value="${b.id}" title="Pilih untuk dibandingkan">
             <span class="qr-badge">${b.depth} pesan</span><span>${esc(b.preview)}</span>${b.head ? '<span class="qr-muted">aktif</span>' : `<button class="qr-btn qr-sm" data-act="goto" data-id="${b.id}">Buka</button>`}</div>`).join("") || "Belum ada cabang.")
@@ -6905,8 +7386,8 @@ def _():
             <h4>System (beku)</h4><pre class="qr-pre">${esc(d.system)}</pre><h4>Pesan terakhir + blok sementara</h4><pre class="qr-pre">${esc(d.last_user_text)}</pre>`);
         else if (a.kind === "search") openModal(`Hasil "${d.q}"`, (d.results || []).map((r) => `<button class="qr-libitem" data-act="jump-to" data-chat="${r.chat_id}" data-id="${r.id}"><b>${esc(r.title)}</b><span>${esc(r.snippet)}</span></button>`).join("") || "Tidak ketemu.");
         else if (a.kind === "learn") openModal("Penjelasan", `<blockquote>${esc(d.text)}</blockquote><p><b>${esc(d.translation || "")}</b></p>
-            ${(d.grammar || []).length ? `<ul>${d.grammar.map((g) => `<li>${esc(g)}</li>`).join("")}</ul>` : ""}
-            ${(d.vocab || []).map((v) => `<div class="qr-memrow"><b>${esc(v.term)}</b><span>${esc(v.translation)} <span class="qr-muted">${esc(v.note || "")}</span></span>
+            ${Array.isArray(d.grammar) && d.grammar.length ? `<ul>${d.grammar.map((g) => `<li>${esc(typeof g === "string" ? g : JSON.stringify(g))}</li>`).join("")}</ul>` : ""}
+            ${(Array.isArray(d.vocab) ? d.vocab : []).filter((v) => v && typeof v === "object").map((v) => `<div class="qr-memrow"><b>${esc(v.term)}</b><span>${esc(v.translation)} <span class="qr-muted">${esc(v.note || "")}</span></span>
               <button class="qr-btn qr-sm" data-act="vocab-add" data-term="${esc(v.term)}" data-tr="${esc(v.translation)}" data-note="${esc(v.note || "")}" data-ex="${esc(d.text)}">${icon("plus")}</button></div>`).join("")}`);
         else if (a.kind === "recall") openModal("Uji ingatan", d.error ? esc(d.error) : `<p><b>${d.score}/${d.total}</b> benar</p>${d.items.map((x) => `<div class="qr-recall ${x.ok ? "ok" : "bad"}">${icon(x.ok ? "check" : "x")}<div><b>${esc(x.q)}</b><br>
             <span class="qr-muted">kunci:</span> ${esc(x.expected)}<br><span class="qr-muted">jawaban:</span> ${esc(x.got)}</div></div>`).join("")}`);
@@ -6934,12 +7415,14 @@ def _():
         const c = get("chat");
         const learn = !!((c.settings || {}).learn);
         if (learn !== state.learn) { state.learn = learn; el.classList.toggle("learn", learn); els.clear(); list.innerHTML = ""; }
-        if (state.lastChat !== c.id) { state.lastChat = c.id; state.studioCard = null; els.clear(); list.innerHTML = ""; fol.jump(); }
+        if (state.lastChat !== c.id) { state.lastChat = c.id; state.studioCard = null; state.imageIntent = false; els.clear(); list.innerHTML = ""; fol.jump(); }
         renderTop(); renderChats(); renderStudio(); renderDrawer(); renderHistory();
       };
       const onCard = () => {
         const card = get("card");
-        if (state.cardView === "new" && card.id) state.cardView = card.id;
+        if (!card.id) return;
+        state.cards.set(card.id, card);
+        if (state.cardView === "new") state.cardView = card.id;
         const forms = [...el.querySelectorAll(`.qr-card-form[data-card="${card.id}"]`)];
         if (state.formDirty === card.id && forms.some((f) => Number(f.dataset.version) !== card.version)) {
           for (const f of forms) {
@@ -6950,8 +7433,8 @@ def _():
           }
           return;
         }
-        renderStudio();
-        if (state.tab === "cards") renderDrawer();
+        if (card.id === state.studioCard) renderStudio();
+        if (state.tab === "cards" && card.id === state.cardView) renderDrawer();
       };
       let raf = 0;
       const onLive = () => { if (!raf) raf = requestAnimationFrame(() => { raf = 0; renderLive(); }); };
@@ -6959,7 +7442,15 @@ def _():
         "change:chats": renderChats, "change:chat": onChat, "change:history": () => { renderHistory(); if (get("chat").kind === "studio" && state.studioCard) send("card_open", { card_id: state.studioCard }); },
         "change:live": onLive, "change:busy": renderBusy, "change:status": renderStatusLine, "change:queue": renderStatusLine,
         "change:toast": onToast, "change:ctx": renderTop, "change:panels": () => { renderPanels(); renderTop(); },
-        "change:server": () => { renderTop(); if (state.tab === "model") renderDrawer(); }, "change:backup": renderBackup,
+        "change:server": () => {
+          renderTop();
+          if (state.tab !== "model" || drawer.hidden) return;
+          const s = get("server");
+          const k = JSON.stringify([s.phase, s.preset, s.ctx, s.mtp, s.embed, s.embed_ready, s.error, s.warnings, s.installed]);
+          if (k !== state.srvKey) { state.srvKey = k; renderDrawer(); return; }
+          const g = dbody.querySelector(".qr-gpu");  // only the GPU line changed: leave the form as it is
+          if (g) g.textContent = s.gpu ? `GPU ${s.gpu.util.toFixed(0)}% · VRAM ${s.gpu.used_gb.toFixed(1)} / ${s.gpu.total_gb.toFixed(0)} GB` : "";
+        }, "change:backup": renderBackup,
         "change:library": () => { if (state.tab === "cards" || state.tab === "story") renderDrawer(); renderWizard(); },
         "change:card": onCard, "change:story": () => { renderStudio(); if (state.tab === "story") renderDrawer(); },
         "change:rev": () => { if (state.tab === "memory" && !drawer.hidden) send("memory", { q: (state.memory || {}).q || "" }); },
@@ -6970,7 +7461,7 @@ def _():
       onChat(); renderBusy(); renderLive(); renderPanels(); renderBackup(); renderStatusLine();
       const cleanup = () => {
         for (const [ev, fn] of Object.entries(handlers)) model.off(ev, fn);
-        clearInterval(timer); themeObs.disconnect(); ac.abort();
+        clearInterval(timer); themeObs.disconnect(); ac.abort(); ro1.disconnect(); ro2.disconnect();
         if (el.__qrCleanup === cleanup) el.__qrCleanup = null;
       };
       el.__qrCleanup = cleanup;
@@ -7311,6 +7802,7 @@ def _(
     SERVERS,
     STORE,
     STORIES,
+    SimpleNamespace,
     Stories,
     Sys,
     TOOLS,
@@ -7322,6 +7814,7 @@ def _(
     json,
     mo,
     re,
+    sys,
     threading,
     time,
 ):
@@ -7367,6 +7860,15 @@ def _(
             self._cards_lock = threading.Lock()
             self._cards_timer = None
             self._cards_ids = set()
+            self.dead = False
+            reg = sys.modules.setdefault("_qchat_runtime", SimpleNamespace(engines=[]))
+            old = getattr(reg, "app", None)
+            if old is not None:
+                old.dead = True
+                if old._after_import in STORE.import_hooks:
+                    STORE.import_hooks.remove(old._after_import)
+            reg.app = self
+            STORE.import_hooks.append(self._after_import)
             CARDS.on_change = self._cards_changed
             TOOLS.on_call = lambda chat_id, name: self._cards_changed("tool")
             self.w.boot = self.boot()
@@ -7397,6 +7899,8 @@ def _(
                 self.w.chat, self.w.history, self.w.panels, self.w.story = {}, {"items": [], "total": 0}, {}, {}
                 return
             self.limit = EngineView.DISPLAY_LIMIT
+            last = getattr(self, "_last_live", {}) or {}
+            self.w.live = last if last.get("active") and last.get("chat_id") == chat_id else {}
             self.w.chat = self.chat_info(chat)
             self.w.history = self.engine.display(chat_id, self.limit)
             self.w.panels = self.engine.panels(chat_id)
@@ -7453,10 +7957,15 @@ def _(
                 cur = self._cur()
                 chat = STORE.chat(cur) if cur else None
                 if chat:
-                    self.w.story = self.story_info(chat)
-                open_id = (self.w.card or {}).get("id")
-                if open_id and (open_id in ids or None in ids or "tool" in ids):
-                    self.w.card = self.card_info(open_id)
+                    story = self.story_info(chat)
+                    if self._cur() == cur:
+                        self.w.story = story
+                # the UI keeps a cache per card id, so each watched card can be sent in turn (last = most recent)
+                for wid in list(getattr(self, "_watched", [])):
+                    if wid in ids or None in ids or "tool" in ids:
+                        info = self.card_info(wid)
+                        if info:
+                            self.w.card = info
                 if "tool" in ids:
                     self.w.rev = self.w.rev + 1
             except Exception:
@@ -7479,20 +7988,36 @@ def _(
             w = self.w
             cur = (w.chat or {}).get("id")
             if kind == "live":
+                snap = dict(payload or {}, tools=[dict(t) for t in (payload or {}).get("tools", [])])
+                self._last_live = snap  # shown again when the user comes back to the generating chat
                 if payload and payload.get("chat_id") not in (None, cur):
                     return
                 now = time.time()
                 if payload and payload.get("active") and now - self._live_t < 0.08 and not payload.get("phase"):
+                    # throttled: make sure the newest state still arrives (a tool chip, the last tokens)
+                    if getattr(self, "_live_timer", None) is None:
+                        def flush():
+                            self._live_timer = None
+                            last = getattr(self, "_last_live", {})
+                            if last.get("chat_id") in (None, (self.w.chat or {}).get("id")):
+                                self._live_t = time.time()
+                                self.w.live = last
+                        self._live_timer = threading.Timer(0.1, flush)
+                        self._live_timer.daemon = True
+                        self._live_timer.start()
                     return
                 self._live_t = now
-                w.live = dict(payload or {}, tools=[dict(t) for t in (payload or {}).get("tools", [])])
+                w.live = snap
             elif kind == "history":
                 if payload == cur:
-                    w.history = self.engine.display(cur, self.limit)
+                    history = self.engine.display(cur, self.limit)
                     chat = STORE.chat(cur)
-                    if chat:
-                        w.chat = self.chat_info(chat)
-                        w.story = self.story_info(chat)
+                    # building the display takes time: the user may have opened another chat meanwhile
+                    if (self.w.chat or {}).get("id") == cur:
+                        w.history = history
+                        if chat:
+                            w.chat = self.chat_info(chat)
+                            w.story = self.story_info(chat)
                 self.refresh_chats()
             elif kind == "panels":
                 if payload == cur:
@@ -7532,9 +8057,21 @@ def _(
                     "warnings": st.get("warnings") or [], "error": st.get("error") or "", "gpu": gpu,
                     "installed": SERVERS.installed() or bool(CFG.BASE_URL)}
 
+        def _after_import(self, ok):
+            """A database was loaded or restored: nothing shown may keep ids from the old file."""
+            if not ok:
+                return
+            self.w.card = {}
+            self.w.live = {}
+            self.w.boot = self.boot()
+            if self.w.library:
+                self.w.library = self.library_info()
+            self.refresh_chats()
+            self.select(self.w.chats[0]["id"] if self.w.chats else 0)
+
         def _ticker(self):
             last_phase = None
-            while True:
+            while not self.dead:
                 try:
                     info = self.server_info()
                     if info["phase"] != last_phase and info["phase"] in ("ready", "failed"):
@@ -7561,9 +8098,16 @@ def _(
                 fn = getattr(self, "c_" + action, None)
                 if fn is None:
                     raise ValueError(f"perintah tidak dikenal: {action}")
+                if action in self.BUSY_BLOCKED and self.engine.busy:
+                    self.w.toast = {"n": time.time(), "text": "Tunggu balasan selesai atau klik Stop dulu.", "kind": "warn"}
+                    return
                 fn(**{k: v for k, v in cmd.items() if k != "n"})
             except Exception as e:
                 self.w.toast = {"n": time.time(), "text": f"{type(e).__name__}: {e}", "kind": "error"}
+
+        # These move the active branch or replace data a running reply writes into.
+        BUSY_BLOCKED = {"reroll", "edit", "swipe", "branch", "goto", "jump", "delete_msg", "continue", "load_db",
+                        "studio_finish", "continue_new"}
 
         def _cur(self):
             return (self.w.chat or {}).get("id")
@@ -7583,6 +8127,12 @@ def _(
             self.select(int(chat_id))
 
         def c_delete_chat(self, chat_id):
+            if self.engine.busy and int(chat_id) in (self._cur(), self.engine.active_chat):
+                self.engine.stop_now()
+                for _ in range(100):  # let the reply end before its chat disappears
+                    if not self.engine.busy:
+                        break
+                    time.sleep(0.05)
             STORE.delete_chat(int(chat_id))
             self.refresh_chats()
             if int(chat_id) == self._cur():
@@ -7719,15 +8269,13 @@ def _(
             self.w.export = {"n": time.time(), "name": name, "b64": base64.b64encode(data).decode()}
 
         def c_save_db(self):
+            # A local download is not the Hugging Face backup: it must not mark the backup as up to date.
             self.w.export = {"n": time.time(), "name": time.strftime("qwen-chat-%Y%m%d-%H%M%S.sqlite"),
                              "b64": base64.b64encode(STORE.export_bytes()).decode()}
-            BACKUP.saved_rev = STORE.rev
 
         def c_load_db(self, b64):
-            STORE.import_bytes(base64.b64decode(b64))
-            self.refresh_chats()
-            self.select(self.w.chats[0]["id"] if self.w.chats else 0)
-            self.w.toast = {"n": time.time(), "text": "Database dimuat."}
+            STORE.import_bytes(base64.b64decode(b64))  # the import hook resets chats, cards and the library view
+            self.w.toast = {"n": time.time(), "text": "Database dimuat. File lama disimpan sebagai .before-import."}
 
         def c_impersonate(self, hint=""):
             self.engine.slash(self._cur(), "impersonate", hint)
@@ -7823,7 +8371,9 @@ def _(
             self.w.library = self.library_info()
 
         def c_card_open(self, card_id):
-            self.w.card = self.card_info(int(card_id))
+            cid = int(card_id)
+            self._watched = [x for x in getattr(self, "_watched", []) if x != cid][-3:] + [cid]
+            self.w.card = self.card_info(cid)
 
         def c_card_new(self, type):
             # New Gaya/GM cards start from the defaults, so a fresh card already plays sensibly.
@@ -7832,8 +8382,14 @@ def _(
             self.w.library = self.library_info()
             self.w.card = self.card_info(cid)
 
-        def c_card_save(self, card_id, data, avatar=None):
+        def c_card_save(self, card_id, data, avatar=None, version=None):
             c = CARDS.get(int(card_id))
+            if version is not None and c and int(version) != c["version"]:
+                self.w.card = self.card_info(int(card_id))
+                self.w.toast = {"n": time.time(), "kind": "warn", "long": True,
+                                "text": f"Kartu sudah diubah (versi {c['version']}) sejak form dibuka. Tidak disimpan: salin "
+                                        f"perubahanmu, muat versi baru, lalu simpan lagi."}
+                return
             CARDS.save(int(card_id), c["type"], data, avatar=base64.b64decode(avatar) if avatar else None)
             self.w.card = self.card_info(int(card_id))
             self.w.library = self.library_info()

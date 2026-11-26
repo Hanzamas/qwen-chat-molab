@@ -40,6 +40,15 @@ class ChatApp:
         self._cards_lock = threading.Lock()
         self._cards_timer = None
         self._cards_ids = set()
+        self.dead = False
+        reg = sys.modules.setdefault("_qchat_runtime", SimpleNamespace(engines=[]))
+        old = getattr(reg, "app", None)
+        if old is not None:
+            old.dead = True
+            if old._after_import in STORE.import_hooks:
+                STORE.import_hooks.remove(old._after_import)
+        reg.app = self
+        STORE.import_hooks.append(self._after_import)
         CARDS.on_change = self._cards_changed
         TOOLS.on_call = lambda chat_id, name: self._cards_changed("tool")
         self.w.boot = self.boot()
@@ -70,6 +79,8 @@ class ChatApp:
             self.w.chat, self.w.history, self.w.panels, self.w.story = {}, {"items": [], "total": 0}, {}, {}
             return
         self.limit = EngineView.DISPLAY_LIMIT
+        last = getattr(self, "_last_live", {}) or {}
+        self.w.live = last if last.get("active") and last.get("chat_id") == chat_id else {}
         self.w.chat = self.chat_info(chat)
         self.w.history = self.engine.display(chat_id, self.limit)
         self.w.panels = self.engine.panels(chat_id)
@@ -126,10 +137,15 @@ class ChatApp:
             cur = self._cur()
             chat = STORE.chat(cur) if cur else None
             if chat:
-                self.w.story = self.story_info(chat)
-            open_id = (self.w.card or {}).get("id")
-            if open_id and (open_id in ids or None in ids or "tool" in ids):
-                self.w.card = self.card_info(open_id)
+                story = self.story_info(chat)
+                if self._cur() == cur:
+                    self.w.story = story
+            # the UI keeps a cache per card id, so each watched card can be sent in turn (last = most recent)
+            for wid in list(getattr(self, "_watched", [])):
+                if wid in ids or None in ids or "tool" in ids:
+                    info = self.card_info(wid)
+                    if info:
+                        self.w.card = info
             if "tool" in ids:
                 self.w.rev = self.w.rev + 1
         except Exception:
@@ -152,20 +168,36 @@ class ChatApp:
         w = self.w
         cur = (w.chat or {}).get("id")
         if kind == "live":
+            snap = dict(payload or {}, tools=[dict(t) for t in (payload or {}).get("tools", [])])
+            self._last_live = snap  # shown again when the user comes back to the generating chat
             if payload and payload.get("chat_id") not in (None, cur):
                 return
             now = time.time()
             if payload and payload.get("active") and now - self._live_t < 0.08 and not payload.get("phase"):
+                # throttled: make sure the newest state still arrives (a tool chip, the last tokens)
+                if getattr(self, "_live_timer", None) is None:
+                    def flush():
+                        self._live_timer = None
+                        last = getattr(self, "_last_live", {})
+                        if last.get("chat_id") in (None, (self.w.chat or {}).get("id")):
+                            self._live_t = time.time()
+                            self.w.live = last
+                    self._live_timer = threading.Timer(0.1, flush)
+                    self._live_timer.daemon = True
+                    self._live_timer.start()
                 return
             self._live_t = now
-            w.live = dict(payload or {}, tools=[dict(t) for t in (payload or {}).get("tools", [])])
+            w.live = snap
         elif kind == "history":
             if payload == cur:
-                w.history = self.engine.display(cur, self.limit)
+                history = self.engine.display(cur, self.limit)
                 chat = STORE.chat(cur)
-                if chat:
-                    w.chat = self.chat_info(chat)
-                    w.story = self.story_info(chat)
+                # building the display takes time: the user may have opened another chat meanwhile
+                if (self.w.chat or {}).get("id") == cur:
+                    w.history = history
+                    if chat:
+                        w.chat = self.chat_info(chat)
+                        w.story = self.story_info(chat)
             self.refresh_chats()
         elif kind == "panels":
             if payload == cur:
@@ -205,9 +237,21 @@ class ChatApp:
                 "warnings": st.get("warnings") or [], "error": st.get("error") or "", "gpu": gpu,
                 "installed": SERVERS.installed() or bool(CFG.BASE_URL)}
 
+    def _after_import(self, ok):
+        """A database was loaded or restored: nothing shown may keep ids from the old file."""
+        if not ok:
+            return
+        self.w.card = {}
+        self.w.live = {}
+        self.w.boot = self.boot()
+        if self.w.library:
+            self.w.library = self.library_info()
+        self.refresh_chats()
+        self.select(self.w.chats[0]["id"] if self.w.chats else 0)
+
     def _ticker(self):
         last_phase = None
-        while True:
+        while not self.dead:
             try:
                 info = self.server_info()
                 if info["phase"] != last_phase and info["phase"] in ("ready", "failed"):
@@ -234,9 +278,16 @@ class ChatApp:
             fn = getattr(self, "c_" + action, None)
             if fn is None:
                 raise ValueError(f"perintah tidak dikenal: {action}")
+            if action in self.BUSY_BLOCKED and self.engine.busy:
+                self.w.toast = {"n": time.time(), "text": "Tunggu balasan selesai atau klik Stop dulu.", "kind": "warn"}
+                return
             fn(**{k: v for k, v in cmd.items() if k != "n"})
         except Exception as e:
             self.w.toast = {"n": time.time(), "text": f"{type(e).__name__}: {e}", "kind": "error"}
+
+    # These move the active branch or replace data a running reply writes into.
+    BUSY_BLOCKED = {"reroll", "edit", "swipe", "branch", "goto", "jump", "delete_msg", "continue", "load_db",
+                    "studio_finish", "continue_new"}
 
     def _cur(self):
         return (self.w.chat or {}).get("id")
@@ -256,6 +307,12 @@ class ChatApp:
         self.select(int(chat_id))
 
     def c_delete_chat(self, chat_id):
+        if self.engine.busy and int(chat_id) in (self._cur(), self.engine.active_chat):
+            self.engine.stop_now()
+            for _ in range(100):  # let the reply end before its chat disappears
+                if not self.engine.busy:
+                    break
+                time.sleep(0.05)
         STORE.delete_chat(int(chat_id))
         self.refresh_chats()
         if int(chat_id) == self._cur():
@@ -392,15 +449,13 @@ class ChatApp:
         self.w.export = {"n": time.time(), "name": name, "b64": base64.b64encode(data).decode()}
 
     def c_save_db(self):
+        # A local download is not the Hugging Face backup: it must not mark the backup as up to date.
         self.w.export = {"n": time.time(), "name": time.strftime("qwen-chat-%Y%m%d-%H%M%S.sqlite"),
                          "b64": base64.b64encode(STORE.export_bytes()).decode()}
-        BACKUP.saved_rev = STORE.rev
 
     def c_load_db(self, b64):
-        STORE.import_bytes(base64.b64decode(b64))
-        self.refresh_chats()
-        self.select(self.w.chats[0]["id"] if self.w.chats else 0)
-        self.w.toast = {"n": time.time(), "text": "Database dimuat."}
+        STORE.import_bytes(base64.b64decode(b64))  # the import hook resets chats, cards and the library view
+        self.w.toast = {"n": time.time(), "text": "Database dimuat. File lama disimpan sebagai .before-import."}
 
     def c_impersonate(self, hint=""):
         self.engine.slash(self._cur(), "impersonate", hint)
@@ -496,7 +551,9 @@ class ChatApp:
         self.w.library = self.library_info()
 
     def c_card_open(self, card_id):
-        self.w.card = self.card_info(int(card_id))
+        cid = int(card_id)
+        self._watched = [x for x in getattr(self, "_watched", []) if x != cid][-3:] + [cid]
+        self.w.card = self.card_info(cid)
 
     def c_card_new(self, type):
         # New Gaya/GM cards start from the defaults, so a fresh card already plays sensibly.
@@ -505,8 +562,14 @@ class ChatApp:
         self.w.library = self.library_info()
         self.w.card = self.card_info(cid)
 
-    def c_card_save(self, card_id, data, avatar=None):
+    def c_card_save(self, card_id, data, avatar=None, version=None):
         c = CARDS.get(int(card_id))
+        if version is not None and c and int(version) != c["version"]:
+            self.w.card = self.card_info(int(card_id))
+            self.w.toast = {"n": time.time(), "kind": "warn", "long": True,
+                            "text": f"Kartu sudah diubah (versi {c['version']}) sejak form dibuka. Tidak disimpan: salin "
+                                    f"perubahanmu, muat versi baru, lalu simpan lagi."}
+            return
         CARDS.save(int(card_id), c["type"], data, avatar=base64.b64decode(avatar) if avatar else None)
         self.w.card = self.card_info(int(card_id))
         self.w.library = self.library_info()

@@ -86,7 +86,8 @@ class Cards:
         line = re.sub(r"^\s*(?:[*\u2022]|-(?=\s)|\d+[.)](?=\s))\s*", "", line).strip()
         if not line or re.fullmatch(r"[|:\-\s]+", line):  # empty, or a markdown separator row
             return None
-        for sep in ("|", "\t", ";", ","):
+        # ", " before ",": a decimal comma ("0,5") is not a column break
+        for sep in ("|", "\t", ";", ", ", ","):
             if sep in line:
                 return [c.strip() for c in line.strip("|").split(sep)] if sep == "|" else [c.strip() for c in line.split(sep)]
         return [line]
@@ -250,6 +251,14 @@ class Cards:
         return self.save(card_id, c["type"], data, name=c["name"] if key not in ("name", "title") else None)
 
     def delete(self, card_id):
+        # SQLite reuses the highest id after a delete, so everything that points at this card goes with it.
+        for kind, sql in (("lore", "SELECT id FROM lore_entries WHERE card_id = ?"),
+                          ("fact", "SELECT id FROM facts WHERE world_card_id = ?"),
+                          ("mem", "SELECT id FROM memories WHERE scope = 'card' AND card_id = ?")):
+            for r in self.store.q(sql, (card_id,)):
+                self.store.x("DELETE FROM vectors WHERE kind = ? AND ref_id = ?", (kind, r["id"]))
+        self.store.x("DELETE FROM facts WHERE world_card_id = ?", (card_id,))
+        self.store.x("DELETE FROM memories WHERE scope = 'card' AND card_id = ?", (card_id,))
         for t in ("cards", "card_versions"):
             self.store.x(f"DELETE FROM {t} WHERE {'id' if t == 'cards' else 'card_id'} = ?", (card_id,))
         self.store.x("DELETE FROM lore_entries WHERE card_id = ?", (card_id,))
@@ -291,6 +300,9 @@ class Cards:
 
     def render(self, card, mode="core", keys=None, limit=6000):
         """Text for the prompt. mode: core (frozen part), detail (the rest), all. 'ui' fields never render."""
+        return TXT.macros(self._render(card, mode, keys, limit), char=card.get("name", ""))
+
+    def _render(self, card, mode="core", keys=None, limit=6000):
         sch = self.schema(card["type"])
         out, section = [f"## {sch.get('label', card['type'])}: {card['name']}"], None
         for f in sch["fields"]:
@@ -375,14 +387,28 @@ class Cards:
         if isinstance(data, (bytes, bytearray)) and data[:8] == b"\x89PNG\r\n\x1a\n":
             obj, avatar = self._png_card(bytes(data)), bytes(data)
         else:
-            obj, avatar = json.loads(data if isinstance(data, str) else bytes(data).decode("utf-8")), None
+            text = data if isinstance(data, str) else bytes(data).decode("utf-8-sig")
+            obj, avatar = json.loads(text.lstrip("﻿")), None
+        if not isinstance(obj, dict):
+            raise ValueError("File kartu harus berisi satu objek JSON.")
         if obj.get("format") == "qcard":
             return self._import_qcard(obj)
         return self._import_st(obj, avatar)
 
     def _import_qcard(self, obj):
         avatar = base64.b64decode(obj["avatar"]) if obj.get("avatar") else None
-        cid = self.save(None, obj["type"], obj.get("data") or {}, name=obj.get("name"), avatar=avatar)
+        type_ = str(obj.get("type") or "")
+        if not type_:
+            raise ValueError("qcard tanpa jenis kartu.")
+        known = self.store.one("SELECT 1 AS x FROM card_schemas WHERE type = ?", (type_,)) or type_ in DEFAULT_SCHEMAS
+        if not known:  # a custom type brings its own schema
+            sch = obj.get("schema")
+            if not isinstance(sch, dict):
+                raise ValueError(f"Jenis kartu '{type_}' tidak dikenal dan qcard ini tidak membawa skemanya.")
+            self.save_schema({**sch, "type": type_})
+        data = {k: v for k, v in (obj.get("data") or {}).items() if re.match(r"^[A-Za-z_][\w-]{0,63}$", str(k))}
+        name = obj.get("name")
+        cid = self.save(None, type_, data, name=str(name) if name is not None else None, avatar=avatar)
         for e in obj.get("lore") or []:
             self.lore_save(cid, e.get("title", ""), e.get("text", ""), e.get("keys", ""), e.get("kind", "istilah"),
                            bool(e.get("core")))
@@ -404,22 +430,39 @@ class Cards:
         d = obj.get("data") if isinstance(obj.get("data"), dict) else obj
         if not d.get("name"):
             raise ValueError("Bukan kartu karakter yang dikenali (tidak ada nama).")
-        data = {"name": d["name"]}
+        name = str(d["name"]).strip()
+        data = {"name": name}
+        # {{char}} becomes the name now; {{user}} stays and is replaced with the persona's name in the prompt
+        fix = lambda v: TXT.macros(v, char=name) if isinstance(v, str) else (
+            [TXT.macros(x, char=name) if isinstance(x, str) else x for x in v] if isinstance(v, list) else v)
         for src, dst in self.ST_MAP.items():
             if d.get(src):
-                data[dst] = d[src]
-        greet = [g for g in [d.get("first_mes")] + list(d.get("alternate_greetings") or []) if g]
+                data[dst] = fix(d[src])
+        greet = [fix(g) for g in [d.get("first_mes")] + list(d.get("alternate_greetings") or []) if isinstance(g, str) and g]
         if greet:
             data["greetings"] = greet
         for k in ("system_prompt", "post_history_instructions"):
             if d.get(k):
-                data[f"st_{k}"] = d[k]
+                data[f"st_{k}"] = fix(d[k])
         cid = self.save(None, "character", data, avatar=avatar)
-        for e in ((d.get("character_book") or {}).get("entries") or []):
-            keys = ", ".join(e.get("keys") or [])
-            self.lore_save(cid, e.get("name") or e.get("comment") or (keys[:40] or "Lore"), e.get("content", ""),
+        book = d.get("character_book") if isinstance(d.get("character_book"), dict) else {}
+        for e in book.get("entries") or []:
+            if not isinstance(e, dict):
+                continue
+            raw_keys = e.get("keys") or []
+            keys = ", ".join(k.strip() for k in (raw_keys.split(",") if isinstance(raw_keys, str) else map(str, raw_keys)) if k.strip())
+            self.lore_save(cid, str(e.get("name") or e.get("comment") or (keys[:40] or "Lore")), fix(str(e.get("content", ""))),
                            keys, "lore", bool(e.get("constant")))
         return cid
+
+    @staticmethod
+    def _inflate(raw, limit=50 * 1024 * 1024):
+        """zlib with a size limit: a few MB of crafted data must not expand into gigabytes."""
+        d = _zlib.decompressobj()
+        out = d.decompress(raw, limit)
+        if d.unconsumed_tail:
+            raise ValueError("Data kartu di PNG terlalu besar.")
+        return out
 
     @staticmethod
     def _png_card(data):
@@ -429,11 +472,16 @@ class Cards:
             chunk = data[pos + 8:pos + 8 + length]
             if ctype in (b"tEXt", b"iTXt", b"zTXt"):
                 key, _, rest = chunk.partition(b"\x00")
-                if ctype == b"zTXt":
-                    rest = _zlib.decompress(rest[1:])
-                elif ctype == b"iTXt":
-                    rest = rest[2:].split(b"\x00", 2)[-1]
-                found[key.decode("latin-1").lower()] = rest
+                key = key.decode("latin-1").lower()
+                if key in ("chara", "ccv3"):  # other text chunks are never decompressed
+                    if ctype == b"zTXt":
+                        rest = Cards._inflate(rest[1:])
+                    elif ctype == b"iTXt":
+                        compressed = rest[:1] == b"\x01"
+                        rest = rest[2:].split(b"\x00", 2)[-1]
+                        if compressed:
+                            rest = Cards._inflate(rest)
+                    found[key] = rest
             pos += 12 + length
         raw = found.get("ccv3") or found.get("chara")
         if raw is None:

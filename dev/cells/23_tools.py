@@ -76,8 +76,13 @@ class ToolBox:
             out += TOOL_STUDIO
         return out
 
-    def call(self, chat_id, message_id, name, raw_args):
-        """Run one tool. Returns (result text, failed, media list)."""
+    FIELD_KEY = re.compile(r"^[A-Za-z_][\w-]{0,63}$")
+
+    def call(self, chat_id, message_id, name, raw_args, allowed=None):
+        """Run one tool. Returns (result text, failed, media list). allowed: names offered to the model;
+        a tool it was not offered is refused even if it exists."""
+        if allowed is not None and name not in allowed:
+            return json.dumps({"error": f"tool {name} tidak tersedia di sini"}), True, []
         try:
             args = json.loads(raw_args or "{}")
             if not isinstance(args, dict):
@@ -280,7 +285,7 @@ class ToolBox:
         if not target:
             return {"error": f"kartu '{card}' tidak dipakai cerita ini. Pilihan: {', '.join(c['name'] for c in pool)}"}
         keys = {f["key"] for f in self.cards.schema(target["type"])["fields"]}
-        if field not in keys and field not in target["data"]:
+        if not self.FIELD_KEY.match(str(field or "")) or (field not in keys and field not in target["data"]):
             return {"error": f"field '{field}' tidak ada di skema {target['type']}. Field: {', '.join(sorted(keys))}"}
         self.cards.set_field(target["id"], field, value)
         report = self._field_report(target["id"], field, value)
@@ -314,6 +319,10 @@ class ToolBox:
         return st.setdefault("drafts", {}), st
 
     def t_card_draft_update(self, chat_id, mid, type, field, value, card_id=None):
+        if type not in Cards.TYPE_ORDER:
+            return {"error": f"jenis kartu '{type}' tidak ada. Pilihan: {', '.join(Cards.TYPE_ORDER)}"}
+        if not self.FIELD_KEY.match(str(field or "")):
+            return {"error": "nama field hanya huruf, angka, _ atau - (lihat skema)"}
         drafts, st = self._drafts(chat_id)
         if card_id:
             card = self.cards.get(int(card_id))

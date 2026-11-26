@@ -80,10 +80,13 @@ function render({ model, el }) {
   const $ = (q) => el.querySelector(q);
   const scroll = $(".qr-scroll"), list = $(".qr-list"), liveBox = $(".qr-live"), input = $(".qr-input");
   const drawer = $(".qr-drawer"), dbody = $(".qr-drawer-body"), modal = $(".qr-modal");
-  const state = { tab: "chat", pending: [], open: new Set(), cardView: null, learn: false, studioCard: null, libFilter: "" };
+  const state = { tab: "chat", pending: [], open: new Set(), cardView: null, learn: false, studioCard: null, libFilter: "",
+    cards: new Map() };
+  const rootActive = () => el.getRootNode().activeElement || document.activeElement;
   const els = new Map();
   const fol = follower(scroll, (on) => { $(".qr-jump").hidden = on; });
-  new ResizeObserver(() => fol.stick()).observe($(".qr-col"));
+  const ro1 = new ResizeObserver(() => fol.stick());
+  ro1.observe($(".qr-col"));
 
   const send = (action, extra = {}) => { model.set("command", { n: Date.now() + Math.random(), action, ...extra }); model.save_changes(); };
   const get = (k) => model.get(k) || {};
@@ -95,8 +98,8 @@ function render({ model, el }) {
     $(".qr-toasts").appendChild(t);
     setTimeout(() => t.remove(), long ? 12000 : 4500);
   };
-  const openModal = (title, html) => { $(".qr-modal-title").textContent = title; $(".qr-modal-body").innerHTML = html; modal.hidden = false; };
-  const closeModal = () => { modal.hidden = true; $(".qr-modal-body").innerHTML = ""; };
+  const openModal = (title, html, wizard = false) => { state.wizard = wizard; $(".qr-modal-title").textContent = title; $(".qr-modal-body").innerHTML = html; modal.hidden = false; };
+  const closeModal = () => { state.wizard = false; modal.hidden = true; $(".qr-modal-body").innerHTML = ""; };
 
   // theme follows marimo (dark class on the page) or the OS
   const syncTheme = () => {
@@ -211,9 +214,10 @@ function render({ model, el }) {
   function actionsBar(it) {
     const sw = it.swipe && it.swipe[1] > 1
       ? `<span class="qr-swipe"><button class="qr-icon qr-xs" data-act="swipe" data-id="${it.id}" data-dir="-1">${icon("left")}</button>${it.swipe[0]}/${it.swipe[1]}<button class="qr-icon qr-xs" data-act="swipe" data-id="${it.id}" data-dir="1">${icon("right")}</button></span>` : "";
-    const b = (act, ic, title) => `<button class="qr-icon qr-xs" data-act="${act}" data-id="${it.id}" title="${title}">${icon(ic)}</button>`;
+    const b = (act, ic, title, id = it.id) => `<button class="qr-icon qr-xs" data-act="${act}" data-id="${id}" title="${title}">${icon(ic)}</button>`;
+    const ba = (act, ic, title) => b(act, ic, title, it.answer_id || it.id);
     if (it.kind === "user") return `<div class="qr-actions">${sw}${it.has_note ? b("note-view", "eye", "Catatan sistem giliran ini") : ""}${b("copy", "copy", "Salin")}${b("edit", "edit", "Edit (membuat cabang)")}${b("pin", "pin", it.pinned ? "Lepas pin" : "Pin")}${b("branch", "branch", "Cabang dari sini")}${b("delete", "trash", "Hapus")}</div>`;
-    return `<div class="qr-actions">${sw}${b("copy", "copy", "Salin")}${b("reroll", "refresh", "Jawab ulang")}${b("continue", "forward", "Lanjutkan")}${b("edit", "edit", "Edit")}${b("pin", "pin", it.pinned ? "Lepas pin" : "Pin")}${b("chapter", "bookmark", "Tandai bab")}${b("fact-check", "flag", "Cek fakta")}${b("branch", "branch", "Cabang dari sini")}${b("delete", "trash", "Hapus")}</div>`;
+    return `<div class="qr-actions">${sw}${b("copy", "copy", "Salin")}${b("reroll", "refresh", "Jawab ulang")}${b("continue", "forward", "Lanjutkan")}${ba("edit", "edit", "Edit")}${ba("pin", "pin", it.pinned ? "Lepas pin" : "Pin")}${ba("chapter", "bookmark", "Tandai bab")}${ba("fact-check", "flag", "Cek fakta")}${b("branch", "branch", "Cabang dari sini")}${b("delete", "trash", "Hapus")}</div>`;
   }
   function statsLine(st) {
     if (!st) return "";
@@ -372,53 +376,59 @@ function render({ model, el }) {
     const cards = st.studio ? st.cards || [] : [];
     // only a card that belongs to this studio session may be shown
     if (!cards.some((x) => x.id === state.studioCard)) state.studioCard = cards.length ? cards[0].id : null;
-    // keep a form with unsaved edits; onCard shows a reload notice instead
-    const keep = state.formDirty && state.formDirty === state.studioCard ? pane.querySelector(".qr-studio-form") : null;
+    // A form with unsaved edits, or one the user is typing in, is left alone: only the tabs are refreshed.
+    const oldForm = pane.querySelector(".qr-studio-form");
+    const keep = oldForm && oldForm.querySelector(".qr-card-form") &&
+      ((state.formDirty && state.formDirty === state.studioCard) || oldForm.contains(rootActive())) ? oldForm : null;
+    const tabsHTML = cards.map((x) => `<button class="qr-tabbtn ${x.id === state.studioCard ? "on" : ""}" data-act="studio-card" data-id="${x.id}">${esc((get("boot").types || {})[x.type] || x.type)}: ${esc(x.name)}</button>`).join("") || '<span class="qr-muted">Belum ada kartu. Mulai ngobrol di kiri.</span>';
+    if (keep && pane.querySelector(".qr-studio-tabs")) { pane.querySelector(".qr-studio-tabs").innerHTML = tabsHTML; return; }
     const quick = [["Lengkapi yang kosong", "Lengkapi field kartu yang masih kosong dengan usulan yang konsisten."],
       ["Cek konsistensi", "Cek konsistensi antar kartu (dan anakronisme kalau dunia berbasis dunia nyata), lalu perbaiki."],
       ["Uji adegan", "Uji adegan: tulis satu paragraf pembuka dengan kartu Gaya dan GM yang sekarang."],
       ["Uji suara", "Uji suara tokoh utama: balas tiga situasi (santai, marah, sedih) sebagai tokoh itu."],
       ["Wawancara", "Aku mau mewawancarai tokoh utama. Jawab sebagai tokoh itu mulai sekarang sampai aku bilang selesai."]];
-    const card = get("card");
+    const card = state.cards.get(state.studioCard) || {};
     pane.innerHTML = `<div class="qr-studio-head"><b>Kartu di Studio</b>
         <button class="qr-btn qr-sm qr-primary" data-act="studio-finish" ${cards.length ? "" : "disabled"}>${icon("book")}Mulai RP</button></div>
       <div class="qr-studio-quick">${quick.map(([l, t]) => `<button class="qr-btn qr-sm" data-act="quick" data-text="${esc(t)}">${esc(l)}</button>`).join("")}</div>
       <div class="qr-studio-quick">
         <button class="qr-btn qr-sm" data-act="studio-image">${icon("upload")}Dari gambar</button>
         <button class="qr-btn qr-sm" data-act="studio-tidy">${icon("edit")}Rapikan teks</button></div>
-      <div class="qr-studio-tabs">${cards.map((x) => `<button class="qr-tabbtn ${x.id === state.studioCard ? "on" : ""}" data-act="studio-card" data-id="${x.id}">${esc((get("boot").types || {})[x.type] || x.type)}: ${esc(x.name)}</button>`).join("") || '<span class="qr-muted">Belum ada kartu. Mulai ngobrol di kiri.</span>'}</div>
+      <div class="qr-studio-tabs">${tabsHTML}</div>
       ${state.studioCard && card.id === state.studioCard ? `<div class="qr-row qr-var"><select class="qr-var-field">${(card.fields || [])
         .filter((f) => f.visibility !== "ui" || ["greetings", "opening"].includes(f.key)).map((f) => `<option value="${esc(f.key)}">${esc(f.label)}</option>`).join("")}</select>
         <button class="qr-btn qr-sm" data-act="variations">${icon("sparkles")}Variasi</button></div>` : ""}
       <div class="qr-studio-form">${state.studioCard && card.id === state.studioCard ? cardForm(card, true) : ""}</div>`;
-    if (keep) pane.querySelector(".qr-studio-form").replaceWith(keep);
     if (state.studioCard && card.id !== state.studioCard) send("card_open", { card_id: state.studioCard });
   }
 
   // ---------- card form ----------
   function fieldInput(f, v) {
-    const name = `f-${f.key}`;
+    const key = esc(f.key);  // keys come from cards the model or an import wrote: never trust them in markup
+    const name = `f-${String(f.key).replace(/[^\w-]/g, "_")}`;
     const badge = `${f.core ? '<span class="qr-badge" title="Masuk prompt beku">inti</span>' : ""}${f.visibility === "secret" ? `<span class="qr-badge">${icon("lock")}rahasia</span>` : ""}${f.visibility === "ui" ? '<span class="qr-badge">hanya UI</span>' : ""}`;
     const label = `<label class="qr-flabel" for="${name}">${esc(f.label)} ${badge}</label>${f.help ? `<div class="qr-help">${esc(f.help)}</div>` : ""}`;
-    if (f.type === "longtext") return `${label}<textarea id="${name}" data-field="${f.key}" data-type="longtext" rows="3">${esc(v ?? "")}</textarea>`;
-    if (f.type === "list") return `${label}<textarea id="${name}" data-field="${f.key}" data-type="list" rows="3" placeholder="Satu per baris">${esc((Array.isArray(v) ? v : v ? [v] : []).join("\n"))}</textarea>`;
-    if (f.type === "tags") return `${label}<input id="${name}" data-field="${f.key}" data-type="tags" value="${esc((Array.isArray(v) ? v : v ? [v] : []).join(", "))}" placeholder="Pisahkan dengan koma">`;
+    if (v !== null && typeof v === "object" && !["list", "tags", "table"].includes(f.type))
+      return `${label}<textarea id="${name}" data-field="${key}" data-type="json" rows="4">${esc(JSON.stringify(v, null, 1))}</textarea>`;
+    if (f.type === "longtext") return `${label}<textarea id="${name}" data-field="${key}" data-type="longtext" rows="3">${esc(v ?? "")}</textarea>`;
+    if (f.type === "list") return `${label}<textarea id="${name}" data-field="${key}" data-type="list" rows="3" placeholder="Satu per baris">${esc((Array.isArray(v) ? v : v ? [v] : []).join("\n"))}</textarea>`;
+    if (f.type === "tags") return `${label}<input id="${name}" data-field="${key}" data-type="tags" value="${esc((Array.isArray(v) ? v : v ? [v] : []).join(", "))}" placeholder="Pisahkan dengan koma">`;
     if (f.type === "select") {
       const opts = [...(f.options || [])];
       if (v && !opts.includes(v)) opts.push(v);
-      return `${label}<select id="${name}" data-field="${f.key}" data-type="text"><option value=""></option>${opts.map((o) => `<option ${o === v ? "selected" : ""}>${esc(o)}</option>`).join("")}</select>`;
+      return `${label}<select id="${name}" data-field="${key}" data-type="text"><option value=""></option>${opts.map((o) => `<option ${o === v ? "selected" : ""}>${esc(o)}</option>`).join("")}</select>`;
     }
-    if (f.type === "number" && v !== undefined && v !== null && v !== "" && isNaN(Number(v))) return `${label}<input id="${name}" data-field="${f.key}" data-type="text" value="${esc(v)}">`;
-    if (f.type === "number") return `${label}<input id="${name}" type="number" data-field="${f.key}" data-type="number" value="${esc(v ?? "")}">`;
+    if (f.type === "number" && v !== undefined && v !== null && v !== "" && isNaN(Number(v))) return `${label}<input id="${name}" data-field="${key}" data-type="text" value="${esc(v)}">`;
+    if (f.type === "number") return `${label}<input id="${name}" type="number" data-field="${key}" data-type="number" value="${esc(v ?? "")}">`;
     if (f.type === "table") {
       const cols = f.columns || ["nilai"];
       const rows = Array.isArray(v) ? v : [];
-      return `${label}<div class="qr-table" data-field="${f.key}" data-type="table" data-cols="${cols.length}">
+      return `${label}<div class="qr-table" data-field="${key}" data-type="table" data-cols="${cols.length}">
         <div class="qr-trow qr-thead">${cols.map((c) => `<span>${esc(c)}</span>`).join("")}<span></span></div>
         ${rows.map((r) => `<div class="qr-trow">${cols.map((c, ci) => `<input value="${esc(Array.isArray(r) ? r[ci] ?? "" : (r || {})[c] ?? "")}">`).join("")}<button class="qr-icon qr-xs" data-act="row-del">${icon("x")}</button></div>`).join("")}
         <button class="qr-btn qr-sm" data-act="row-add">${icon("plus")}Baris</button></div>`;
     }
-    return `${label}<input id="${name}" data-field="${f.key}" data-type="text" value="${esc(v ?? "")}">`;
+    return `${label}<input id="${name}" data-field="${key}" data-type="text" value="${esc(v ?? "")}">`;
   }
   function cardForm(c, compact) {
     const sections = {};
@@ -456,7 +466,8 @@ function render({ model, el }) {
       const k = n.dataset.field, t = n.dataset.type;
       if (t === "table") {
         data[k] = [...n.querySelectorAll(".qr-trow:not(.qr-thead)")].map((r) => [...r.querySelectorAll("input")].map((i) => i.value.trim())).filter((r) => r.some((x) => x));
-      } else if (t === "list") data[k] = n.value.split("\n").map((x) => x.trim()).filter(Boolean);
+      } else if (t === "json") { try { data[k] = JSON.parse(n.value); } catch (e) { data[k] = n.value; } }
+      else if (t === "list") data[k] = n.value.split("\n").map((x) => x.trim()).filter(Boolean);
       else if (t === "tags") data[k] = n.value.split(",").map((x) => x.trim()).filter(Boolean);
       else if (t === "number") data[k] = n.value === "" ? "" : Number(n.value);
       else data[k] = n.value;
@@ -528,7 +539,7 @@ function render({ model, el }) {
         <span class="qr-muted">${esc((get("boot").types || {})[x.role] || x.role)}</span><b>${esc(x.name)}</b>
         ${x.latest > x.version ? '<span class="qr-badge" title="Berlaku setelah Terapkan sekarang atau compaction">versi baru</span>' : ""}
         <button class="qr-icon qr-xs" data-act="open-card" data-id="${x.id}" title="Buka">${icon("edit")}</button>
-        <button class="qr-icon qr-xs" data-act="detach" data-id="${x.id}" data-role="${x.role}" title="Lepas">${icon("x")}</button></div>`).join("")}
+        <button class="qr-icon qr-xs" data-act="detach" data-id="${x.id}" data-role="${esc(x.role)}" title="Lepas">${icon("x")}</button></div>`).join("")}
       <div class="qr-row"><select class="qr-attach-role">${roles.map((r) => `<option value="${r}">${esc((get("boot").types || {})[r] || r)}</option>`).join("")}</select>
         <select class="qr-attach-card"><option value="">Pasang kartu…</option>${(lib.cards || []).map((x) => `<option value="${x.id}">${esc(x.type)} · ${esc(x.name)}</option>`).join("")}</select>
         <button class="qr-btn qr-sm" data-act="attach-card">Pasang</button></div></section>
@@ -541,7 +552,8 @@ function render({ model, el }) {
         <button class="qr-btn qr-sm" data-act="apply-now">${icon("refresh")}Terapkan sekarang</button></section>` : ""}`;
   }
   function tabCards() {
-    const lib = get("library"), card = get("card"), types = get("boot").types || {};
+    const lib = get("library"), types = get("boot").types || {};
+    const card = state.cards.get(state.cardView) || {};
     if (state.cardView && card.id === state.cardView) {
       return `<button class="qr-btn qr-sm" data-act="cards-back">${icon("left")}Perpustakaan</button>${cardForm(card, false)}`;
     }
@@ -571,12 +583,12 @@ function render({ model, el }) {
     return `<section><h4>Server</h4><div class="qr-srv"><i class="qr-dot ${s.phase === "ready" ? "ok" : s.phase === "failed" ? "bad" : s.phase === "idle" ? "off" : "wait"}"></i>
         <b>${esc(s.preset || "Tidak ada")}</b> <span class="qr-muted">${esc(s.phase || "")}${s.ctx ? ` · ${fmtN(s.ctx)} token` : ""}${s.mtp ? " · MTP" : ""}${s.embed ? ` · embedder ${s.embed_ready ? "siap" : "memuat"}` : ""}</span></div>
       ${(s.warnings || []).map((w) => `<div class="qr-flag">${icon("warn")}${esc(w)}</div>`).join("")}${s.error ? `<pre class="qr-error">${esc(s.error)}</pre>` : ""}
-      ${s.gpu ? `<div class="qr-muted">GPU ${s.gpu.util.toFixed(0)}% · VRAM ${s.gpu.used_gb.toFixed(1)} / ${s.gpu.total_gb.toFixed(0)} GB</div>` : ""}
+      <div class="qr-muted qr-gpu">${s.gpu ? `GPU ${s.gpu.util.toFixed(0)}% · VRAM ${s.gpu.used_gb.toFixed(1)} / ${s.gpu.total_gb.toFixed(0)} GB` : ""}</div>
       ${s.installed ? "" : `<div class="qr-flag">${icon("warn")}Belum terpasang. Klik Install di sel Server model.</div>`}</section>
       <section><h4>Ganti model</h4><label>Model<select class="qr-model-sel">${boot.presets.map((x) => `<option ${x.name === sel ? "selected" : ""}>${esc(x.name)}</option>`).join("")}</select></label>
-      <label>Konteks<select class="qr-ctx-sel">${ctxs.map(([k, v]) => `<option value="${v}" ${v === (s.ctx || 524288) ? "selected" : ""}>${esc(k)}</option>`).join("")}</select></label>
+      <label>Konteks<select class="qr-ctx-sel">${ctxs.map(([k, v]) => `<option value="${v}" ${v === (state.modelCtx || s.ctx || 524288) ? "selected" : ""}>${esc(k)}</option>`).join("")}</select></label>
       ${p.yarn_exp ? '<div class="qr-help">Di atas 262K memakai YaRN tanpa resep resmi untuk model ini (eksperimental).</div>' : ""}
-      <label class="qr-check"><input type="checkbox" class="qr-mtp" checked> MTP</label><label class="qr-check"><input type="checkbox" class="qr-emb" checked> Embedder</label>
+      <label class="qr-check"><input type="checkbox" class="qr-mtp" ${state.modelMtp === false ? "" : "checked"}> MTP</label><label class="qr-check"><input type="checkbox" class="qr-emb" ${state.modelEmb === false ? "" : "checked"}> Embedder</label>
       <div class="qr-help">Ganti model membuat seluruh konteks diproses ulang di giliran berikutnya (bisa beberapa menit untuk chat panjang).</div>
       <div class="qr-row"><button class="qr-btn qr-primary" data-act="model-start">${icon("cpu")}Start</button><button class="qr-btn qr-danger" data-act="model-stop">Stop</button></div></section>`;
   }
@@ -599,6 +611,11 @@ function render({ model, el }) {
   }
   function renderWizard() {
     if (!state.wizard) return;
+    // keep what the user already picked when the card list changes underneath
+    const body = $(".qr-modal-body"), prev = body.querySelector(".qr-wizard") ? {
+      title: body.querySelector(".wz-title")?.value || "", greet: body.querySelector(".wz-greet")?.value || "1",
+      roles: Object.fromEntries([...body.querySelectorAll("select[data-role]")].map((x) => [x.dataset.role, x.value])),
+      chars: new Set([...body.querySelectorAll(".qr-wz-chars input:checked")].map((x) => x.value)) } : null;
     const lib = get("library"), types = get("boot").types || {};
     const opt = (t) => (lib.cards || []).filter((c) => c.type === t).map((c) => `<option value="${c.id}">${esc(c.name)}</option>`).join("");
     openModal("Mulai cerita", `<div class="qr-wizard">
@@ -606,7 +623,13 @@ function render({ model, el }) {
       ${["world", "scenario", "persona", "style", "gm"].map((t) => `<label>${esc(types[t] || t)}<select data-role="${t}"><option value="">${t === "style" || t === "gm" ? "default" : "tidak ada"}</option>${opt(t)}</select></label>`).join("")}
       <div class="qr-flabel">Tokoh</div><div class="qr-wz-chars">${(lib.cards || []).filter((c) => c.type === "character").map((c) => `<label class="qr-check"><input type="checkbox" value="${c.id}"> ${esc(c.name)}</label>`).join("") || '<span class="qr-muted">Belum ada kartu tokoh. Buat di Studio atau impor.</span>'}</div>
       <label>Pesan pembuka ke-<input class="wz-greet" type="number" min="1" value="1"></label>
-      <div class="qr-row"><button class="qr-btn qr-primary" data-act="wizard-go">${icon("book")}Mulai</button><button class="qr-btn" data-act="studio">${icon("sparkles")}Susun di Studio dulu</button></div></div>`);
+      <div class="qr-row"><button class="qr-btn qr-primary" data-act="wizard-go">${icon("book")}Mulai</button><button class="qr-btn" data-act="studio">${icon("sparkles")}Susun di Studio dulu</button></div></div>`, true);
+    if (prev) {
+      body.querySelector(".wz-title").value = prev.title;
+      body.querySelector(".wz-greet").value = prev.greet;
+      for (const x of body.querySelectorAll("select[data-role]")) if (prev.roles[x.dataset.role] !== undefined) x.value = prev.roles[x.dataset.role];
+      for (const x of body.querySelectorAll(".qr-wz-chars input")) x.checked = prev.chars.has(x.value);
+    }
   }
 
   // ---------- events ----------
@@ -624,21 +647,35 @@ function render({ model, el }) {
     box.innerHTML = state.pending.map((f, i) => `<span class="qr-att">${icon("clip")}${esc(f.name)} <span class="qr-muted">${kb(f.size)}</span><button class="qr-icon qr-xs" data-act="unpend" data-i="${i}">${icon("x")}</button></span>`).join("");
   }
   const LONG_PH = input.placeholder;
-  new ResizeObserver(() => { input.placeholder = el.clientWidth < 640 ? "Kirim pesan" : LONG_PH; }).observe(el);
+  const ro2 = new ResizeObserver(() => { input.placeholder = el.clientWidth < 640 ? "Kirim pesan" : LONG_PH; });
+  ro2.observe(el);
+  listen("keydown", (e) => { if (e.key === "Escape" && !modal.hidden) closeModal(); });
   const grow = () => { input.style.height = "auto"; input.style.height = `${Math.min(input.scrollHeight, 240)}px`; };
   input.addEventListener("input", grow);
-  input.addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); $(".qr-form").requestSubmit(); } });
+  input.addEventListener("keydown", (e) => {
+    if (e.key !== "Enter" || e.shiftKey || e.isComposing || e.keyCode === 229) return;  // 229: Enter that ends IME input
+    e.preventDefault();
+    if (!input.value.trim() && !state.pending.length) return;  // an empty Enter never stops a reply (Stop is the button)
+    $(".qr-form").requestSubmit();
+  });
   input.addEventListener("paste", (e) => { const fs = [...(e.clipboardData?.files || [])]; if (fs.length) { e.preventDefault(); addFiles(fs); } });
   $(".qr-form").addEventListener("submit", async (e) => {
     e.preventDefault();
     const text = input.value.trim();
     if (model.get("busy") && !text && !state.pending.length) { send("stop"); return; }
     if (!text && !state.pending.length) return;
+    if (state.sending) return;
+    // clear first: a second Enter while big files are read must not send the same message twice
+    const pending = state.pending;
+    state.sending = true; input.value = ""; state.pending = []; renderPending(); grow();
     try {
-      const files = await Promise.all(state.pending.map(async (f) => ({ name: f.name, mime: f.type || "", b64: await readB64(f) })));
+      const files = await Promise.all(pending.map(async (f) => ({ name: f.name, mime: f.type || "", b64: await readB64(f) })));
       send("send", { text, files });
-      input.value = ""; state.pending = []; renderPending(); grow(); fol.jump();
-    } catch (err) { toast(`Gagal membaca lampiran: ${err}`, "error"); }
+      fol.jump();
+    } catch (err) {
+      input.value = text; state.pending = pending; renderPending(); grow();
+      toast(`Gagal membaca lampiran: ${err}`, "error");
+    } finally { state.sending = false; }
   });
   const main = $(".qr-main");
   let depth = 0;
@@ -660,22 +697,34 @@ function render({ model, el }) {
   $(".qr-file-att").addEventListener("change", (e) => {
     addFiles([...(e.target.files || [])]);
     e.target.value = "";
-    if (state.imageIntent && state.pending.length) {
+    if (state.imageIntent && state.pending.length && get("chat").kind === "studio") {
       state.imageIntent = false;
       input.value = "Isi penampilan tokoh dari gambar terlampir (card_draft_update, field appearance), lalu jelaskan singkat apa yang kamu isi.";
       $(".qr-form").requestSubmit();
     }
   });
+  $(".qr-file-att").addEventListener("cancel", () => { state.imageIntent = false; });
   $(".qr-file-card").addEventListener("change", async (e) => { const f = e.target.files?.[0]; e.target.value = ""; if (f) send("card_import", { b64: await readB64(f), name: f.name }); });
   $(".qr-file-avatar").addEventListener("change", async (e) => {
     const f = e.target.files?.[0]; e.target.value = "";
     const form = el.querySelector(".qr-drawer .qr-card-form");
-    if (f && form) send("card_save", { card_id: Number(form.dataset.card), data: collectCard(form), avatar: await readB64(f) });
+    if (f && form) send("card_save", { card_id: Number(form.dataset.card), data: collectCard(form), avatar: await readB64(f), version: Number(form.dataset.version) });
   });
   // typing in a card form marks it as having unsaved edits
-  const markDirty = (e) => { const f = e.target.closest && e.target.closest(".qr-card-form"); if (f && !e.target.closest(".qr-lore-edit, .qr-tl")) state.formDirty = Number(f.dataset.card); };
+  const markDirty = (e) => { const f = e.target.closest && e.target.closest(".qr-card-form"); if (f && !e.target.closest(".qr-lore-edit, .qr-tl, .qr-version-sel")) state.formDirty = Number(f.dataset.card); };
+  const leaveForm = () => {
+    if (state.formDirty && state.formDirty === state.cardView && !confirm("Perubahan kartu belum disimpan. Tinggalkan dan buang perubahan?")) return false;
+    if (state.formDirty === state.cardView) state.formDirty = null;
+    return true;
+  };
   listen("input", markDirty);
   listen("change", markDirty);
+  dbody.addEventListener("change", (e) => {
+    const t = e.target;
+    if (t.classList.contains("qr-ctx-sel")) state.modelCtx = Number(t.value);
+    else if (t.classList.contains("qr-mtp")) state.modelMtp = t.checked;
+    else if (t.classList.contains("qr-emb")) state.modelEmb = t.checked;
+  });
   dbody.addEventListener("input", (e) => {
     const t = e.target;
     if (t.dataset.smp && t.type === "range") t.nextElementSibling.textContent = t.value;
@@ -724,14 +773,15 @@ function render({ model, el }) {
       case "compact": if (confirm("Padatkan konteks lama sekarang? Bisa makan waktu beberapa menit untuk chat panjang.")) send("compact"); break;
       case "open-tab": openDrawer(btn.dataset.tab); break;
       case "close-drawer": drawer.hidden = true; break;
-      case "tab": openDrawer(btn.dataset.tab); break;
+      case "tab": if (btn.dataset.tab !== state.tab && state.tab === "cards" && !leaveForm()) break; openDrawer(btn.dataset.tab); break;
       case "close-modal": closeModal(); state.wizard = false; break;
       case "toggle-world": state.open.has("world") ? state.open.delete("world") : state.open.add("world"); renderPanels(); break;
       case "time-skip": if (confirm(`Lompat waktu ${btn.dataset.label}?`)) send("time_skip", { label: btn.dataset.label }); break;
-      case "copy": { const it = (model.get("history").items || []).find((x) => x.id === mid || (x.ids || []).includes(mid)); navigator.clipboard?.writeText(it ? it.content : ""); toast("Disalin."); break; }
+      case "copy": { const it = (model.get("history").items || []).find((x) => x.id === mid || (x.ids || []).includes(mid)); Promise.resolve(navigator.clipboard?.writeText(it ? it.content : "")).then(() => toast("Disalin."), () => toast("Gagal menyalin.", "warn")); break; }
       case "edit": {
-        const it = (model.get("history").items || []).find((x) => x.id === mid);
-        openModal("Edit pesan", `<textarea class="qr-edit-text" rows="10">${esc(it ? it.content : "")}</textarea>
+        const it = (model.get("history").items || []).find((x) => x.id === mid || x.answer_id === mid);
+        const text = it ? (it.kind === "bot" ? (it.edit_text ?? it.content) : it.content) : "";
+        openModal("Edit pesan", `<textarea class="qr-edit-text" rows="10">${esc(text)}</textarea>
           <div class="qr-help">${it && it.kind === "user" ? "Membuat cabang baru dan menjawab ulang dari sini." : "Menyimpan versi baru pesan ini."}</div>
           <button class="qr-btn qr-primary" data-act="edit-save" data-id="${mid}">Simpan</button>`);
         break;
@@ -742,7 +792,7 @@ function render({ model, el }) {
       case "swipe": send("swipe", { mid: id, dir: Number(btn.dataset.dir) }); break;
       case "delete": if (confirm("Hapus pesan ini dan semua balasan setelahnya di cabang ini?")) send("delete_msg", { mid }); break;
       case "branch": send("branch", { mid }); break;
-      case "pin": { const it = (model.get("history").items || []).find((x) => x.id === mid); send("pin", { mid, on: !(it && it.pinned) }); break; }
+      case "pin": { const it = (model.get("history").items || []).find((x) => x.id === mid || x.answer_id === mid); send("pin", { mid, on: !(it && it.pinned) }); break; }
       case "chapter": { const t = prompt("Judul bab:"); if (t) send("chapter", { mid, title: t }); break; }
       case "fact-check": send("fact_check", { mid }); toast("Memeriksa fakta…"); break;
       case "choose": send("choose", { text: btn.dataset.text }); fol.jump(); break;
@@ -770,14 +820,14 @@ function render({ model, el }) {
       case "side-logs": send("side_logs"); break;
       case "notice-close": send("notice_clear"); break;
       case "compare": { const ids = [...el.querySelectorAll(".qr-cmp:checked")].map((i) => Number(i.value)); if (ids.length === 2) send("compare", { a: ids[0], b: ids[1] }); else toast("Pilih tepat 2 cabang.", "warn"); break; }
-      case "card-save": { const form = btn.closest(".qr-card-form"); state.formDirty = null; send("card_save", { card_id: Number(form.dataset.card), data: collectCard(form) }); break; }
+      case "card-save": { const form = btn.closest(".qr-card-form"); state.formDirty = null; send("card_save", { card_id: Number(form.dataset.card), data: collectCard(form), version: Number(form.dataset.version) }); break; }
       case "card-avatar": $(".qr-file-avatar").click(); break;
       case "card-export": { const form = btn.closest(".qr-card-form"); send("card_export", { card_id: Number(form.dataset.card), fmt: btn.dataset.fmt }); break; }
       case "card-delete": { const form = btn.closest(".qr-card-form"); if (confirm("Hapus kartu ini beserta lore dan garis waktunya?")) { send("card_delete", { card_id: Number(form.dataset.card) }); state.cardView = null; } break; }
       case "card-new": send("card_new", { type: btn.dataset.type }); state.cardView = "new"; break;
       case "card-import": $(".qr-file-card").click(); break;
-      case "open-card": state.formDirty = null; state.tab = "cards"; state.cardView = id; drawer.hidden = false; send("card_open", { card_id: id }); renderDrawer(); break;
-      case "cards-back": state.formDirty = null; state.cardView = null; send("library"); renderDrawer(); break;
+      case "open-card": if (!leaveForm()) break; state.formDirty = null; state.tab = "cards"; state.cardView = id; drawer.hidden = false; send("card_open", { card_id: id }); renderDrawer(); break;
+      case "cards-back": if (!leaveForm()) break; state.formDirty = null; state.cardView = null; send("library"); renderDrawer(); break;
       case "schema": send("schema_get", { type: btn.dataset.type }); break;
       case "schema-save": send("schema_save", { schema: el.querySelector(".qr-schema-text").value }); break;
       case "row-add": { const tbl = btn.closest(".qr-table"); state.formDirty = Number(btn.closest(".qr-card-form").dataset.card); const n = Number(tbl.dataset.cols); const r = document.createElement("div"); r.className = "qr-trow"; r.innerHTML = Array(n).fill("<input>").join("") + `<button class="qr-icon qr-xs" data-act="row-del">${icon("x")}</button>`; tbl.insertBefore(r, btn); break; }
@@ -828,7 +878,16 @@ function render({ model, el }) {
     const a = model.get("aux") || {};
     if (!a.kind) return;
     const d = a.data;
-    if (a.kind === "memory") { state.memory = d; if (state.tab === "memory") { const f = document.activeElement; dbody.innerHTML = tabMemory(); if (f && f.classList.contains("qr-mem-q")) dbody.querySelector(".qr-mem-q").focus(); } }
+    if (a.kind === "memory") {
+      state.memory = d;
+      const f = rootActive();
+      const typing = f && dbody.contains(f) && (f.tagName === "TEXTAREA" || (f.tagName === "INPUT" && !f.classList.contains("qr-mem-q")));
+      if (state.tab === "memory" && !typing) {
+        const q = f && f.classList.contains("qr-mem-q") ? f.value : null, pos = q !== null ? f.selectionStart : 0;
+        dbody.innerHTML = tabMemory();
+        if (q !== null) { const n = dbody.querySelector(".qr-mem-q"); n.value = q; n.focus(); n.setSelectionRange(pos, pos); }
+      }
+    }
     else if (a.kind === "vocab") { state.vocab = d; if (state.tab === "learn") dbody.innerHTML = tabLearn(); }
     else if (a.kind === "branches") openModal("Pohon cabang", (d.map((b) => `<div class="qr-branch ${b.active ? "on" : ""}"><input type="checkbox" class="qr-cmp" value="${b.id}" title="Pilih untuk dibandingkan">
         <span class="qr-badge">${b.depth} pesan</span><span>${esc(b.preview)}</span>${b.head ? '<span class="qr-muted">aktif</span>' : `<button class="qr-btn qr-sm" data-act="goto" data-id="${b.id}">Buka</button>`}</div>`).join("") || "Belum ada cabang.")
@@ -851,8 +910,8 @@ function render({ model, el }) {
         <h4>System (beku)</h4><pre class="qr-pre">${esc(d.system)}</pre><h4>Pesan terakhir + blok sementara</h4><pre class="qr-pre">${esc(d.last_user_text)}</pre>`);
     else if (a.kind === "search") openModal(`Hasil "${d.q}"`, (d.results || []).map((r) => `<button class="qr-libitem" data-act="jump-to" data-chat="${r.chat_id}" data-id="${r.id}"><b>${esc(r.title)}</b><span>${esc(r.snippet)}</span></button>`).join("") || "Tidak ketemu.");
     else if (a.kind === "learn") openModal("Penjelasan", `<blockquote>${esc(d.text)}</blockquote><p><b>${esc(d.translation || "")}</b></p>
-        ${(d.grammar || []).length ? `<ul>${d.grammar.map((g) => `<li>${esc(g)}</li>`).join("")}</ul>` : ""}
-        ${(d.vocab || []).map((v) => `<div class="qr-memrow"><b>${esc(v.term)}</b><span>${esc(v.translation)} <span class="qr-muted">${esc(v.note || "")}</span></span>
+        ${Array.isArray(d.grammar) && d.grammar.length ? `<ul>${d.grammar.map((g) => `<li>${esc(typeof g === "string" ? g : JSON.stringify(g))}</li>`).join("")}</ul>` : ""}
+        ${(Array.isArray(d.vocab) ? d.vocab : []).filter((v) => v && typeof v === "object").map((v) => `<div class="qr-memrow"><b>${esc(v.term)}</b><span>${esc(v.translation)} <span class="qr-muted">${esc(v.note || "")}</span></span>
           <button class="qr-btn qr-sm" data-act="vocab-add" data-term="${esc(v.term)}" data-tr="${esc(v.translation)}" data-note="${esc(v.note || "")}" data-ex="${esc(d.text)}">${icon("plus")}</button></div>`).join("")}`);
     else if (a.kind === "recall") openModal("Uji ingatan", d.error ? esc(d.error) : `<p><b>${d.score}/${d.total}</b> benar</p>${d.items.map((x) => `<div class="qr-recall ${x.ok ? "ok" : "bad"}">${icon(x.ok ? "check" : "x")}<div><b>${esc(x.q)}</b><br>
         <span class="qr-muted">kunci:</span> ${esc(x.expected)}<br><span class="qr-muted">jawaban:</span> ${esc(x.got)}</div></div>`).join("")}`);
@@ -880,12 +939,14 @@ function render({ model, el }) {
     const c = get("chat");
     const learn = !!((c.settings || {}).learn);
     if (learn !== state.learn) { state.learn = learn; el.classList.toggle("learn", learn); els.clear(); list.innerHTML = ""; }
-    if (state.lastChat !== c.id) { state.lastChat = c.id; state.studioCard = null; els.clear(); list.innerHTML = ""; fol.jump(); }
+    if (state.lastChat !== c.id) { state.lastChat = c.id; state.studioCard = null; state.imageIntent = false; els.clear(); list.innerHTML = ""; fol.jump(); }
     renderTop(); renderChats(); renderStudio(); renderDrawer(); renderHistory();
   };
   const onCard = () => {
     const card = get("card");
-    if (state.cardView === "new" && card.id) state.cardView = card.id;
+    if (!card.id) return;
+    state.cards.set(card.id, card);
+    if (state.cardView === "new") state.cardView = card.id;
     const forms = [...el.querySelectorAll(`.qr-card-form[data-card="${card.id}"]`)];
     if (state.formDirty === card.id && forms.some((f) => Number(f.dataset.version) !== card.version)) {
       for (const f of forms) {
@@ -896,8 +957,8 @@ function render({ model, el }) {
       }
       return;
     }
-    renderStudio();
-    if (state.tab === "cards") renderDrawer();
+    if (card.id === state.studioCard) renderStudio();
+    if (state.tab === "cards" && card.id === state.cardView) renderDrawer();
   };
   let raf = 0;
   const onLive = () => { if (!raf) raf = requestAnimationFrame(() => { raf = 0; renderLive(); }); };
@@ -905,7 +966,15 @@ function render({ model, el }) {
     "change:chats": renderChats, "change:chat": onChat, "change:history": () => { renderHistory(); if (get("chat").kind === "studio" && state.studioCard) send("card_open", { card_id: state.studioCard }); },
     "change:live": onLive, "change:busy": renderBusy, "change:status": renderStatusLine, "change:queue": renderStatusLine,
     "change:toast": onToast, "change:ctx": renderTop, "change:panels": () => { renderPanels(); renderTop(); },
-    "change:server": () => { renderTop(); if (state.tab === "model") renderDrawer(); }, "change:backup": renderBackup,
+    "change:server": () => {
+      renderTop();
+      if (state.tab !== "model" || drawer.hidden) return;
+      const s = get("server");
+      const k = JSON.stringify([s.phase, s.preset, s.ctx, s.mtp, s.embed, s.embed_ready, s.error, s.warnings, s.installed]);
+      if (k !== state.srvKey) { state.srvKey = k; renderDrawer(); return; }
+      const g = dbody.querySelector(".qr-gpu");  // only the GPU line changed: leave the form as it is
+      if (g) g.textContent = s.gpu ? `GPU ${s.gpu.util.toFixed(0)}% · VRAM ${s.gpu.used_gb.toFixed(1)} / ${s.gpu.total_gb.toFixed(0)} GB` : "";
+    }, "change:backup": renderBackup,
     "change:library": () => { if (state.tab === "cards" || state.tab === "story") renderDrawer(); renderWizard(); },
     "change:card": onCard, "change:story": () => { renderStudio(); if (state.tab === "story") renderDrawer(); },
     "change:rev": () => { if (state.tab === "memory" && !drawer.hidden) send("memory", { q: (state.memory || {}).q || "" }); },
@@ -916,7 +985,7 @@ function render({ model, el }) {
   onChat(); renderBusy(); renderLive(); renderPanels(); renderBackup(); renderStatusLine();
   const cleanup = () => {
     for (const [ev, fn] of Object.entries(handlers)) model.off(ev, fn);
-    clearInterval(timer); themeObs.disconnect(); ac.abort();
+    clearInterval(timer); themeObs.disconnect(); ac.abort(); ro1.disconnect(); ro2.disconnect();
     if (el.__qrCleanup === cleanup) el.__qrCleanup = null;
   };
   el.__qrCleanup = cleanup;

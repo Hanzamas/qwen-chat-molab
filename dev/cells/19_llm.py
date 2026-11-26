@@ -1,3 +1,7 @@
+import http.client as _http_client
+import socket as _socket
+
+
 class LLM:
     """OpenAI-compatible client for the running server (vLLM, or llama.cpp behind the proxy)."""
 
@@ -26,7 +30,8 @@ class LLM:
             if not val:
                 return cur["ctx"] or 0
             self._ctx_cache = {key: val}
-        return self._ctx_cache[key]
+            return val
+        return self._ctx_cache.get(key) or cur["ctx"] or 0
 
     def tokenize(self, messages, tools=None, kwargs=None):
         cur = self.servers.current()
@@ -69,18 +74,33 @@ class LLM:
         req = urllib.request.Request(cur["base_url"] + "/chat/completions", data=json.dumps(body).encode(), headers=self._hdr())
         acc = {"content": "", "reasoning": "", "calls": {}, "usage": None, "finish": None, "t_think": None, "t_answer": None}
         resp = urllib.request.urlopen(req, timeout=timeout)
+        done = threading.Event()
+        if stop is not None:
+            # Stop must also work while the server is still reading a long prompt and sends nothing:
+            # shutting the socket down ends the blocked read, and the server aborts the request.
+            def watch():
+                while not done.wait(0.25):
+                    if stop.is_set():
+                        LLM._abort(resp)
+                        return
+            threading.Thread(target=watch, daemon=True).start()
         try:
             for raw in resp:
                 if stop is not None and stop.is_set():
                     acc["finish"] = "stopped"
                     break
                 line = raw.decode("utf-8", "replace").strip()
+                if line.startswith("error:"):  # llama.cpp reports some failures as an SSE error line
+                    raise RuntimeError("Server error: " + line[6:].strip()[:500])
                 if not line.startswith("data:"):
                     continue
                 data = line[5:].strip()
                 if data == "[DONE]":
                     break
                 chunk = json.loads(data)
+                if isinstance(chunk, dict) and chunk.get("error"):  # vLLM sends errors inside the stream
+                    err = chunk["error"]
+                    raise RuntimeError("Server error: " + str(err.get("message") if isinstance(err, dict) else err)[:500])
                 if chunk.get("usage"):
                     acc["usage"] = chunk["usage"]
                 for choice in chunk.get("choices") or []:
@@ -102,10 +122,27 @@ class LLM:
                         acc["finish"] = choice["finish_reason"]
                     if (r or delta.get("content")) and on_delta:
                         on_delta(acc)
+        except (OSError, ValueError, AttributeError, _http_client.HTTPException):
+            if stop is not None and stop.is_set():
+                acc["finish"] = "stopped"
+            else:
+                raise
         finally:
+            done.set()
             # Closing the stream makes the server abort the request when Stop is pressed.
             resp.close()
         return acc
+
+    @staticmethod
+    def _abort(resp):
+        try:
+            resp.fp.raw._sock.shutdown(_socket.SHUT_RDWR)
+        except Exception:
+            pass
+        try:
+            resp.close()
+        except Exception:
+            pass
 
     def complete(self, messages, kwargs=None, sampling=None, max_tokens=4000, tools=None, timeout=7200, stop=None,
                  on_delta=None):

@@ -40,7 +40,10 @@ class Backup:
         while self.status["enabled"]:
             time.sleep(self.interval)
             if self.store.rev != self.saved_rev:
-                self.backup_now()
+                try:
+                    self.backup_now()
+                except Exception:
+                    pass  # recorded in status["last_error"]; the next interval tries again
 
     def backup_now(self):
         if not self.token:
@@ -53,6 +56,9 @@ class Backup:
                 self.store.backup_to(tmp)
                 api = self._api()
                 api.create_repo(self.repo, repo_type="dataset", private=True, exist_ok=True)
+                # exist_ok keeps an existing repo as it is: never upload chats to a public one
+                if not getattr(api.repo_info(self.repo, repo_type="dataset"), "private", False):
+                    raise RuntimeError(f"Repo {self.repo} publik. Jadikan private dulu di Hugging Face; backup tidak diunggah.")
                 stamp = time.strftime("%Y%m%d-%H%M%S")
                 from huggingface_hub import CommitOperationAdd, CommitOperationDelete
                 ops = [CommitOperationAdd(f"backups/qwen-chat-{stamp}.sqlite", str(tmp)),
