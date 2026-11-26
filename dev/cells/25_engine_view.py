@@ -102,11 +102,31 @@ class EngineView:
                 "stats": [{"key": s["key"], "label": s["label"], "value": s["value"], "min": s["min"], "max": s["max"],
                            "change": s["change"]} for s in st["stats"]],
                 "status": {k: v for k, v in player.items() if k != "location"},
-                "characters": {k: v for k, v in st["status"].items() if k != "player"},
+                "characters": self._observable(st["status"], player.get("location")),
+                "gm_view": bool(chat["settings"].get("gm_view")),
+                "characters_gm": {k: v for k, v in st["status"].items() if k != "player"} if chat["settings"].get("gm_view") else {},
                 "weather": wthr["text"] if wthr else "", "events": [{"id": e["id"], "time": e["world_time"], "text": e["text"],
                                                                      "new": not e["shown"]} for e in events],
                 "time_skips": gm.get("time_skips") or ["2 jam", "1 hari", "1 minggu"], "persona": persona["name"] if persona else "",
                 "story": (c["story"] or {}).get("title", "")}
+
+    # What can be seen of someone in the same place. Plans, attitudes, what they know and carry stay hidden.
+    OBSERVABLE = ("outfit", "mood", "injuries", "keadaan")
+
+    @classmethod
+    def _observable(cls, status, here):
+        norm = lambda s: re.sub(r"\s+", " ", str(s or "").strip().lower())
+        here = norm(here)
+        out = {}
+        for name, st in status.items():
+            if name == "player":
+                continue
+            loc = norm(st.get("location"))
+            if here and loc and (loc == here or here in loc or loc in here):
+                out[name] = {k: st[k] for k in cls.OBSERVABLE if st.get(k) not in (None, "", [])}
+            elif not here or not loc:
+                out[name] = {k: st[k] for k in ("keadaan",) if st.get(k) not in (None, "", [])}
+        return out
 
     def branches(self, chat_id):
         """Leaves of the message tree with a preview, newest first."""

@@ -736,3 +736,19 @@ def test_schema_v2_fields(nb):
     keys = lambda t: {f["key"] for f in C.schema(t)["fields"]}
     assert {"schedule", "skill_levels"} <= keys("character") and "skill_levels" in keys("persona")
     assert "locations" in keys("world") and {"state_check", "continuity_check"} <= keys("gm") and "keadaan" in keys("status")
+
+
+def test_panel_shows_only_what_the_player_sees(engine, nb):
+    chat, _ = _story(nb, engine, fmt="game")
+    S, W = nb["STORE"], nb["WORLD"]
+    head = S.chat(chat)["head_id"]
+    W.status_update(chat, head, "player", {"location": "Dapur"})
+    W.status_update(chat, head, "Lotte Braun", {"location": "Dapur", "mood": "gugup", "plan_now": "Kabur malam ini",
+                                                 "knows": ["surat merah"]})
+    W.status_update(chat, head, "Otto", {"location": "Stasiun", "mood": "marah"})
+    p = engine.panels(chat)
+    assert p["characters"]["Lotte Braun"] == {"mood": "gugup"}
+    assert "Otto" not in p["characters"] and not p["characters_gm"]
+    S.chat_settings(chat, gm_view=True)
+    p = engine.panels(chat)
+    assert p["characters_gm"]["Lotte Braun"]["plan_now"] == "Kabur malam ini" and "Otto" in p["characters_gm"]

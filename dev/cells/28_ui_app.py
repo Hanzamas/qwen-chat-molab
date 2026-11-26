@@ -175,8 +175,10 @@ function render({ model, el }) {
         <div class="qr-sbar"><i style="width:${pct}%"></i></div><b>${Number(s.value)}</b>${ch}</div>`;
     };
     const status = Object.entries(p.status || {}).map(([k, v]) => `<span class="qr-tag">${esc(k)}: ${esc(Array.isArray(v) ? v.join(", ") : typeof v === "object" ? JSON.stringify(v) : v)}</span>`).join("");
-    const npcs = Object.entries(p.characters || {});
-    const npcHTML = npcs.length ? `<details class="qr-npcs" data-key="npcs" ${state.open.has("npcs") ? "open" : ""}><summary>${icon("users")}Tokoh lain (${npcs.length})</summary>
+    // Without Mode GM only what your character can see of the people around: no plans, attitudes, knowledge.
+    const npcs = Object.entries(p.gm_view ? p.characters_gm || {} : p.characters || {});
+    const gmBtn = `<button class="qr-btn qr-sm ${p.gm_view ? "qr-primary" : ""}" data-act="gm-view" title="Tampilkan semua status tokoh (spoiler)">Mode GM</button>`;
+    const npcHTML = npcs.length || p.gm_view ? `<details class="qr-npcs" data-key="npcs" ${state.open.has("npcs") ? "open" : ""}><summary>${icon("users")}${p.gm_view ? "Semua tokoh (mode GM)" : "Yang terlihat di sekitarmu"} (${npcs.length}) ${gmBtn}</summary>
       ${npcs.map(([name, st]) => `<div class="qr-npc"><b>${esc(name)}</b> ${Object.entries(st).map(([k, v]) => `<span class="qr-tag">${esc(k)}: ${esc(Array.isArray(v) ? v.join(", ") : typeof v === "object" ? JSON.stringify(v) : String(v)).slice(0, 120)}</span>`).join("")}</div>`).join("")}</details>` : "";
     sp.innerHTML = `<div class="qr-sp-head">${icon("clock")}<b>${esc(p.time)}</b><span>·</span>${icon("map")}<span>${esc(p.location || "-")}</span>
         <span>·</span><span>Giliran ${p.turn}</span>${p.story ? `<span class="qr-muted">· ${esc(p.story)}</span>` : ""}</div>
@@ -794,6 +796,8 @@ function render({ model, el }) {
       case "close-drawer": drawer.hidden = true; break;
       case "tab": if (btn.dataset.tab !== state.tab && state.tab === "cards" && !leaveForm()) break; openDrawer(btn.dataset.tab); break;
       case "close-modal": closeModal(); state.wizard = false; break;
+      case "gm-view": { e.preventDefault(); const p = get("panels");
+        if (p.gm_view || confirm("Mode GM menampilkan rencana, sikap, dan isi kepala semua tokoh (spoiler). Tampilkan?")) send("settings", { gm_view: !p.gm_view }); break; }
       case "toggle-world": state.open.has("world") ? state.open.delete("world") : state.open.add("world"); renderPanels(); break;
       case "time-skip": if (confirm(`Lompat waktu ${btn.dataset.label}?`)) send("time_skip", { label: btn.dataset.label }); break;
       case "copy": { const it = (model.get("history").items || []).find((x) => x.id === mid || (x.ids || []).includes(mid)); Promise.resolve(navigator.clipboard?.writeText(it ? it.content : "")).then(() => toast("Disalin."), () => toast("Gagal menyalin.", "warn")); break; }

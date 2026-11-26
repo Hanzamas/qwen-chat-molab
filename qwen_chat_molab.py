@@ -5343,11 +5343,31 @@ def _(TXT, hashlib, io, json, re, time, zipfile):
                     "stats": [{"key": s["key"], "label": s["label"], "value": s["value"], "min": s["min"], "max": s["max"],
                                "change": s["change"]} for s in st["stats"]],
                     "status": {k: v for k, v in player.items() if k != "location"},
-                    "characters": {k: v for k, v in st["status"].items() if k != "player"},
+                    "characters": self._observable(st["status"], player.get("location")),
+                    "gm_view": bool(chat["settings"].get("gm_view")),
+                    "characters_gm": {k: v for k, v in st["status"].items() if k != "player"} if chat["settings"].get("gm_view") else {},
                     "weather": wthr["text"] if wthr else "", "events": [{"id": e["id"], "time": e["world_time"], "text": e["text"],
                                                                          "new": not e["shown"]} for e in events],
                     "time_skips": gm.get("time_skips") or ["2 jam", "1 hari", "1 minggu"], "persona": persona["name"] if persona else "",
                     "story": (c["story"] or {}).get("title", "")}
+
+        # What can be seen of someone in the same place. Plans, attitudes, what they know and carry stay hidden.
+        OBSERVABLE = ("outfit", "mood", "injuries", "keadaan")
+
+        @classmethod
+        def _observable(cls, status, here):
+            norm = lambda s: re.sub(r"\s+", " ", str(s or "").strip().lower())
+            here = norm(here)
+            out = {}
+            for name, st in status.items():
+                if name == "player":
+                    continue
+                loc = norm(st.get("location"))
+                if here and loc and (loc == here or here in loc or loc in here):
+                    out[name] = {k: st[k] for k in cls.OBSERVABLE if st.get(k) not in (None, "", [])}
+                elif not here or not loc:
+                    out[name] = {k: st[k] for k in ("keadaan",) if st.get(k) not in (None, "", [])}
+            return out
 
         def branches(self, chat_id):
             """Leaves of the message tree with a preview, newest first."""
@@ -7043,8 +7063,10 @@ def _():
             <div class="qr-sbar"><i style="width:${pct}%"></i></div><b>${Number(s.value)}</b>${ch}</div>`;
         };
         const status = Object.entries(p.status || {}).map(([k, v]) => `<span class="qr-tag">${esc(k)}: ${esc(Array.isArray(v) ? v.join(", ") : typeof v === "object" ? JSON.stringify(v) : v)}</span>`).join("");
-        const npcs = Object.entries(p.characters || {});
-        const npcHTML = npcs.length ? `<details class="qr-npcs" data-key="npcs" ${state.open.has("npcs") ? "open" : ""}><summary>${icon("users")}Tokoh lain (${npcs.length})</summary>
+        // Without Mode GM only what your character can see of the people around: no plans, attitudes, knowledge.
+        const npcs = Object.entries(p.gm_view ? p.characters_gm || {} : p.characters || {});
+        const gmBtn = `<button class="qr-btn qr-sm ${p.gm_view ? "qr-primary" : ""}" data-act="gm-view" title="Tampilkan semua status tokoh (spoiler)">Mode GM</button>`;
+        const npcHTML = npcs.length || p.gm_view ? `<details class="qr-npcs" data-key="npcs" ${state.open.has("npcs") ? "open" : ""}><summary>${icon("users")}${p.gm_view ? "Semua tokoh (mode GM)" : "Yang terlihat di sekitarmu"} (${npcs.length}) ${gmBtn}</summary>
           ${npcs.map(([name, st]) => `<div class="qr-npc"><b>${esc(name)}</b> ${Object.entries(st).map(([k, v]) => `<span class="qr-tag">${esc(k)}: ${esc(Array.isArray(v) ? v.join(", ") : typeof v === "object" ? JSON.stringify(v) : String(v)).slice(0, 120)}</span>`).join("")}</div>`).join("")}</details>` : "";
         sp.innerHTML = `<div class="qr-sp-head">${icon("clock")}<b>${esc(p.time)}</b><span>·</span>${icon("map")}<span>${esc(p.location || "-")}</span>
             <span>·</span><span>Giliran ${p.turn}</span>${p.story ? `<span class="qr-muted">· ${esc(p.story)}</span>` : ""}</div>
@@ -7662,6 +7684,8 @@ def _():
           case "close-drawer": drawer.hidden = true; break;
           case "tab": if (btn.dataset.tab !== state.tab && state.tab === "cards" && !leaveForm()) break; openDrawer(btn.dataset.tab); break;
           case "close-modal": closeModal(); state.wizard = false; break;
+          case "gm-view": { e.preventDefault(); const p = get("panels");
+            if (p.gm_view || confirm("Mode GM menampilkan rencana, sikap, dan isi kepala semua tokoh (spoiler). Tampilkan?")) send("settings", { gm_view: !p.gm_view }); break; }
           case "toggle-world": state.open.has("world") ? state.open.delete("world") : state.open.add("world"); renderPanels(); break;
           case "time-skip": if (confirm(`Lompat waktu ${btn.dataset.label}?`)) send("time_skip", { label: btn.dataset.label }); break;
           case "copy": { const it = (model.get("history").items || []).find((x) => x.id === mid || (x.ids || []).includes(mid)); Promise.resolve(navigator.clipboard?.writeText(it ? it.content : "")).then(() => toast("Disalin."), () => toast("Gagal menyalin.", "warn")); break; }
@@ -8587,6 +8611,8 @@ def _(
             if updates:
                 STORE.chat_settings(cid, **updates)
             self.w.chat = self.chat_info(STORE.chat(cid))
+            if "gm_view" in updates:
+                self.w.panels = self.engine.panels(cid)
 
         def c_reroll(self, mid):
             self.engine.reroll(self._cur(), int(mid))

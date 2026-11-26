@@ -340,6 +340,8 @@ class ChatApp:
         if updates:
             STORE.chat_settings(cid, **updates)
         self.w.chat = self.chat_info(STORE.chat(cid))
+        if "gm_view" in updates:
+            self.w.panels = self.engine.panels(cid)
 
     def c_reroll(self, mid):
         self.engine.reroll(self._cur(), int(mid))
