@@ -971,3 +971,43 @@ def test_chapters_end_compaction_pieces(engine, nb):
         comp.CHUNK_TOKENS = old
     assert not any(b == 8 for _, b in plain)
     assert any(b == 8 for _, b in marked)  # the piece before the chapter ends right before it
+
+
+def test_story_search_and_new_embeddings(engine, nb, monkeypatch):
+    import os
+    monkeypatch.setenv("QCHAT_EMBED_URL", os.environ["QCHAT_BASE_URL"].removesuffix("/v1"))
+    chat, _ = _story(nb, engine)
+    S, T, K, EMB = nb["STORE"], nb["TOOLS"], nb["KNOW"], nb["EMB"]
+    engine.send(chat, "Halo.")
+    wait_idle(engine)
+    head = S.chat(chat)["head_id"]
+    kid = K.add(chat, head, ["Lotte Braun"], "Lotte menyimpan kopi tubruk di lemari atas")[0]
+    sid = S.chat(chat)["story_id"]
+    nb["STORIES"].canon_set(sid, "Dapur", "Lemari atas berisi persediaan kopi", chat, message_id=head)
+    EMB.backfill()
+    for _ in range(300):
+        got = {r["kind"] for r in S.q("SELECT DISTINCT kind FROM vectors")}
+        if {"know", "canon", "card"} <= got:
+            break
+        time.sleep(0.05)
+    assert {"know", "canon", "card"} <= got, got
+    EMB.cache.clear()
+    res, failed, _ = T.call(chat, head, "story_search", json.dumps({"query": "coffee"}))
+    types = {r["type"] for r in json.loads(res)["results"]}
+    assert not failed and "ingatan" in types, res
+    assert K.relevant(chat, "Lotte Braun", "coffee")[0]["id"] == kid  # found by meaning (coffee ~ kopi)
+
+
+def test_embedder_model_switch_rebuilds_vectors(nb):
+    S, EMB, SV = nb["STORE"], nb["EMB"], nb["SERVERS"]
+    S.x("INSERT OR REPLACE INTO vectors (kind, ref_id, dim, v) VALUES ('mem', 999999, 1, x'00')")
+    S.meta_set("embed_model", "0.6B")
+    old = SV.state.get("embed_model")
+    SV.state["embed_model"] = "4B"
+    try:
+        EMB.check_model()
+        assert not S.q("SELECT 1 AS x FROM vectors") and S.meta_get("embed_model") == "4B"
+        assert SV.embed_spec()["dim"] == 2560 and SV.embed_spec()["vllm_util"] == "0.88"
+    finally:
+        SV.state["embed_model"] = old
+        S.meta_set("embed_model", old or "0.6B")

@@ -207,7 +207,7 @@ class ServerManager:
 
     # ---------- start / stop ----------
 
-    def start(self, name, ctx, mtp=True, embed=False, log=None):
+    def start(self, name, ctx, mtp=True, embed=False, log=None, embed_model=None):
         """Download (if needed) and launch a preset. Returns once the process is running;
         a watcher thread marks it ready, or retries without MTP if the drafter makes it crash."""
         p = PRESETS[name]
@@ -223,6 +223,8 @@ class ServerManager:
             gen = self.gen
             self.state.update(phase="downloading", preset=name, ctx=ctx, mtp=bool(mtp and p.get("mtp")),
                               embed=embed, warnings=[], error="", started=time.time())
+            if embed_model in EMBEDDERS:
+                self.state["embed_model"] = embed_model
             self._save()
         try:
             if p["backend"] == "vllm":
@@ -257,7 +259,7 @@ class ServerManager:
                "--host", "127.0.0.1", "--port", str(CFG.PORT), "--api-key", CFG.API_KEY,
                "--max-model-len", str(ctx),
                # One long conversation: all the memory, no batch sharing.
-               "--gpu-memory-utilization", "0.92" if self.state.get("embed") else "0.94",
+               "--gpu-memory-utilization", self.embed_spec()["vllm_util"] if self.state.get("embed") else "0.94",
                "--max-num-seqs", "1",
                # Every turn resends the whole history; prefix caching reuses its KV instead of recomputing it.
                "--enable-prefix-caching", "--max-num-batched-tokens", "8192",
@@ -393,10 +395,18 @@ class ServerManager:
 
     # ---------- embedder ----------
 
+    def embed_spec(self):
+        return EMBEDDERS.get(self.state.get("embed_model") or "0.6B", EMBEDDER)
+
     def embed_start(self, log=None):
+        spec = self.embed_spec()
+        running = (CFG.LOG_DIR / "embed.model").read_text().strip() if (CFG.LOG_DIR / "embed.model").exists() else "0.6B"
         if self.embed_ready() or Sys.pid_alive(self.pid["embed"]):
-            return
-        path = self.fetch(EMBEDDER["repo"], EMBEDDER["revision"], EMBEDDER["file"], log=log)
+            if running == (self.state.get("embed_model") or "0.6B"):
+                return
+            self.embed_stop()  # another embedder model was chosen
+        path = self.fetch(spec["repo"], spec["revision"], spec["file"], log=log)
+        (CFG.LOG_DIR / "embed.model").write_text(self.state.get("embed_model") or "0.6B")
         cmd = [str(self.llama_bin()), "-m", str(path), "--embedding", "--pooling", "last", "--host", "127.0.0.1",
                "--port", str(CFG.EMBED_PORT), "--api-key", CFG.API_KEY, "-ngl", "999", "-c", "8192", "-ub", "8192",
                "-np", "1"]

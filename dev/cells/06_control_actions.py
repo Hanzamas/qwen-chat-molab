@@ -13,11 +13,12 @@ def _act():
             return mo.callout(mo.md(f"**{ctl_preset.value}** maksimal {p['yarn_max']:,} token. Pilih konteks yang lebih kecil."),
                               kind="danger")
         try:
-            SERVERS.start(ctl_preset.value, ctl_ctx.value, mtp=ctl_mtp.value, embed=ctl_embed.value)
+            SERVERS.start(ctl_preset.value, ctl_ctx.value, mtp=ctl_mtp.value, embed=ctl_embed.value,
+                          embed_model=ctl_embed_model.value)
         except Exception as e:
             return mo.callout(mo.md(f"Start gagal: {e}"), kind="danger")
         STORE.meta_set("server", {"preset": ctl_preset.value, "ctx": ctl_ctx.value, "mtp": ctl_mtp.value,
-                                  "embed": ctl_embed.value})
+                                  "embed": ctl_embed.value, "embed_model": ctl_embed_model.value})
         note = ""
         if ctl_ctx.value > p["max_ctx"] and p.get("yarn_exp"):
             note = ("\n\n**YaRN eksperimental:** model ini tidak punya resep YaRN resmi. Cek `n_ctx` di log dan uji "

@@ -708,11 +708,11 @@ class ChatApp:
         self.w.toast = {"n": time.time(), "text": f"Skema {sch['type']} disimpan (versi {sch['version']})."}
 
     # model
-    def c_model_switch(self, preset, ctx, mtp=True, embed=True):
+    def c_model_switch(self, preset, ctx, mtp=True, embed=True, embed_model=None):
         p = PRESETS[preset]
         if int(ctx) > p["yarn_max"]:
             raise ValueError(f"{preset} maksimal {p['yarn_max']:,} token.")
-        self.engine.switch_model(preset, int(ctx), bool(mtp), bool(embed))
+        self.engine.switch_model(preset, int(ctx), bool(mtp), bool(embed), embed_model if embed_model in EMBEDDERS else None)
 
     def c_model_stop(self):
         SERVERS.stop()

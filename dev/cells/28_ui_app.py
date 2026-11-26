@@ -651,6 +651,7 @@ function render({ model, el }) {
       <label>Konteks<select class="qr-ctx-sel">${ctxs.map(([k, v]) => `<option value="${v}" ${v === (state.modelCtx || s.ctx || 524288) ? "selected" : ""}>${esc(k)}</option>`).join("")}</select></label>
       ${p.yarn_exp ? '<div class="qr-help">Di atas 262K memakai YaRN tanpa resep resmi untuk model ini (eksperimental).</div>' : ""}
       <label class="qr-check"><input type="checkbox" class="qr-mtp" ${state.modelMtp === false ? "" : "checked"}> MTP</label><label class="qr-check"><input type="checkbox" class="qr-emb" ${state.modelEmb === false ? "" : "checked"}> Embedder</label>
+      <select class="qr-emb-model">${["0.6B", "4B"].map((m) => `<option ${m === (state.modelEmbModel || s.embed_model || "0.6B") ? "selected" : ""}>${m}</option>`).join("")}</select>
       <div class="qr-help">Ganti model membuat seluruh konteks diproses ulang di giliran berikutnya (bisa beberapa menit untuk chat panjang).</div>
       <div class="qr-row"><button class="qr-btn qr-primary" data-act="model-start">${icon("cpu")}Start</button><button class="qr-btn qr-danger" data-act="model-stop">Stop</button></div></section>`;
   }
@@ -787,6 +788,7 @@ function render({ model, el }) {
     if (t.classList.contains("qr-ctx-sel")) state.modelCtx = Number(t.value);
     else if (t.classList.contains("qr-mtp")) state.modelMtp = t.checked;
     else if (t.classList.contains("qr-emb")) state.modelEmb = t.checked;
+    else if (t.classList.contains("qr-emb-model")) state.modelEmbModel = t.value;
   });
   dbody.addEventListener("input", (e) => {
     const t = e.target;
@@ -932,7 +934,7 @@ function render({ model, el }) {
       case "smp-reset": send("settings", { sampling: {} }); break;
       case "mem-del": send("memory_delete", { mid: id }); break;
       case "mem-undo": send("memory_undo", { log_id: id }); break;
-      case "model-start": send("model_switch", { preset: dbody.querySelector(".qr-model-sel").value, ctx: Number(dbody.querySelector(".qr-ctx-sel").value), mtp: dbody.querySelector(".qr-mtp").checked, embed: dbody.querySelector(".qr-emb").checked }); break;
+      case "model-start": send("model_switch", { preset: dbody.querySelector(".qr-model-sel").value, ctx: Number(dbody.querySelector(".qr-ctx-sel").value), mtp: dbody.querySelector(".qr-mtp").checked, embed: dbody.querySelector(".qr-emb").checked, embed_model: dbody.querySelector(".qr-emb-model").value }); break;
       case "model-stop": if (confirm("Hentikan server model?")) send("model_stop"); break;
       case "review": send("vocab_review", { vid: id, grade: Number(btn.dataset.grade) }); break;
       case "vocab-del": send("vocab_delete", { vid: id }); break;

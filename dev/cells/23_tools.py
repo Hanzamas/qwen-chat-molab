@@ -58,6 +58,8 @@ TOOL_RP = [
          "who": {"type": "array", "items": _S}, "due": _S}, ["kind", "title"]),
     _fn("thread_close", "Close a story thread when it is resolved, failed or dropped.",
         {"id": _I, "status": {"type": "string", "enum": list(Threads.CLOSED)}, "note": _S}, ["id", "status"]),
+    _fn("story_search", "Search everything known about this story by meaning, not only by words: memories, the story book, "
+        "what characters know, lore, cards, summaries of earlier parts, past world events.", {"query": _S, "limit": _I}, ["query"]),
     _fn("relationship", "Change how a character feels about another (b: a name or 'player'). delta -20..20 with the reason "
         "(what happened). Small, earned changes; big swings only for big events.",
         {"a": _S, "b": _S, "delta": _N, "reason": _S}, ["a", "b", "delta", "reason"]),
@@ -371,6 +373,50 @@ class ToolBox:
         ids = KNOW.add(chat_id, mid, holders, text, kind, source, kw.get("from") or kw.get("start") or "", truth, importance,
                        st["time_text"])
         return {"saved": ids, "who": holders}
+
+    @staticmethod
+    def _rank(query, kind, rows, text_of, limit=4):
+        """Rows ordered by meaning when the embedder runs, otherwise by shared words."""
+        if not rows:
+            return []
+        by_id = {r["id"]: r for r in rows}
+        if EMB.ready():
+            found = [by_id[i] for i, s in EMB.search(kind, query, limit=limit, allowed=set(by_id)) if s > 0.3]
+            if found:
+                return found  # nothing embedded yet for this kind: fall back to words
+        scored = sorted(((TXT.overlap(query, text_of(r)), r["id"]) for r in rows), reverse=True)
+        return [by_id[i] for n, i in scored[:limit] if n > 0]
+
+    def t_story_search(self, chat_id, mid, query, limit=10):
+        ctx = self.mem.ctx_of(chat_id)
+        vis, sid = ctx["visible"], ctx["story_id"]
+        out = [{"type": "memory", "id": r["id"], "text": r["text"][:500]}
+               for r in self.mem.search(query, ctx, limit=4, kinds=("fact", "summary_core"))]
+        out += [{"type": "ingatan", "holder": r["holder"], "text": KNOW.line(r)}
+                for r in self._rank(query, "know", KNOW._rows(chat_id), lambda r: r["text"])]
+        if sid:
+            canon = self.stories.canon(sid, vis)
+            logs = [r for r in self.store.q("SELECT id, message_id, section, text FROM canon_log WHERE story_id = ? AND text != ''",
+                                            (sid,)) if r["message_id"] in vis and canon.get(r["section"]) == r["text"]]
+            hit = {r["section"] for r in self._rank(query, "canon", logs, lambda r: f"{r['section']}: {r['text']}", 3)}
+            hit |= {k for k, v in canon.items() if TXT.overlap(query, f"{k} {v}") >= 2}
+            out += [{"type": "buku cerita", "section": k, "text": canon[k][:600]} for k in list(hit)[:3]]
+        card_ids = ctx["card_ids"]
+        if card_ids:
+            lore = self.store.q(f"SELECT * FROM lore_entries WHERE card_id IN ({','.join('?' * len(card_ids))})", card_ids)
+            out += [{"type": "lore", "title": r["title"], "known_to": r.get("known_to", ""), "text": r["text"][:500]}
+                    for r in self._rank(query, "lore", lore, lambda r: f"{r['title']} {r['text']}", 3)]
+            cards = [c for c in (self.cards.get(i) for i in card_ids) if c]
+            out += [{"type": "kartu", "name": c["name"], "text": self.cards.render(c, mode="all", limit=600)}
+                    for c in self._rank(query, "card", cards, lambda c: self.cards.render(c, mode="all"), 2)]
+        sums = [s for s in self.store.q("SELECT id, node_id, text FROM summaries WHERE chat_id = ?", (chat_id,)) if s["node_id"] in vis]
+        out += [{"type": "ringkasan", "id": s["id"], "text": s["text"][:800]} for s in self._rank(query, "sum", sums, lambda s: s["text"], 2)]
+        events = [e for e in self.store.q("SELECT id, message_id, world_time, text FROM world_events WHERE chat_id IN "
+                                          f"({','.join('?' * len(self.store.lineage(chat_id)))})", self.store.lineage(chat_id))
+                  if not e["message_id"] or e["message_id"] in vis]
+        out += [{"type": "kejadian", "time": e["world_time"], "text": e["text"][:400]}
+                for e in self._rank(query, "event", events, lambda e: e["text"], 3)]
+        return {"results": out[:max(1, min(int(limit), 30))]} if out else {"results": [], "note": "Tidak ketemu."}
 
     def t_relationship(self, chat_id, mid, a, b, delta, reason=""):
         ha, hb = self._holder(chat_id, a), self._holder(chat_id, b)

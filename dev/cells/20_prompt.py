@@ -17,6 +17,7 @@ Aturan tetap:
   pengetahuan narator; jangan biarkan tokoh memakainya kalau tidak ada di ingatannya. Ingatan bertanda KELIRU dipercaya
   tokoh itu walaupun salah. Catat yang baru diketahui tokoh dengan knowledge_add atau tell.
 - Hubungan: kalau kejadian mengubah perasaan tokoh terhadap tokoh lain atau pemain, catat dengan relationship.
+- Lupa sesuatu tentang cerita ini? Cari dengan story_search (menurut makna) sebelum mengarang.
 - Benang cerita: catat janji, janji temu (dengan tenggat), misteri, petunjuk, utang, dendam, dan rencana dengan thread_open;
   tutup dengan thread_close. Benang yang lewat tenggat harus punya akibat di dunia (orang menunggu, kesal, pergi).
 - Pesan pemain yang diawali [OOC] adalah percakapan di luar cerita: jawab di luar cerita, singkat, tanpa memerankan tokoh.

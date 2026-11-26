@@ -209,9 +209,16 @@ def _(Path, SimpleNamespace, json, os, re, secrets):
             thinking=("low", "medium", "high", "xhigh"), vision=True),
     }
 
-    EMBEDDER = dict(repo="Qwen/Qwen3-Embedding-0.6B-GGUF", revision="370f27d7550e0def9b39c1f16d3fbaa13aa67728",
-                    file="Qwen3-Embedding-0.6B-Q8_0.gguf", dim=1024,
-                    query_prefix="Instruct: Given a roleplay or chat query, retrieve relevant memories, lore and facts\nQuery: ")
+    _EMB_PREFIX = "Instruct: Given a roleplay or chat query, retrieve relevant memories, lore and facts\nQuery: "
+    # 0.6B: ~1 GB VRAM, default. 4B: better recall, ~4.5 GB VRAM (vLLM then leaves more room). Vectors of one model cannot
+    # be compared with the other's, so switching rebuilds them.
+    EMBEDDERS = {
+        "0.6B": dict(repo="Qwen/Qwen3-Embedding-0.6B-GGUF", revision="370f27d7550e0def9b39c1f16d3fbaa13aa67728",
+                     file="Qwen3-Embedding-0.6B-Q8_0.gguf", dim=1024, query_prefix=_EMB_PREFIX, vllm_util="0.92"),
+        "4B": dict(repo="Qwen/Qwen3-Embedding-4B-GGUF", revision="f4602530db1d980e16da9d7d3a70294cf5c190be",
+                   file="Qwen3-Embedding-4B-Q8_0.gguf", dim=2560, query_prefix=_EMB_PREFIX, vllm_util="0.88"),
+    }
+    EMBEDDER = EMBEDDERS["0.6B"]
 
     CTX_CHOICES = {"128K": 131072, "262K (native)": 262144, "512K (YaRN)": 524288, "1M (YaRN, Qwen)": 1000000}
 
@@ -242,7 +249,15 @@ def _(Path, SimpleNamespace, json, os, re, secrets):
             return {"enable_thinking": False, "preserve_thinking": True}
         return {"enable_thinking": True, "reasoning_effort": level, "preserve_thinking": True}
 
-    return CFG, CTX_CHOICES, EMBEDDER, PRESETS, quant_of, thinking_kwargs
+    return (
+        CFG,
+        CTX_CHOICES,
+        EMBEDDER,
+        EMBEDDERS,
+        PRESETS,
+        quant_of,
+        thinking_kwargs,
+    )
 
 
 @app.cell(hide_code=True)
@@ -392,6 +407,7 @@ def _(CFG, Path, json, mo, os, re, signal, subprocess, time, urllib):
 def _(
     CFG,
     EMBEDDER,
+    EMBEDDERS,
     PRESETS,
     Path,
     Sys,
@@ -615,7 +631,7 @@ def _(
 
         # ---------- start / stop ----------
 
-        def start(self, name, ctx, mtp=True, embed=False, log=None):
+        def start(self, name, ctx, mtp=True, embed=False, log=None, embed_model=None):
             """Download (if needed) and launch a preset. Returns once the process is running;
             a watcher thread marks it ready, or retries without MTP if the drafter makes it crash."""
             p = PRESETS[name]
@@ -631,6 +647,8 @@ def _(
                 gen = self.gen
                 self.state.update(phase="downloading", preset=name, ctx=ctx, mtp=bool(mtp and p.get("mtp")),
                                   embed=embed, warnings=[], error="", started=time.time())
+                if embed_model in EMBEDDERS:
+                    self.state["embed_model"] = embed_model
                 self._save()
             try:
                 if p["backend"] == "vllm":
@@ -665,7 +683,7 @@ def _(
                    "--host", "127.0.0.1", "--port", str(CFG.PORT), "--api-key", CFG.API_KEY,
                    "--max-model-len", str(ctx),
                    # One long conversation: all the memory, no batch sharing.
-                   "--gpu-memory-utilization", "0.92" if self.state.get("embed") else "0.94",
+                   "--gpu-memory-utilization", self.embed_spec()["vllm_util"] if self.state.get("embed") else "0.94",
                    "--max-num-seqs", "1",
                    # Every turn resends the whole history; prefix caching reuses its KV instead of recomputing it.
                    "--enable-prefix-caching", "--max-num-batched-tokens", "8192",
@@ -801,10 +819,18 @@ def _(
 
         # ---------- embedder ----------
 
+        def embed_spec(self):
+            return EMBEDDERS.get(self.state.get("embed_model") or "0.6B", EMBEDDER)
+
         def embed_start(self, log=None):
+            spec = self.embed_spec()
+            running = (CFG.LOG_DIR / "embed.model").read_text().strip() if (CFG.LOG_DIR / "embed.model").exists() else "0.6B"
             if self.embed_ready() or Sys.pid_alive(self.pid["embed"]):
-                return
-            path = self.fetch(EMBEDDER["repo"], EMBEDDER["revision"], EMBEDDER["file"], log=log)
+                if running == (self.state.get("embed_model") or "0.6B"):
+                    return
+                self.embed_stop()  # another embedder model was chosen
+            path = self.fetch(spec["repo"], spec["revision"], spec["file"], log=log)
+            (CFG.LOG_DIR / "embed.model").write_text(self.state.get("embed_model") or "0.6B")
             cmd = [str(self.llama_bin()), "-m", str(path), "--embedding", "--pooling", "last", "--host", "127.0.0.1",
                    "--port", str(CFG.EMBED_PORT), "--api-key", CFG.API_KEY, "-ngl", "999", "-c", "8192", "-ub", "8192",
                    "-np", "1"]
@@ -831,7 +857,7 @@ def _(
 
 
 @app.cell(hide_code=True)
-def _(CTX_CHOICES, PRESETS, STORE, mo):
+def _(CTX_CHOICES, EMBEDDERS, PRESETS, STORE, mo):
     # Last used server settings are stored in the database, so a restored backup starts with them selected.
     _last = STORE.meta_get("server", {}) or {}
     _ctx_label = next((k for k, v in CTX_CHOICES.items() if v == _last.get("ctx")), "512K (YaRN)")
@@ -840,6 +866,8 @@ def _(CTX_CHOICES, PRESETS, STORE, mo):
     ctl_ctx = mo.ui.dropdown(options=CTX_CHOICES, value=_ctx_label, label="Konteks")
     ctl_mtp = mo.ui.switch(value=_last.get("mtp", True), label="MTP (lebih cepat)")
     ctl_embed = mo.ui.switch(value=_last.get("embed", True), label="Embedder (pencarian memory lebih pintar)")
+    ctl_embed_model = mo.ui.dropdown(options=list(EMBEDDERS), value=_last.get("embed_model") if _last.get("embed_model") in EMBEDDERS
+                                     else "0.6B", label="Ukuran embedder")
     ctl_hf = mo.ui.text(kind="password", full_width=True,
                          label="Token Hugging Face (opsional; untuk model gated, download lebih cepat, dan backup)")
     ctl_install = mo.ui.run_button(label="Install")
@@ -848,7 +876,7 @@ def _(CTX_CHOICES, PRESETS, STORE, mo):
     mo.vstack([
         mo.md("### Server model"),
         ctl_preset,
-        mo.hstack([ctl_ctx, ctl_mtp, ctl_embed], justify="start", align="center", gap=2),
+        mo.hstack([ctl_ctx, ctl_mtp, ctl_embed, ctl_embed_model], justify="start", align="center", gap=2),
         ctl_hf,
         mo.md("_Token hanya disimpan di memori kernel (env `HF_TOKEN`), tidak ditulis ke database, disk, atau backup._"),
         mo.hstack([ctl_install, ctl_start, ctl_stop], justify="start"),
@@ -856,6 +884,7 @@ def _(CTX_CHOICES, PRESETS, STORE, mo):
     return (
         ctl_ctx,
         ctl_embed,
+        ctl_embed_model,
         ctl_hf,
         ctl_install,
         ctl_mtp,
@@ -872,6 +901,7 @@ def _(
     STORE,
     ctl_ctx,
     ctl_embed,
+    ctl_embed_model,
     ctl_hf,
     ctl_install,
     ctl_mtp,
@@ -896,11 +926,12 @@ def _(
                 return mo.callout(mo.md(f"**{ctl_preset.value}** maksimal {p['yarn_max']:,} token. Pilih konteks yang lebih kecil."),
                                   kind="danger")
             try:
-                SERVERS.start(ctl_preset.value, ctl_ctx.value, mtp=ctl_mtp.value, embed=ctl_embed.value)
+                SERVERS.start(ctl_preset.value, ctl_ctx.value, mtp=ctl_mtp.value, embed=ctl_embed.value,
+                              embed_model=ctl_embed_model.value)
             except Exception as e:
                 return mo.callout(mo.md(f"Start gagal: {e}"), kind="danger")
             STORE.meta_set("server", {"preset": ctl_preset.value, "ctx": ctl_ctx.value, "mtp": ctl_mtp.value,
-                                      "embed": ctl_embed.value})
+                                      "embed": ctl_embed.value, "embed_model": ctl_embed_model.value})
             note = ""
             if ctl_ctx.value > p["max_ctx"] and p.get("yarn_exp"):
                 note = ("\n\n**YaRN eksperimental:** model ini tidak punya resep YaRN resmi. Cek `n_ctx` di log dan uji "
@@ -3250,7 +3281,6 @@ def _(
 def _(
     CARDS,
     CFG,
-    EMBEDDER,
     SERVERS,
     STORE,
     STORIES,
@@ -3280,8 +3310,22 @@ def _(
         def ready(self):
             return self.np is not None and self.servers.embed_ready()
 
+        def check_model(self):
+            """Vectors from another embedder model cannot be compared: rebuild them when the model changed."""
+            model = self.servers.state.get("embed_model") or "0.6B"
+            have = self.store.meta_get("embed_model")
+            if have == model:
+                return
+            if have is not None:
+                self.store.x("DELETE FROM vectors")
+                with self.qlock:
+                    self.queue = []
+                    self.pending = {}
+            self.cache.clear()
+            self.store.meta_set("embed_model", model)
+
         def embed(self, texts, query=False):
-            prefix = EMBEDDER["query_prefix"] if query else ""
+            prefix = self.servers.embed_spec()["query_prefix"] if query else ""
             body = {"input": [prefix + t[:6000] for t in texts], "model": "embed"}
             status, text = Sys.http("POST", self.servers.embed_url() + "/v1/embeddings", body,
                                     {"Authorization": f"Bearer {CFG.API_KEY}"}, timeout=120)
@@ -3373,14 +3417,31 @@ def _(
 
         def backfill(self):
             """Queue everything that has no vector yet (after Load, or when the embedder starts)."""
+            if self.ready():
+                self.check_model()
             have = {(r["kind"], r["ref_id"]) for r in self.store.q("SELECT kind, ref_id FROM vectors")}
             for kind, sql in (("mem", "SELECT id, text FROM memories"), ("fact", "SELECT id, claim AS text FROM facts"),
                               ("lore", "SELECT id, title || ': ' || text AS text FROM lore_entries"),
                               ("sum", "SELECT id, text FROM summaries"),
-                              ("event", "SELECT id, text FROM world_events")):
+                              ("event", "SELECT id, text FROM world_events"),
+                              ("know", "SELECT id, text FROM knowledge"),
+                              ("canon", "SELECT id, section || ': ' || text AS text FROM canon_log WHERE text != ''")):
                 for r in self.store.q(sql):
                     if (kind, r["id"]) not in have:
                         self.enqueue(kind, r["id"], r["text"])
+            # cards change: re-embed a card when its version is newer than the one embedded
+            done = self.store.meta_get("emb_cards", {}) or {}
+            changed = False
+            for c in self.store.q("SELECT id, version FROM cards"):
+                if done.get(str(c["id"])) != c["version"] or ("card", c["id"]) not in have:
+                    card = CARDS.get(c["id"])
+                    text = CARDS.render(card, mode="all", limit=4000) if card else ""
+                    if text:
+                        self.enqueue("card", c["id"], text)
+                        done[str(c["id"])] = c["version"]
+                        changed = True
+            if changed:
+                self.store.meta_set("emb_cards", done)
             for r in self.store.q("SELECT id, content FROM messages WHERE role IN ('user', 'assistant') AND content != ''"):
                 for i, piece in enumerate(Memory.chunks(r["content"])):
                     if ("msg", r["id"] * 100 + i) not in have:
@@ -3650,6 +3711,12 @@ def _(
                 keys = [k.strip().lower() for k in (r["keys"] or "").split(",") if k.strip()] or [r["title"].lower()]
                 if any(re.search(rf"(?<!\w){re.escape(k)}(?!\w)", low) for k in keys):
                     hits.append(r)
+            if len(hits) < limit and text and self.emb.ready():
+                by_id = {r["id"]: r for r in rows}
+                have = {r["id"] for r in hits}
+                for i, s in self.emb.search("lore", text[-2000:], limit=4, allowed=set(by_id) - have):
+                    if s >= 0.55:
+                        hits.append(by_id[i])
             return hits[:limit]
 
         def lore_core(self, card_ids):
@@ -3696,10 +3763,12 @@ def _(
                 if same:
                     out.append(same[0]["id"])
                     continue
-                out.append(self.store.x("INSERT INTO knowledge (chat_id, message_id, holder, text, kind, source, source_who, truth, "
-                                        "importance, world_time, created) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                                        (chat_id, message_id, h, text[:2000], kind, source, source_who or "", truth, importance,
-                                         str(world_time or ""), time.time())))
+                kid = self.store.x("INSERT INTO knowledge (chat_id, message_id, holder, text, kind, source, source_who, truth, "
+                                   "importance, world_time, created) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                                   (chat_id, message_id, h, text[:2000], kind, source, source_who or "", truth, importance,
+                                    str(world_time or ""), time.time()))
+                EMB.enqueue("know", kid, text)
+                out.append(kid)
             return out
 
         def holders(self, chat_id):
@@ -3722,9 +3791,14 @@ def _(
                                                       "ORDER BY bm25(knowledge_fts) LIMIT 200", (q,))):
                     if r["id"] in ids:
                         hit[r["id"]] = rank
+            sim = {}
+            if query and EMB.ready():  # by meaning too, when the embedder runs
+                sim = {i: s for i, s in EMB.search("know", query, limit=40, allowed={r["id"] for r in rows}) if s > 0.3}
             newest = max(r["id"] for r in rows)
+
             def score(r):
                 s = (3.0 - min(hit[r["id"]], 30) / 10) if r["id"] in hit else 0.0
+                s += 4 * max(0.0, sim.get(r["id"], 0.0) - 0.3)
                 return s + 2 * float(r["importance"] or 0.5) + (0.5 if r["id"] > newest - 20 else 0)
             return sorted(rows, key=score, reverse=True)[:limit]
 
@@ -3733,12 +3807,15 @@ def _(
                 self.store.x("UPDATE knowledge SET forgotten_at = ? WHERE id = ?", (message_id, kid))
             else:
                 self.store.x("DELETE FROM knowledge WHERE id = ?", (kid,))
+                self.store.x("DELETE FROM vectors WHERE kind = 'know' AND ref_id = ?", (kid,))
 
         def edit(self, kid, **fields):
             allowed = {k: v for k, v in fields.items() if k in ("text", "kind", "truth", "source", "source_who", "importance")}
             if allowed:
                 sets = ", ".join(f"{k} = ?" for k in allowed)
                 self.store.x(f"UPDATE knowledge SET {sets} WHERE id = ?", (*allowed.values(), kid))
+                if "text" in allowed:
+                    EMB.enqueue("know", kid, allowed["text"])
 
         @staticmethod
         def line(r):
@@ -4250,6 +4327,7 @@ def _(
       pengetahuan narator; jangan biarkan tokoh memakainya kalau tidak ada di ingatannya. Ingatan bertanda KELIRU dipercaya
       tokoh itu walaupun salah. Catat yang baru diketahui tokoh dengan knowledge_add atau tell.
     - Hubungan: kalau kejadian mengubah perasaan tokoh terhadap tokoh lain atau pemain, catat dengan relationship.
+    - Lupa sesuatu tentang cerita ini? Cari dengan story_search (menurut makna) sebelum mengarang.
     - Benang cerita: catat janji, janji temu (dengan tenggat), misteri, petunjuk, utang, dendam, dan rencana dengan thread_open;
       tutup dengan thread_close. Benang yang lewat tenggat harus punya akibat di dunia (orang menunggu, kesal, pergi).
     - Pesan pemain yang diawali [OOC] adalah percakapan di luar cerita: jawab di luar cerita, singkat, tanpa memerankan tokoh.
@@ -4922,6 +5000,7 @@ def _(TXT, re, threading, time):
 def _(
     CARDS,
     Cards,
+    EMB,
     KNOW,
     Knowledge,
     MEM,
@@ -4999,6 +5078,8 @@ def _(
              "who": {"type": "array", "items": _S}, "due": _S}, ["kind", "title"]),
         _fn("thread_close", "Close a story thread when it is resolved, failed or dropped.",
             {"id": _I, "status": {"type": "string", "enum": list(Threads.CLOSED)}, "note": _S}, ["id", "status"]),
+        _fn("story_search", "Search everything known about this story by meaning, not only by words: memories, the story book, "
+            "what characters know, lore, cards, summaries of earlier parts, past world events.", {"query": _S, "limit": _I}, ["query"]),
         _fn("relationship", "Change how a character feels about another (b: a name or 'player'). delta -20..20 with the reason "
             "(what happened). Small, earned changes; big swings only for big events.",
             {"a": _S, "b": _S, "delta": _N, "reason": _S}, ["a", "b", "delta", "reason"]),
@@ -5312,6 +5393,50 @@ def _(
             ids = KNOW.add(chat_id, mid, holders, text, kind, source, kw.get("from") or kw.get("start") or "", truth, importance,
                            st["time_text"])
             return {"saved": ids, "who": holders}
+
+        @staticmethod
+        def _rank(query, kind, rows, text_of, limit=4):
+            """Rows ordered by meaning when the embedder runs, otherwise by shared words."""
+            if not rows:
+                return []
+            by_id = {r["id"]: r for r in rows}
+            if EMB.ready():
+                found = [by_id[i] for i, s in EMB.search(kind, query, limit=limit, allowed=set(by_id)) if s > 0.3]
+                if found:
+                    return found  # nothing embedded yet for this kind: fall back to words
+            scored = sorted(((TXT.overlap(query, text_of(r)), r["id"]) for r in rows), reverse=True)
+            return [by_id[i] for n, i in scored[:limit] if n > 0]
+
+        def t_story_search(self, chat_id, mid, query, limit=10):
+            ctx = self.mem.ctx_of(chat_id)
+            vis, sid = ctx["visible"], ctx["story_id"]
+            out = [{"type": "memory", "id": r["id"], "text": r["text"][:500]}
+                   for r in self.mem.search(query, ctx, limit=4, kinds=("fact", "summary_core"))]
+            out += [{"type": "ingatan", "holder": r["holder"], "text": KNOW.line(r)}
+                    for r in self._rank(query, "know", KNOW._rows(chat_id), lambda r: r["text"])]
+            if sid:
+                canon = self.stories.canon(sid, vis)
+                logs = [r for r in self.store.q("SELECT id, message_id, section, text FROM canon_log WHERE story_id = ? AND text != ''",
+                                                (sid,)) if r["message_id"] in vis and canon.get(r["section"]) == r["text"]]
+                hit = {r["section"] for r in self._rank(query, "canon", logs, lambda r: f"{r['section']}: {r['text']}", 3)}
+                hit |= {k for k, v in canon.items() if TXT.overlap(query, f"{k} {v}") >= 2}
+                out += [{"type": "buku cerita", "section": k, "text": canon[k][:600]} for k in list(hit)[:3]]
+            card_ids = ctx["card_ids"]
+            if card_ids:
+                lore = self.store.q(f"SELECT * FROM lore_entries WHERE card_id IN ({','.join('?' * len(card_ids))})", card_ids)
+                out += [{"type": "lore", "title": r["title"], "known_to": r.get("known_to", ""), "text": r["text"][:500]}
+                        for r in self._rank(query, "lore", lore, lambda r: f"{r['title']} {r['text']}", 3)]
+                cards = [c for c in (self.cards.get(i) for i in card_ids) if c]
+                out += [{"type": "kartu", "name": c["name"], "text": self.cards.render(c, mode="all", limit=600)}
+                        for c in self._rank(query, "card", cards, lambda c: self.cards.render(c, mode="all"), 2)]
+            sums = [s for s in self.store.q("SELECT id, node_id, text FROM summaries WHERE chat_id = ?", (chat_id,)) if s["node_id"] in vis]
+            out += [{"type": "ringkasan", "id": s["id"], "text": s["text"][:800]} for s in self._rank(query, "sum", sums, lambda s: s["text"], 2)]
+            events = [e for e in self.store.q("SELECT id, message_id, world_time, text FROM world_events WHERE chat_id IN "
+                                              f"({','.join('?' * len(self.store.lineage(chat_id)))})", self.store.lineage(chat_id))
+                      if not e["message_id"] or e["message_id"] in vis]
+            out += [{"type": "kejadian", "time": e["world_time"], "text": e["text"][:400]}
+                    for e in self._rank(query, "event", events, lambda e: e["text"], 3)]
+            return {"results": out[:max(1, min(int(limit), 30))]} if out else {"results": [], "note": "Tidak ketemu."}
 
         def t_relationship(self, chat_id, mid, a, b, delta, reason=""):
             ha, hb = self._holder(chat_id, a), self._holder(chat_id, b)
@@ -7266,13 +7391,14 @@ def _(
             self.store.side_log("recall_test", result, chat_id)
             self.emit("recall", result)
 
-        def switch_model(self, preset, ctx, mtp=True, embed=True):
+        def switch_model(self, preset, ctx, mtp=True, embed=True, embed_model=None):
             def job():
                 def log(title, text, code):
                     self.emit("status", f"{title}: {'selesai' if code == 0 else 'gagal' if code else 'jalan…'}")
                 try:
-                    SERVERS.start(preset, ctx, mtp=mtp, embed=embed, log=log)
-                    self.store.meta_set("server", {"preset": preset, "ctx": ctx, "mtp": mtp, "embed": embed})
+                    SERVERS.start(preset, ctx, mtp=mtp, embed=embed, log=log, embed_model=embed_model)
+                    self.store.meta_set("server", {"preset": preset, "ctx": ctx, "mtp": mtp, "embed": embed,
+                                                   "embed_model": embed_model or SERVERS.state.get("embed_model") or "0.6B"})
                     self.emit("toast", {"text": f"{preset} dimulai. Tunggu READY di bar atas."})
                 except Exception as e:
                     self.emit("toast", {"text": f"Ganti model gagal: {e}", "kind": "error"})
@@ -8098,6 +8224,7 @@ def _():
           <label>Konteks<select class="qr-ctx-sel">${ctxs.map(([k, v]) => `<option value="${v}" ${v === (state.modelCtx || s.ctx || 524288) ? "selected" : ""}>${esc(k)}</option>`).join("")}</select></label>
           ${p.yarn_exp ? '<div class="qr-help">Di atas 262K memakai YaRN tanpa resep resmi untuk model ini (eksperimental).</div>' : ""}
           <label class="qr-check"><input type="checkbox" class="qr-mtp" ${state.modelMtp === false ? "" : "checked"}> MTP</label><label class="qr-check"><input type="checkbox" class="qr-emb" ${state.modelEmb === false ? "" : "checked"}> Embedder</label>
+          <select class="qr-emb-model">${["0.6B", "4B"].map((m) => `<option ${m === (state.modelEmbModel || s.embed_model || "0.6B") ? "selected" : ""}>${m}</option>`).join("")}</select>
           <div class="qr-help">Ganti model membuat seluruh konteks diproses ulang di giliran berikutnya (bisa beberapa menit untuk chat panjang).</div>
           <div class="qr-row"><button class="qr-btn qr-primary" data-act="model-start">${icon("cpu")}Start</button><button class="qr-btn qr-danger" data-act="model-stop">Stop</button></div></section>`;
       }
@@ -8234,6 +8361,7 @@ def _():
         if (t.classList.contains("qr-ctx-sel")) state.modelCtx = Number(t.value);
         else if (t.classList.contains("qr-mtp")) state.modelMtp = t.checked;
         else if (t.classList.contains("qr-emb")) state.modelEmb = t.checked;
+        else if (t.classList.contains("qr-emb-model")) state.modelEmbModel = t.value;
       });
       dbody.addEventListener("input", (e) => {
         const t = e.target;
@@ -8379,7 +8507,7 @@ def _():
           case "smp-reset": send("settings", { sampling: {} }); break;
           case "mem-del": send("memory_delete", { mid: id }); break;
           case "mem-undo": send("memory_undo", { log_id: id }); break;
-          case "model-start": send("model_switch", { preset: dbody.querySelector(".qr-model-sel").value, ctx: Number(dbody.querySelector(".qr-ctx-sel").value), mtp: dbody.querySelector(".qr-mtp").checked, embed: dbody.querySelector(".qr-emb").checked }); break;
+          case "model-start": send("model_switch", { preset: dbody.querySelector(".qr-model-sel").value, ctx: Number(dbody.querySelector(".qr-ctx-sel").value), mtp: dbody.querySelector(".qr-mtp").checked, embed: dbody.querySelector(".qr-emb").checked, embed_model: dbody.querySelector(".qr-emb-model").value }); break;
           case "model-stop": if (confirm("Hentikan server model?")) send("model_stop"); break;
           case "review": send("vocab_review", { vid: id, grade: Number(btn.dataset.grade) }); break;
           case "vocab-del": send("vocab_delete", { vid: id }); break;
@@ -8864,6 +8992,7 @@ def _(
     CTX_CHOICES,
     Cards,
     DEFAULT_CARDS,
+    EMBEDDERS,
     Engine,
     EngineView,
     KNOW,
@@ -9603,11 +9732,11 @@ def _(
             self.w.toast = {"n": time.time(), "text": f"Skema {sch['type']} disimpan (versi {sch['version']})."}
 
         # model
-        def c_model_switch(self, preset, ctx, mtp=True, embed=True):
+        def c_model_switch(self, preset, ctx, mtp=True, embed=True, embed_model=None):
             p = PRESETS[preset]
             if int(ctx) > p["yarn_max"]:
                 raise ValueError(f"{preset} maksimal {p['yarn_max']:,} token.")
-            self.engine.switch_model(preset, int(ctx), bool(mtp), bool(embed))
+            self.engine.switch_model(preset, int(ctx), bool(mtp), bool(embed), embed_model if embed_model in EMBEDDERS else None)
 
         def c_model_stop(self):
             SERVERS.stop()

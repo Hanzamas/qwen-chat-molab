@@ -111,9 +111,16 @@ PRESETS = {
         thinking=("low", "medium", "high", "xhigh"), vision=True),
 }
 
-EMBEDDER = dict(repo="Qwen/Qwen3-Embedding-0.6B-GGUF", revision="370f27d7550e0def9b39c1f16d3fbaa13aa67728",
-                file="Qwen3-Embedding-0.6B-Q8_0.gguf", dim=1024,
-                query_prefix="Instruct: Given a roleplay or chat query, retrieve relevant memories, lore and facts\nQuery: ")
+_EMB_PREFIX = "Instruct: Given a roleplay or chat query, retrieve relevant memories, lore and facts\nQuery: "
+# 0.6B: ~1 GB VRAM, default. 4B: better recall, ~4.5 GB VRAM (vLLM then leaves more room). Vectors of one model cannot
+# be compared with the other's, so switching rebuilds them.
+EMBEDDERS = {
+    "0.6B": dict(repo="Qwen/Qwen3-Embedding-0.6B-GGUF", revision="370f27d7550e0def9b39c1f16d3fbaa13aa67728",
+                 file="Qwen3-Embedding-0.6B-Q8_0.gguf", dim=1024, query_prefix=_EMB_PREFIX, vllm_util="0.92"),
+    "4B": dict(repo="Qwen/Qwen3-Embedding-4B-GGUF", revision="f4602530db1d980e16da9d7d3a70294cf5c190be",
+               file="Qwen3-Embedding-4B-Q8_0.gguf", dim=2560, query_prefix=_EMB_PREFIX, vllm_util="0.88"),
+}
+EMBEDDER = EMBEDDERS["0.6B"]
 
 CTX_CHOICES = {"128K": 131072, "262K (native)": 262144, "512K (YaRN)": 524288, "1M (YaRN, Qwen)": 1000000}
 

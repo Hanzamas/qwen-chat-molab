@@ -1402,13 +1402,14 @@ class Engine(EngineView):
         self.store.side_log("recall_test", result, chat_id)
         self.emit("recall", result)
 
-    def switch_model(self, preset, ctx, mtp=True, embed=True):
+    def switch_model(self, preset, ctx, mtp=True, embed=True, embed_model=None):
         def job():
             def log(title, text, code):
                 self.emit("status", f"{title}: {'selesai' if code == 0 else 'gagal' if code else 'jalan…'}")
             try:
-                SERVERS.start(preset, ctx, mtp=mtp, embed=embed, log=log)
-                self.store.meta_set("server", {"preset": preset, "ctx": ctx, "mtp": mtp, "embed": embed})
+                SERVERS.start(preset, ctx, mtp=mtp, embed=embed, log=log, embed_model=embed_model)
+                self.store.meta_set("server", {"preset": preset, "ctx": ctx, "mtp": mtp, "embed": embed,
+                                               "embed_model": embed_model or SERVERS.state.get("embed_model") or "0.6B"})
                 self.emit("toast", {"text": f"{preset} dimulai. Tunggu READY di bar atas."})
             except Exception as e:
                 self.emit("toast", {"text": f"Ganti model gagal: {e}", "kind": "error"})

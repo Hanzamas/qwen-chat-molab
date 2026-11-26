@@ -17,8 +17,22 @@ class Embedder:
     def ready(self):
         return self.np is not None and self.servers.embed_ready()
 
+    def check_model(self):
+        """Vectors from another embedder model cannot be compared: rebuild them when the model changed."""
+        model = self.servers.state.get("embed_model") or "0.6B"
+        have = self.store.meta_get("embed_model")
+        if have == model:
+            return
+        if have is not None:
+            self.store.x("DELETE FROM vectors")
+            with self.qlock:
+                self.queue = []
+                self.pending = {}
+        self.cache.clear()
+        self.store.meta_set("embed_model", model)
+
     def embed(self, texts, query=False):
-        prefix = EMBEDDER["query_prefix"] if query else ""
+        prefix = self.servers.embed_spec()["query_prefix"] if query else ""
         body = {"input": [prefix + t[:6000] for t in texts], "model": "embed"}
         status, text = Sys.http("POST", self.servers.embed_url() + "/v1/embeddings", body,
                                 {"Authorization": f"Bearer {CFG.API_KEY}"}, timeout=120)
@@ -110,14 +124,31 @@ class Embedder:
 
     def backfill(self):
         """Queue everything that has no vector yet (after Load, or when the embedder starts)."""
+        if self.ready():
+            self.check_model()
         have = {(r["kind"], r["ref_id"]) for r in self.store.q("SELECT kind, ref_id FROM vectors")}
         for kind, sql in (("mem", "SELECT id, text FROM memories"), ("fact", "SELECT id, claim AS text FROM facts"),
                           ("lore", "SELECT id, title || ': ' || text AS text FROM lore_entries"),
                           ("sum", "SELECT id, text FROM summaries"),
-                          ("event", "SELECT id, text FROM world_events")):
+                          ("event", "SELECT id, text FROM world_events"),
+                          ("know", "SELECT id, text FROM knowledge"),
+                          ("canon", "SELECT id, section || ': ' || text AS text FROM canon_log WHERE text != ''")):
             for r in self.store.q(sql):
                 if (kind, r["id"]) not in have:
                     self.enqueue(kind, r["id"], r["text"])
+        # cards change: re-embed a card when its version is newer than the one embedded
+        done = self.store.meta_get("emb_cards", {}) or {}
+        changed = False
+        for c in self.store.q("SELECT id, version FROM cards"):
+            if done.get(str(c["id"])) != c["version"] or ("card", c["id"]) not in have:
+                card = CARDS.get(c["id"])
+                text = CARDS.render(card, mode="all", limit=4000) if card else ""
+                if text:
+                    self.enqueue("card", c["id"], text)
+                    done[str(c["id"])] = c["version"]
+                    changed = True
+        if changed:
+            self.store.meta_set("emb_cards", done)
         for r in self.store.q("SELECT id, content FROM messages WHERE role IN ('user', 'assistant') AND content != ''"):
             for i, piece in enumerate(Memory.chunks(r["content"])):
                 if ("msg", r["id"] * 100 + i) not in have:
@@ -387,6 +418,12 @@ class Memory:
             keys = [k.strip().lower() for k in (r["keys"] or "").split(",") if k.strip()] or [r["title"].lower()]
             if any(re.search(rf"(?<!\w){re.escape(k)}(?!\w)", low) for k in keys):
                 hits.append(r)
+        if len(hits) < limit and text and self.emb.ready():
+            by_id = {r["id"]: r for r in rows}
+            have = {r["id"] for r in hits}
+            for i, s in self.emb.search("lore", text[-2000:], limit=4, allowed=set(by_id) - have):
+                if s >= 0.55:
+                    hits.append(by_id[i])
         return hits[:limit]
 
     def lore_core(self, card_ids):
@@ -433,10 +470,12 @@ class Knowledge:
             if same:
                 out.append(same[0]["id"])
                 continue
-            out.append(self.store.x("INSERT INTO knowledge (chat_id, message_id, holder, text, kind, source, source_who, truth, "
-                                    "importance, world_time, created) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                                    (chat_id, message_id, h, text[:2000], kind, source, source_who or "", truth, importance,
-                                     str(world_time or ""), time.time())))
+            kid = self.store.x("INSERT INTO knowledge (chat_id, message_id, holder, text, kind, source, source_who, truth, "
+                               "importance, world_time, created) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                               (chat_id, message_id, h, text[:2000], kind, source, source_who or "", truth, importance,
+                                str(world_time or ""), time.time()))
+            EMB.enqueue("know", kid, text)
+            out.append(kid)
         return out
 
     def holders(self, chat_id):
@@ -459,9 +498,14 @@ class Knowledge:
                                                   "ORDER BY bm25(knowledge_fts) LIMIT 200", (q,))):
                 if r["id"] in ids:
                     hit[r["id"]] = rank
+        sim = {}
+        if query and EMB.ready():  # by meaning too, when the embedder runs
+            sim = {i: s for i, s in EMB.search("know", query, limit=40, allowed={r["id"] for r in rows}) if s > 0.3}
         newest = max(r["id"] for r in rows)
+
         def score(r):
             s = (3.0 - min(hit[r["id"]], 30) / 10) if r["id"] in hit else 0.0
+            s += 4 * max(0.0, sim.get(r["id"], 0.0) - 0.3)
             return s + 2 * float(r["importance"] or 0.5) + (0.5 if r["id"] > newest - 20 else 0)
         return sorted(rows, key=score, reverse=True)[:limit]
 
@@ -470,12 +514,15 @@ class Knowledge:
             self.store.x("UPDATE knowledge SET forgotten_at = ? WHERE id = ?", (message_id, kid))
         else:
             self.store.x("DELETE FROM knowledge WHERE id = ?", (kid,))
+            self.store.x("DELETE FROM vectors WHERE kind = 'know' AND ref_id = ?", (kid,))
 
     def edit(self, kid, **fields):
         allowed = {k: v for k, v in fields.items() if k in ("text", "kind", "truth", "source", "source_who", "importance")}
         if allowed:
             sets = ", ".join(f"{k} = ?" for k in allowed)
             self.store.x(f"UPDATE knowledge SET {sets} WHERE id = ?", (*allowed.values(), kid))
+            if "text" in allowed:
+                EMB.enqueue("know", kid, allowed["text"])
 
     @staticmethod
     def line(r):
