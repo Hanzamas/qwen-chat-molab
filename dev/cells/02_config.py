@@ -116,7 +116,7 @@ def thinking_kwargs(preset, level):
     if level not in levels:
         level = levels[-1]
     if preset["family"] == "gemma":
-        return {"enable_thinking": level != "off"}
+        return {"enable_thinking": level != "off", "preserve_thinking": True}
     if level == "off":
         return {"enable_thinking": False, "preserve_thinking": True}
     return {"enable_thinking": True, "reasoning_effort": level, "preserve_thinking": True}

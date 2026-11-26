@@ -241,6 +241,8 @@ def test_export_and_misc(engine, nb):
     new = eng.continue_in_new_chat(chat)
     assert nb["WORLD"].state(new, nb["STORE"].path_ids(new))["time_text"] == \
         nb["WORLD"].state(chat, nb["STORE"].path_ids(chat))["time_text"]
+    hist = nb["PROMPT"].history(new, nb["STORE"].path(new))
+    assert any("Adegan terakhir" in m["content"] for m in hist)
     eng.slash(chat, "impersonate", "")
     wait_idle(eng)
     assert eng.events.of("compose")[-1].startswith("Aku")

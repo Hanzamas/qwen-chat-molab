@@ -156,10 +156,12 @@ class Engine(EngineView):
         for m in path[start:]:
             if m["role"] in ("user", "assistant") and m["content"].strip():
                 recap.append(("Pemain" if m["role"] == "user" else "Narator") + ": " + m["content"])
-        intro = ("Lanjutan dari chat sebelumnya. Adegan terakhir:\n\n" + "\n\n".join(recap))[:60000]
-        root = self.store.add_message(new, None, "assistant", intro, meta={"carry_over": True})
-        # Ringkasan dari chat lama dipasang di node akar chat baru.
-        self.store.x("UPDATE summaries SET node_id = ? WHERE chat_id = ? AND node_id = 0", (root, new))
+        intro = ("Adegan terakhir dari chat sebelumnya:\n\n" + "\n\n".join(recap))[:60000]
+        # The chronicle hangs on a root node; the recap follows it, so the recap stays in the history.
+        root = self.store.add_message(new, None, "assistant", f"(Lanjutan dari chat \"{old['title']}\".)",
+                                      meta={"carry_over": True})
+        self.store.x("UPDATE summaries SET node_id = ?, from_id = ? WHERE chat_id = ? AND node_id = 0", (root, root, new))
+        self.store.add_message(new, root, "assistant", intro, meta={"carry_over": True})
         self.world.add_event(new, None, "world", "time", st["time"].strftime("%Y-%m-%d %H:%M"), "set", "lanjutan")
         for s in st["stats"]:
             self.world.add_event(new, None, "player", s["key"], s["value"], "set", "lanjutan")
@@ -374,10 +376,13 @@ class Engine(EngineView):
         self.emit("ctx", {"used": self.last_used.get(chat_id, 0), "max": self.llm.max_context()})
 
     def _default_max_tokens(self, c):
+        """Room for the answer plus the thinking budget of the chat's level (max_tokens covers both)."""
         length = c["settings"].get("length") or "panjang"
         content = {"pendek": 2000, "sedang": 4000}.get(length, 8000)
-        thinking = self.prompt.kwargs(c).get("enable_thinking", True)
-        return content + (16000 if thinking else 0)
+        kw = self.prompt.kwargs(c)
+        if not kw.get("enable_thinking", True):
+            return content
+        return content + {"low": 4000, "medium": 8000, "high": 16000, "xhigh": 32000}.get(kw.get("reasoning_effort"), 16000)
 
     def _group_note(self, chat_id, c):
         speaker = c["settings"].get("speaker")
@@ -560,7 +565,7 @@ class Engine(EngineView):
             v = self.llm.complete(self.prompt.side(chat_id, FACTCHECK_VERIFY.format(claim=claim, source=source, text=text[:8000]),
                                                    path=path),
                                   kwargs=self.prompt.kwargs(c), sampling={"temperature": 0.2}, max_tokens=4000,
-                                  tools=self.tools.specs(c))
+                                  tools=self.tools.specs(c), stop=self.stop if announce else self.bg_cancel)
             verdict = self._json(v["content"]) or {}
             if verdict.get("verdict") == "salah":
                 warnings.append({"claim": claim, "correction": verdict.get("correction", ""), "source": source})
