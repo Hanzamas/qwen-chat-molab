@@ -602,3 +602,15 @@ def test_stop_returns_queued_text(engine, nb, fake):
     engine.stop_now()
     wait_idle(engine, 30)
     assert any("kedua yang diantrikan" in str(p) for p in engine.events.of("compose"))
+
+
+def test_continued_chat_shows_every_summary(engine, nb):
+    chat, _ = _story(nb, engine)
+    S = nb["STORE"]
+    head = S.chat(chat)["head_id"]
+    for i in range(2):
+        S.x("INSERT INTO summaries (chat_id, node_id, from_id, level, text, core, created) VALUES (?, ?, ?, 'chunk', ?, '', ?)",
+            (chat, head, head, f"## Inti\nRingkasan {i}", time.time()))
+    new = engine.continue_in_new_chat(chat)
+    sums = [i for i in engine.display(new)["items"] if i["kind"] == "summary"]
+    assert len(sums) == 2

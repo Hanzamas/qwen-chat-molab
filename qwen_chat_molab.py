@@ -4929,8 +4929,12 @@ def _(TXT, hashlib, io, json, re, time, zipfile):
             pos = {mid: i for i, mid in enumerate(ids)}
             chapters = {r["message_id"]: r["title"] for r in self.store.q("SELECT message_id, title FROM chapters WHERE chat_id = ?",
                                                                           (chat_id,))}
-            sums = {s["node_id"]: s for s in self.store.q("SELECT id, node_id, from_id, level, text FROM summaries WHERE chat_id = ? "
-                                                           "AND level IN ('chunk', 'era')", (chat_id,)) if s["node_id"] in pos}
+            # several summaries can hang on one node (a continued chat carries the whole chronicle on its root)
+            sums = {}
+            for s in self.store.q("SELECT id, node_id, from_id, level, text FROM summaries WHERE chat_id = ? "
+                                  "AND level IN ('chunk', 'era') ORDER BY id", (chat_id,)):
+                if s["node_id"] in pos:
+                    sums.setdefault(s["node_id"], []).append(s)
             dice = self.world.dice_for(ids)
             att_meta = {r["message_id"]: r for r in self.store.q(
                 f"SELECT message_id, COUNT(*) AS n, GROUP_CONCAT(kind || ':' || name, '|') AS names FROM attachments "
@@ -4989,8 +4993,7 @@ def _(TXT, hashlib, io, json, re, time, zipfile):
                     cur["dice"] += dice.get(m["id"], [])
                 if m["id"] in chapters:
                     items[-1]["chapter"] = chapters[m["id"]]
-                if m["id"] in sums:
-                    s = sums[m["id"]]
+                for s in sums.get(m["id"], []):
                     items.append({"kind": "summary", "id": f"s{s['id']}", "text": s["text"], "level": s["level"],
                                   "range": [pos.get(s["from_id"], 0) + 1, n]})
                     cur = None
