@@ -349,15 +349,15 @@ Setiap tahap selesai dengan tes lokal lulus, commit, dan push. Tes GPU di Molab 
 akhir tiap tahap (saya tidak bisa mengakses sandbox).
 
 ### Tahap 0 — Fondasi
-- [ ] Semua kode masuk ke sel notebook (lihat bagian 1); unduhan `qwen_chat_app.py` dan semua patch teks dihapus.
-- [ ] Semua patch lama dibawa ke kode, tidak ada yang hilang: Camoufox + browser stealth, selector Google
+- [x] Semua kode masuk ke sel notebook (lihat bagian 1); unduhan `qwen_chat_app.py` dan semua patch teks dihapus.
+- [x] Semua patch lama dibawa ke kode, tidak ada yang hilang: Camoufox + browser stealth, selector Google
       yang diperbaiki, DuckDuckGo dibuang, sampler per model, kwargs Gemma + Qwen (`enable_thinking`,
       `reasoning_effort`, `preserve_thinking`), tombol Compact manual, `dedupe_parens`, aturan bahasa
       (dipindah jadi isi kartu Gaya default), lampiran (gambar, video, PDF, docx, xlsx, pptx, zip).
-- [ ] Preset model di sel Setelan: Dark-Gemistry Q8/Q6, Qwen3.8 27B heretic-ara Q8, 40B Build2, Huihui 27B
+- [x] Preset model di sel Setelan: Dark-Gemistry Q8/Q6, Qwen3.8 27B heretic-ara Q8, 40B Build2, Huihui 27B
       (vLLM). Default 512K, temperature 1.0, thinking xhigh, MTP untuk Qwen, YaRN sampai 1M untuk Qwen,
       YaRN 512K eksperimental + peringatan untuk Gemma, KV fp8 saat YaRN di vLLM.
-- [ ] Dark-Gemistry 31B di vLLM 0.32.0 (`Gemma4ForConditionalGeneration` didukung):
+- [x] Dark-Gemistry 31B di vLLM 0.32.0 (`Gemma4ForConditionalGeneration` didukung) — kode siap, belum diuji di GPU:
       - Dua pilihan bobot: `hoborific/Gemma-4-Dark-Gemistry-31B-W8A16-FP8` (~33GB, quant komunitas) atau BF16
         asli `Nimbz/Gemma-4-Dark-Gemistry-31B` + `--quantization fp8` (unduh ~65GB).
       - `--tool-call-parser gemma4 --reasoning-parser gemma4`, kwargs `enable_thinking`, sampler card
@@ -369,108 +369,108 @@ akhir tiap tahap (saya tidak bisa mengakses sandbox).
         Drafter dilatih untuk Gemma 4 31B asli, jadi percepatannya di Dark-Gemistry bisa lebih kecil; hasil
         jawaban tidak berubah. N dipilih dari tingkat penerimaan di metrik vLLM.
       - Belum terbukti: memori KV Gemma 4 di 262K pada vLLM.
-- [ ] MTP Gemma di llama.cpp: preset Dark-Gemistry GGUF memakai GGUF drafter assistant (`--spec-type draft-mtp`
+- [x] (belum diuji di GPU) MTP Gemma di llama.cpp: preset Dark-Gemistry GGUF memakai GGUF drafter assistant (`--spec-type draft-mtp`
       + file drafter). Flag persisnya dicek di versi llama.cpp yang dikunci.
-- [ ] Cegah konteks meluap: perkirakan token pesan baru (karakter/3 + 1500 per gambar) sebelum melewati
+- [x] Cegah konteks meluap: perkirakan token pesan baru (karakter/3 + 1500 per gambar) sebelum melewati
       pengukuran token.
-- [ ] Kunci versi: llama.cpp per tag rilis, model HF per revisi commit, dependency Python.
-- [ ] Migrasi `user_version`; impor database lama (skema sekarang) ke skema baru.
-- [ ] Server OpenAI palsu + tes dasar (stream, tool call, tokenize).
-- [ ] **Bug:** `max_context()` dibaca ulang setiap Start / setiap giliran.
-- [ ] Header menampilkan model yang sedang jalan; pesan error tidak lagi menyebut "vLLM" untuk llama.cpp.
-- [ ] Hasil tool lama dipangkas dari prompt (aslinya tetap di database).
-- [ ] Metadata per pesan (model, quant, sampler, seed, ctx, YaRN).
-- [ ] Lihat prompt: prompt persis + jumlah token per bagian.
-- [ ] Pulih dari crash: jawaban parsial disimpan berkala (`status=partial`) dan bisa dilanjutkan.
-- [ ] Antrian pesan saat model masih menjawab.
-- [ ] `wiki_search` / `wiki_read` (API Wikipedia); browser Camoufox dibiarkan menyala di antara pencarian.
-- [ ] Sel backup: field token HF (tersembunyi, hanya di memori kernel; kalau kosong pakai env `HF_TOKEN`),
+- [x] Kunci versi: llama.cpp per tag rilis, model HF per revisi commit, dependency Python.
+- [x] Migrasi `user_version`; impor database lama (skema sekarang) ke skema baru.
+- [x] Server OpenAI palsu + tes dasar (stream, tool call, tokenize).
+- [x] **Bug:** `max_context()` dibaca ulang setiap Start / setiap giliran.
+- [x] Header menampilkan model yang sedang jalan; pesan error tidak lagi menyebut "vLLM" untuk llama.cpp.
+- [x] Hasil tool lama dipangkas dari prompt (aslinya tetap di database).
+- [x] Metadata per pesan (model, quant, sampler, seed, ctx, YaRN).
+- [x] Lihat prompt: prompt persis + jumlah token per bagian.
+- [x] Pulih dari crash: jawaban parsial disimpan berkala (`status=partial`) dan bisa dilanjutkan.
+- [x] Antrian pesan saat model masih menjawab.
+- [x] `wiki_search` / `wiki_read` (API Wikipedia); browser Camoufox dibiarkan menyala di antara pencarian.
+- [x] Sel backup: field token HF (tersembunyi, hanya di memori kernel; kalau kosong pakai env `HF_TOKEN`),
       repo private, jeda, "Backup sekarang", "Pulihkan terbaru"; hanya jalan kalau ada perubahan; snapshot
       via SQLite backup API; simpan N terakhir. Token tidak pernah ditulis ke database, disk, atau backup.
 
 ### Tahap 1 — UI baru + RP dasar
-- [ ] UI gaya ChatGPT: sidebar (cari, cerita → chat, status backup, Simpan/Muat), bar atas (model + quant +
+- [x] UI gaya ChatGPT: sidebar (cari, cerita → chat, status backup, Simpan/Muat), bar atas (model + quant +
       konteks, level thinking, indikator konteks, jam dunia, ikon Compact / Studio / Pengaturan), laci
       pengaturan dengan tab Chat | Cerita | Memory | Sampler | Backup.
-- [ ] Pesan: bubble kanan untukmu, jawaban model selebar kolom; tombol saat kursor di atas: salin, edit,
+- [x] Pesan: bubble kanan untukmu, jawaban model selebar kolom; tombol saat kursor di atas: salin, edit,
       jawab ulang, lanjutkan, hapus, ‹ 1/3 ›; tool tampil sebagai chip; titik compaction jadi garis pemisah
       yang bisa diklik.
-- [ ] Kolom ketik bentuk pil: lampiran, chip author's note, tombol kirim/stop bundar.
-- [ ] Responsif di layar sempit (sidebar jadi laci).
-- [ ] Ikon Lucide inline, marked + DOMPurify disimpan di sel, tema ikut dark/light marimo.
-- [ ] Tipografi RP: 16px, jarak baris 1.7, maks ~72 karakter; terjemahan dalam kurung setelah dialog bahasa
+- [x] Kolom ketik bentuk pil: lampiran, chip author's note, tombol kirim/stop bundar.
+- [x] Responsif di layar sempit (sidebar jadi laci).
+- [x] Ikon Lucide inline, renderer markdown sendiri + DOMPurify 3.2.4 disimpan di sel (bukan marked: span dialog dan avatar pembicara bergantung pada renderer sendiri), tema ikut dark/light marimo.
+- [x] Tipografi RP: 16px, jarak baris 1.7, maks ~72 karakter; terjemahan dalam kurung setelah dialog bahasa
       target ditampilkan redup dan miring (aturannya dari kartu Gaya).
-- [ ] **Scroll:** berhenti menempel saat kamu menggulung ke atas (wheel/sentuh/keyboard), menempel lagi
+- [x] **Scroll:** berhenti menempel saat kamu menggulung ke atas (wheel/sentuh/keyboard), menempel lagi
       hanya di dasar atau lewat tombol; gulungan buatan widget tidak dihitung; `overscroll-behavior: contain`.
-- [ ] **Thinking:** kotak hanya mengikuti teks baru selama kamu belum menggulung di dalamnya; tombol
+- [x] **Thinking:** kotak hanya mengikuti teks baru selama kamu belum menggulung di dalamnya; tombol
       "ikuti" dan "tampilkan penuh"; tidak lagi menutup otomatis (pengaturan: terbuka / tertutup /
       tertutup setelah selesai); durasi + token; thinking lama tetap bisa dibaca dan dicari walau sudah
       dibuang dari prompt.
-- [ ] Render bertahap: pesan ditambahkan, bukan digambar ulang; 150 pesan terakhir + "muat sebelumnya".
-- [ ] Pohon pesan: reroll + geser versi, edit, lanjutkan, hapus, cabang dari sini + pohon cabang.
-- [ ] Ganti nama chat.
-- [ ] Per chat: slider sampler (default dari card model, tombol reset, seed, max_tokens), author's note, panjang
+- [x] Render bertahap: pesan ditambahkan, bukan digambar ulang; 150 pesan terakhir + "muat sebelumnya".
+- [x] Pohon pesan: reroll + geser versi, edit, lanjutkan, hapus, cabang dari sini + pohon cabang.
+- [x] Ganti nama chat.
+- [x] Per chat: slider sampler (default dari card model, tombol reset, seed, max_tokens), author's note, panjang
       balasan, level thinking (dikunci saat chat dibuat).
-- [ ] OOC `((...))` / `/ooc`: dipisah dari cerita, tidak masuk ringkasan, tidak dibalas sebagai tokoh.
-- [ ] Slash command: `/ooc`, `/note`, `/reroll`, `/continue`, `/bab`, `/ingat <kata>`, `/impersonate`, `/studio`.
-- [ ] Penanda bab + daftar isi.
-- [ ] Pin pesan.
-- [ ] Cari di semua chat dari UI, loncat ke pesan.
-- [ ] Komponen UI format game: panel status tetap (bar statistik, +/− dengan alasan), panel Dunia yang bisa
+- [x] OOC `((...))` / `/ooc`: dipisah dari cerita, tidak masuk ringkasan, tidak dibalas sebagai tokoh.
+- [x] Slash command: `/ooc`, `/note`, `/reroll`, `/continue`, `/bab`, `/ingat <kata>`, `/impersonate`, `/studio`.
+- [x] Penanda bab + daftar isi.
+- [x] Pin pesan.
+- [x] Cari di semua chat dari UI, loncat ke pesan.
+- [x] Komponen UI format game: panel status tetap (bar statistik, +/− dengan alasan), panel Dunia yang bisa
       dilipat, kartu pilihan selebar kolom (klik kirim / pensil edit), tombol lompat waktu.
 
 ### Tahap 2 — Kartu dan Studio
-- [ ] Enam jenis kartu + skema status, semua sebagai data; editor skema; form yang dibangkitkan dari skema.
-- [ ] Perpustakaan kartu per jenis, avatar, versi.
-- [ ] Kartu Dunia dengan lore (`lore_entries`), garis waktu (`timeline`), definisi statistik, tanda berbasis
+- [x] Enam jenis kartu + skema status, semua sebagai data; editor skema; form yang dibangkitkan dari skema.
+- [x] Perpustakaan kartu per jenis, avatar, versi.
+- [x] Kartu Dunia dengan lore (`lore_entries`), garis waktu (`timeline`), definisi statistik, tanda berbasis
       dunia nyata.
-- [ ] Perakit prompt otomatis dari kartu (bagian 3); kolom system prompt manual pindah ke pengaturan lanjutan.
-- [ ] Tautan cerita/chat ↔ kartu; kartu inti beku, detail ditempel saat tokoh muncul; `card_read`.
-- [ ] Impor/ekspor `qcard` (kartu Dunia membawa lore, garis waktu, buku fakta); importer SillyTavern V2/V3
+- [x] Perakit prompt otomatis dari kartu (bagian 3); kolom system prompt manual pindah ke pengaturan lanjutan.
+- [x] Tautan cerita/chat ↔ kartu; kartu inti beku, detail ditempel saat tokoh muncul; `card_read`.
+- [x] Impor/ekspor `qcard` (kartu Dunia membawa lore, garis waktu, buku fakta); importer SillyTavern V2/V3
       (JSON + PNG) via mapping.
-- [ ] Studio (semua fitur di bagian 4), termasuk riset ke buku fakta dan cek anakronisme.
-- [ ] `/studio` dan `((ubah: ...))` di tengah RP, berlaku di epoch berikutnya atau lewat "terapkan sekarang".
-- [ ] Pilih pesan pembuka saat chat baru dibuat.
-- [ ] Lore terpicu kata kunci dari 2 pesan terakhir.
+- [x] Studio (semua fitur di bagian 4), termasuk riset ke buku fakta dan cek anakronisme.
+- [x] `/studio` dan `((ubah: ...))` di tengah RP, berlaku di epoch berikutnya atau lewat "terapkan sekarang".
+- [x] Pilih pesan pembuka saat chat baru dibuat.
+- [x] Lore terpicu kata kunci dari 2 pesan terakhir.
 
 ### Tahap 3 — Memory, buku fakta, compaction
-- [ ] Buku cerita (canon) per cerita + snapshot beku + perubahan sementara. Batas ukuran supaya prompt tetap
+- [x] Buku cerita (canon) per cerita + snapshot beku + perubahan sementara. Batas ukuran supaya prompt tetap
       ramping: profil user + memory lingkup user ~2K token, buku cerita ~12K token, kartu inti ~1-1.5K per tokoh.
-- [ ] Compaction tahap 1 yang sudah ada tetap dipakai: di 90% konteks, thinking dan lampiran giliran lama
+- [x] Compaction tahap 1 yang sudah ada tetap dipakai: di 90% konteks, thinking dan lampiran giliran lama
       dibuang dulu; kalau sudah di bawah 60%, berhenti tanpa meringkas. 3 giliran user terakhir selalu utuh.
-- [ ] Status tokoh (skema `status.v1`), diperbarui model lewat tool, ditempel sementara.
-- [ ] Daftar "jangan pernah lupa".
-- [ ] Memory berlingkup (user / card / story / chat), `memory_update`, dedup yang mengembalikan kandidat,
+- [x] Status tokoh (skema `status.v1`), diperbarui model lewat tool, ditempel sementara.
+- [x] Daftar "jangan pernah lupa".
+- [x] Memory berlingkup (user / card / story / chat), `memory_update`, dedup yang mengembalikan kandidat,
       catatan memory + undo.
-- [ ] Buku fakta: tabel `facts` + FTS, `fact_lookup`, `fact_save`, fakta relevan ditempel sementara.
-- [ ] 10 memory teratas sementara (FTS dulu; hybrid di tahap 7): stopword ID/DE/EN, minimal 2 kata cocok,
+- [x] Buku fakta: tabel `facts` + FTS, `fact_lookup`, `fact_save`, fakta relevan ditempel sementara.
+- [x] 10 memory teratas sementara (FTS dulu; hybrid di tahap 7): stopword ID/DE/EN, minimal 2 kata cocok,
       maksimal 500 karakter per memory, lewati yang sudah ada di snapshot, entri ringkasan tidak ikut.
-- [ ] Compaction: simpan memory dulu → ringkasan per potongan ~100K token (bab jadi batas potongan) →
+- [x] Compaction: simpan memory dulu → ringkasan per potongan ~100K token (bab jadi batas potongan) →
       cek nama yang hilang → kronik bertingkat.
       - Budget per potongan `min(32768, ctx/16)`: 512K dan 1M → 32K, 262K → 16K. `max_tokens` = budget +
         jatah thinking, karena thinking tetap nyala supaya kwargs sama.
       - Kronik maksimal ~25% konteks (512K → ~128K). Kalau lewat, potongan paling lama dipadatkan jadi era.
       - Request ringkasan memakai `tools` + kwargs yang sama dan `tool_choice: "none"`.
       - Ringkasan kosong = error yang tampil.
-- [ ] Format ringkasan: dibuka `## Inti` (maksimal ~200 kata), lalu tujuan dan preferensi, tokoh dan status,
+- [x] Format ringkasan: dibuka `## Inti` (maksimal ~200 kata), lalu tujuan dan preferensi, tokoh dan status,
       kronologi per rentang `#` (dengan jam dunia), fakta/angka/nama, kutipan penting (dialog disalin persis),
       urusan belum selesai. Hanya bagian Inti yang masuk memory; ringkasan lengkap tetap di `summaries`.
-- [ ] Pesan yang di-pin disalin persis ke "momen tersemat" saat masuk wilayah ringkasan.
-- [ ] Lanjutkan di chat baru (cerita yang sama, kronik + 2-3 giliran terakhir).
-- [ ] Baca lintas chat: `history_read(chat_id, ...)`, `summary_read(chat_id)`.
-- [ ] Hapus chat membersihkan memory lingkup chat, snapshot, dan salinan ringkasan.
+- [x] Pesan yang di-pin disalin persis ke "momen tersemat" saat masuk wilayah ringkasan.
+- [x] Lanjutkan di chat baru (cerita yang sama, kronik + 2-3 giliran terakhir).
+- [x] Baca lintas chat: `history_read(chat_id, ...)`, `summary_read(chat_id)`.
+- [x] Hapus chat membersihkan memory lingkup chat, snapshot, dan salinan ringkasan.
 
 ### Tahap 4 — Realisme dan dunia yang hidup
-- [ ] Skema `gm.v1` dan `style.v1` lengkap dengan aturan realisme, frasa terlarang, dan checklist thinking.
-- [ ] Jam dunia + `world_advance`.
-- [ ] Dadu: `roll(kejadian, peluang)`, RNG kode, hasil tampil di chat, `dice_log`.
-- [ ] Agenda NPC (tujuan, rencana, rutinitas) + update rencana lewat tool.
-- [ ] Batas pengetahuan: `known_to` di kejadian dan rahasia; hanya yang diketahui tokoh yang ditempel untuknya.
-- [ ] Statistik `number` + `rate_per_hour` dihitung kode setiap jam dunia maju.
-- [ ] Garis waktu dipicu jam dunia.
-- [ ] World tick saat GPU diam + batal saat kamu mengetik + ringkasan "Selama kamu pergi"; skala default
+- [x] Skema `gm.v1` dan `style.v1` lengkap dengan aturan realisme, frasa terlarang, dan checklist thinking.
+- [x] Jam dunia + `world_advance`.
+- [x] Dadu: `roll(kejadian, peluang)`, RNG kode, hasil tampil di chat, `dice_log`.
+- [x] Agenda NPC (tujuan, rencana, rutinitas) + update rencana lewat tool.
+- [x] Batas pengetahuan: `known_to` di kejadian dan rahasia; hanya yang diketahui tokoh yang ditempel untuknya.
+- [x] Statistik `number` + `rate_per_hour` dihitung kode setiap jam dunia maju.
+- [x] Garis waktu dipicu jam dunia.
+- [x] World tick saat GPU diam + batal saat kamu mengetik + ringkasan "Selama kamu pergi"; skala default
       1 jam nyata = 1 jam cerita, diatur di kartu GM.
-- [ ] Format RP terstruktur (bagian 6), pilihan format prosa / game di kartu GM:
+- [x] Format RP terstruktur (bagian 6), pilihan format prosa / game di kartu GM:
       - panel status dihitung kode + `status_update` + `status_events` yang mengikuti pohon pesan;
       - panel Dunia: jam, cuaca dari tabel iklim + RNG ber-seed, berita/gosip dari `world_events`;
       - lompat waktu: jam maju → statistik → world tick → narasi transisi;
@@ -478,24 +478,24 @@ akhir tiap tahap (saya tidak bisa mengakses sandbox).
         cek kemiripan, kategori wajib, cek jumlah kalimat, frekuensi dari kartu GM.
 
 ### Tahap 5 — Kualitas, fakta, bahasa
-- [ ] Deteksi pengulangan (n-gram di beberapa balasan terakhir) → author's note sementara "hindari frasa X".
-- [ ] Deteksi frasa terlarang dari kartu Gaya.
-- [ ] Panjang narasi: target acak dalam rentang kartu Gaya tiap giliran, hitung paragraf + kalimat setelah
+- [x] Deteksi pengulangan (n-gram di beberapa balasan terakhir) → author's note sementara "hindari frasa X".
+- [x] Deteksi frasa terlarang dari kartu Gaya.
+- [x] Panjang narasi: target acak dalam rentang kartu Gaya tiap giliran, hitung paragraf + kalimat setelah
       selesai, kurang → lanjutkan otomatis; preset pendek / sedang / panjang (panjang = 5-10 × 5-10); `max_tokens`
       default mengikuti preset (panjang ≥ ~6K + jatah thinking).
-- [ ] Pemeriksa "jangan bertindak untukmu": tandai narasi yang melanjutkan aksi atau ucapan pemain melebihi
+- [x] Pemeriksa "jangan bertindak untukmu": tandai narasi yang melanjutkan aksi atau ucapan pemain melebihi
       yang ditulis, tawarkan reroll.
-- [ ] Penjaga format: narasi pindah bahasa, terjemahan dobel, dialog bahasa target terpecah → perbaiki
+- [x] Penjaga format: narasi pindah bahasa, terjemahan dobel, dialog bahasa target terpecah → perbaiki
       otomatis (yang aman) atau tawarkan reroll.
-- [ ] Pemeriksa fakta otomatis dengan mode mati / latar belakang (default) / ketat; ⚠ + koreksi + sumber.
-- [ ] Mode belajar bahasa (bahasa target dari kartu Gaya): terjemahan tersembunyi sampai disorot, klik
+- [x] Pemeriksa fakta otomatis dengan mode mati / latar belakang (default) / ketat; ⚠ + koreksi + sumber.
+- [x] Mode belajar bahasa (bahasa target dari kartu Gaya): terjemahan tersembunyi sampai disorot, klik
       kalimat untuk tata bahasa + kosakata (tugas sampingan dengan awal prompt yang sama), daftar kosakata,
       flashcard dengan jadwal ulang.
 
 ### Tahap 6 — Ganti model, group chat, ekspor
-- [ ] Ganti model dari widget: daftar preset, Start/Stop, status READY, reset konteks + sampler. Peringatan:
+- [x] Ganti model dari widget: daftar preset, Start/Stop, status READY, reset konteks + sampler. Peringatan:
       ganti model berarti seluruh konteks diproses ulang (bisa beberapa menit di 400K token).
-- [ ] Group chat: banyak kartu tokoh.
+- [x] Group chat: banyak kartu tokoh.
       - **Default: mode narator GM.** Satu balasan bisa berisi beberapa tokoh; model (sebagai GM) memutuskan
         siapa yang bereaksi berdasarkan agenda, posisi, dan batas pengetahuan tiap tokoh. Satu kali generate
         per giliran, cache tetap aman.
@@ -503,17 +503,17 @@ akhir tiap tahap (saya tidak bisa mengakses sandbox).
       - Mode opsional "satu tokoh per balasan": model memilih pembicara berikutnya, tiap tokoh generate sendiri
         (lebih lambat karena beberapa kali generate per giliran).
       - Avatar dan nama tokoh ditampilkan per bagian balasan.
-- [ ] Ekspor cerita ke Markdown / HTML / EPUB tanpa OOC dan thinking, dengan bab.
+- [x] Ekspor cerita ke Markdown / HTML / EPUB tanpa OOC dan thinking, dengan bab.
 
 ### Tahap 7 — Embedding dan uji ingatan
-- [ ] Embedder **Qwen3-Embedding-0.6B** (keputusan; 4B tetap bisa dipilih di Setelan) lewat `llama-server --embedding --pooling last` di port +3.
+- [x] Embedder **Qwen3-Embedding-0.6B** (keputusan; 4B tetap bisa dipilih di Setelan) lewat `llama-server --embedding --pooling last` di port +3.
       Binary llama.cpp dipasang otomatis juga di mode vLLM; `--gpu-memory-utilization` vLLM turun dari 0.94 ke
       0.92 saat embedder aktif; query memakai awalan instruksi sesuai card Qwen3-Embedding.
-- [ ] Vektor float16 di tabel SQLite, pencarian numpy, gabung dengan BM25 lewat RRF (k=60); fallback FTS.
-- [ ] Yang di-embed: memory, buku cerita, lore, buku fakta, kartu, ringkasan, kejadian dunia, potongan pesan
+- [x] Vektor float16 di tabel SQLite, pencarian numpy, gabung dengan BM25 lewat RRF (k=60); fallback FTS.
+- [x] Yang di-embed: memory, buku cerita, lore, buku fakta, kartu, ringkasan, kejadian dunia, potongan pesan
       (~400 token, overlap 80). Embed ulang otomatis setelah Muat.
-- [ ] Tombol uji ingatan: pertanyaan otomatis tentang detail awal cerita, dinilai terhadap arsip mentah.
-- [ ] Compaction otomatis saat diam, mulai di 75% (giliran chat sendiri memadatkan di 90%), dengan progres token
+- [x] Tombol uji ingatan: pertanyaan otomatis tentang detail awal cerita, dinilai terhadap arsip mentah.
+- [x] Compaction otomatis saat diam, mulai di 75% (giliran chat sendiri memadatkan di 90%), dengan progres token
       dan batal bersih saat kamu mengirim pesan.
 
 ### Tahap 8 — Kontinuitas tokoh dan cerita
