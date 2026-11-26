@@ -1040,3 +1040,55 @@ def test_group_one_character_per_reply(engine, nb, fake):
     sent = [json.dumps(b["messages"][-1], ensure_ascii=False)[-160:] for b in fake["log"][n1:]]
     assert [m for m in S.path(chat) if m["role"] == "assistant"][-1]["content"].startswith("**Otto Kranz** Aku duluan"), sent
     assert not S.chat(chat)["settings"].get("speaker")
+
+
+def test_concurrent_settings_and_card_saves_lose_nothing(engine, nb):
+    import threading as _th
+    S, C = nb["STORE"], nb["CARDS"]
+    chat = engine.new_chat("chat", "balapan")
+    cid = C.save(None, "character", {"name": "Balapan"})
+    v0 = C.get(cid)["version"]
+    errors = []
+
+    def settings(i):
+        try:
+            for j in range(20):
+                S.chat_settings(chat, **{f"k{i}_{j}": j})
+        except Exception as e:  # noqa: BLE001
+            errors.append(e)
+
+    def card(i):
+        try:
+            for j in range(10):
+                C.set_field(cid, f"f{i}_{j}", f"v{j}")
+        except Exception as e:  # noqa: BLE001
+            errors.append(e)
+
+    threads = [_th.Thread(target=settings, args=(i,)) for i in range(8)] + [_th.Thread(target=card, args=(i,)) for i in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(60)
+    assert not errors, errors
+    s = S.chat(chat)["settings"]
+    assert all(f"k{i}_{j}" in s for i in range(8) for j in range(20))  # no update dropped another's key
+    data = C.get(cid)["data"]
+    assert all(f"f{i}_{j}" in data for i in range(6) for j in range(10))
+    versions = [r["version"] for r in C.versions(cid)]
+    assert C.get(cid)["version"] == v0 + 60 and len(versions) == len(set(versions)) == v0 + 60
+
+
+def test_old_browser_thread_stops_when_the_cell_runs_again(nb):
+    import sys as _sys
+    reg = _sys.modules["_qchat_runtime"]
+    assert reg.web is nb["WEB"]
+    old = nb["WebTools"]()
+    assert old._run(lambda: 41 + 1) == 42  # the worker thread is running
+    th = old.thread
+    assert th.is_alive()
+    closed = []
+    old.cleanup = lambda: closed.append(True)  # stands in for the browser
+    old.page = object()
+    old.shutdown()  # what the cell does to the previous WebTools when it runs again
+    th.join(5)
+    assert not th.is_alive() and closed and old.page is None
