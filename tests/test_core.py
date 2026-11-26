@@ -261,7 +261,9 @@ def test_ubah_routes_to_story_book(engine, nb):
     eng.send(chat, "((ubah: sersannya jadi lebih tua))")
     wait_idle(eng)
     sid = nb["STORE"].chat(chat)["story_id"]
-    assert nb["STORIES"].get(sid)["data"]["canon"].get("Catatan") == "Sersan lebih tua."
+    # logged on this chat's branch, not written into the base shared by every chat of the story
+    assert nb["STORIES"].canon(sid, nb["STORE"].visible_ids(chat)).get("Catatan") == "Sersan lebih tua."
+    assert "Catatan" not in nb["STORIES"].get(sid)["data"]["canon"]
     assert nb["STORIES"].pending_list(sid, chat)
 
 
