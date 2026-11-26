@@ -4796,8 +4796,11 @@ def _(
         _fn("status_update", "Change status. subject: 'player' or a character name. changes: object of field -> value. "
             "Numeric player stats take a delta (+n / -n) or {\"set\": n}; list fields take {\"add\": x} or {\"remove\": x}.",
             {"subject": _S, "changes": {"type": "object"}, "reason": _S}, ["subject", "changes"]),
-        _fn("roll", "Roll for an uncertain outcome. odds = chance of success 0..1 chosen for plausibility. "
-            "The system's result is binding.", {"event": _S, "odds": _N}, ["event", "odds"]),
+        _fn("roll", "Roll for an uncertain outcome. Give skill (as on the card, e.g. 'Bahasa Jerman') and difficulty: the system "
+            "computes the chance from that skill level and the roller's condition (injuries, fatigue). who: 'player' (default) "
+            "or a character name. odds 0..1 only when no skill fits. The system's result is binding.",
+            {"event": _S, "skill": _S, "difficulty": {"type": "string", "enum": ["mudah", "sedang", "sulit", "sangat sulit"]},
+             "who": _S, "odds": _N}, ["event"]),
         _fn("world_event", "Record an off-screen event. known_to: names who know it (use 'player' for the player). "
             "Everyone in known_to also gets it in their memory.",
             {"text": _S, "known_to": {"type": "array", "items": _S}, "public": _B}, ["text"]),
@@ -5024,10 +5027,68 @@ def _(
             done = self.world.status_update(chat_id, mid, subject or "player", changes, reason)
             return {"updated": done}
 
-        def t_roll(self, chat_id, mid, event, odds):
-            r = self.world.roll(chat_id, mid, event, odds)
+        DIFFICULTY = {"mudah": 0.2, "sedang": 0.0, "sulit": -0.2, "sangat sulit": -0.35}
+
+        def roll_odds(self, chat_id, who="player", skill="", difficulty="sedang", odds=None):
+            """Chance of success: skill level from the card (persona for the player), difficulty, and condition from the
+            world state. Returns (odds, reasons)."""
+            holder = self._holder(chat_id, who or "player") or "player"
+            _, cards = self._story(chat_id)
+            card = (cards or {}).get("persona") if holder == "player" else next(
+                (ch for ch in (cards or {}).get("character", []) if ch["name"] == holder), None)
+            why = []
+            if skill:
+                rows = (card or {}).get("data", {}).get("skill_levels") or []
+                want = skill.strip().lower()
+                hit = next((r for r in rows if r and str(r[0]).strip().lower() == want), None) or next(
+                    (r for r in rows if r and (want in str(r[0]).lower() or str(r[0]).lower() in want)), None)
+                try:
+                    base = float(str(hit[1]).replace(",", ".")) / 100 if hit and len(hit) > 1 else 0.4
+                except ValueError:
+                    base = 0.4
+                why.append(f"{hit[0]} {base:.0%}" if hit else f"{skill}: tidak terlatih 40%")
+                mod = self.DIFFICULTY.get(difficulty or "sedang", 0.0)
+                if mod:
+                    why.append(f"{difficulty} {mod:+.0%}")
+                p = base + mod
+            else:
+                try:
+                    p = float(odds) if odds is not None else 0.5
+                except (TypeError, ValueError):
+                    p = 0.5
+                why.append(f"peluang dasar {p:.0%}")
+            st = self.world.state(chat_id, self.store.path_ids(chat_id))
+            status = st["status"].get(holder) or {}
+            keadaan = str(status.get("keadaan") or "").lower()
+            if keadaan in ("pingsan", "mati"):
+                return 0.0, why + [f"{keadaan}: tidak bisa"]
+            if keadaan == "terluka parah":
+                p -= 0.2
+                why.append("terluka parah -20%")
+            injuries = status.get("injuries") or []
+            if isinstance(injuries, list) and injuries:
+                cut = min(0.2, 0.05 * len(injuries))
+                p -= cut
+                why.append(f"{len(injuries)} luka -{cut:.0%}")
+            if holder == "player":
+                for s in st["stats"]:
+                    key, v = s["key"].lower(), s["value"]
+                    lo, hi = s["min"] if s["min"] is not None else 0, s["max"] if s["max"] is not None else 100
+                    share = (v - lo) / (hi - lo) if hi > lo else 0.5
+                    if any(k in key for k in ("energi", "energy", "stamina")) and share < 0.4:
+                        cut = 0.15 if share < 0.2 else 0.05
+                        p -= cut
+                        why.append(f"{s['label']} rendah -{cut:.0%}")
+                    if any(k in key for k in ("lapar", "haus", "hunger", "thirst", "lelah", "capek")) and share > 0.8:
+                        p -= 0.05
+                        why.append(f"{s['label']} tinggi -5%")
+            return min(max(p, 0.03), 0.97), why
+
+        def t_roll(self, chat_id, mid, event, odds=None, skill="", difficulty="sedang", who="player"):
+            p, why = self.roll_odds(chat_id, who, skill, difficulty, odds)
+            r = self.world.roll(chat_id, mid, event, p)
             verdict = "BERHASIL" if r["success"] else "GAGAL"
-            return {**r, "result": f"{verdict} (peluang {r['odds']:.0%}). Hasil ini wajib diikuti."}
+            return {**r, "why": why, "result": f"{verdict} (peluang {r['odds']:.0%}: {', '.join(why)}). Hasil ini wajib diikuti."}
 
         def _holder(self, chat_id, name):
             """Card name for a character name or alias; 'player' for the player or the persona's name."""

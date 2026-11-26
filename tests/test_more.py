@@ -825,3 +825,26 @@ def test_story_threads_with_deadlines(engine, nb, fake):
     # another branch does not have these threads
     S.set_head(chat, S.path(chat)[0]["id"])
     assert all(r["id"] not in (tid, tid2) for r in TH.list(chat, include_closed=True))
+
+
+def test_dice_from_skill_and_condition(engine, nb):
+    chat, _ = _story(nb, engine)
+    S, T, C, W = nb["STORE"], nb["TOOLS"], nb["CARDS"], nb["WORLD"]
+    cards = nb["STORIES"].cards_of(S.chat(chat)["story_id"])
+    C.set_field(cards["persona"]["id"], "skill_levels", [["Bahasa Jerman", "55"], ["Memasak", "80"]])
+    C.set_field(cards["character"][0]["id"], "skill_levels", "Berbohong, 70")
+    nb["STORIES"].refresh_versions(S.chat(chat)["story_id"])
+    p, why = T.roll_odds(chat, "player", "bahasa jerman", "sulit")
+    assert abs(p - 0.35) < 1e-9 and why[0].startswith("Bahasa Jerman")
+    p, _ = T.roll_odds(chat, "Lotte", "Berbohong", "mudah")
+    assert abs(p - 0.9) < 1e-9
+    p, why = T.roll_odds(chat, "player", "Panjat tebing", "sedang")
+    assert abs(p - 0.4) < 1e-9 and "tidak terlatih" in why[0]
+    head = S.chat(chat)["head_id"]
+    W.status_update(chat, head, "player", {"injuries": {"add": "pergelangan terkilir"}, "energi": {"set": 10}})
+    p, why = T.roll_odds(chat, "player", "Memasak", "sedang")
+    assert abs(p - (0.8 - 0.05 - 0.15)) < 1e-9 and any("luka" in w for w in why)
+    W.status_update(chat, head, "Lotte Braun", {"keadaan": "pingsan"})
+    assert T.roll_odds(chat, "Lotte", "Berbohong")[0] == 0.0
+    res, failed, _ = T.call(chat, head, "roll", json.dumps({"event": "membujuk", "skill": "Bahasa Jerman", "difficulty": "sedang"}))
+    assert not failed and "peluang" in json.loads(res)["result"]
