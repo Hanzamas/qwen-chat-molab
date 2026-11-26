@@ -13,7 +13,7 @@
 import marimo
 
 __generated_with = "0.25.2"
-app = marimo.App(width="full", app_title="Qwen Chat")
+app = marimo.App(width="full", app_title="Qwen Chat", auto_download=["html"])
 
 
 @app.cell(hide_code=True)
@@ -37,7 +37,6 @@ def _():
 
     return (
         Path,
-        base64,
         json,
         mo,
         os,
@@ -59,8 +58,7 @@ def _(mo):
     # Qwen Chat
 
     Chat panjang dengan **Qwen3.8-27B abliterated** (uncensored, FP8) di GPU molab lewat vLLM, lengkap dengan agent:
-    web search (Google, Bing, DuckDuckGo lewat Playwright), buka halaman web plus screenshot, memory, riwayat yang bisa
-    dicari ulang, dan lampiran: gambar, video, PDF (teks + gambar halaman), DOCX, XLSX, PPTX, ZIP, dan file teks (maks 25 MB).
+    web search (Google, Bing, DuckDuckGo lewat Playwright), buka halaman web, memory, dan riwayat yang bisa dicari ulang.
 
     1. Nyalakan GPU lewat *notebook specs*, lalu klik **Install** (vLLM + Playwright + browser).
     2. Klik **Start**, tunggu panel server `READY` (download sekitar 31 GB lalu load).
@@ -101,7 +99,11 @@ def _(Path, os, secrets):
 
     # Popen handles started from this kernel; poll() reaps exited children.
     PROCS = {}
+    # Sampler yang dikirim jendela chat. Diisi ulang setiap Start sesuai model yang sedang jalan,
+    # jadi ganti model tidak perlu menjalankan ulang sel chat. Default: Qwen3.8 thinking (model card).
+    SAMPLING = {"temperature": 1.0, "top_p": 0.95, "top_k": 20, "min_p": 0.0}
     return (
+        SAMPLING,
         API_KEY,
         BASE_URL,
         DB_PATH,
@@ -272,11 +274,12 @@ def _(VENV, VLLM_BIN, VLLM_OK, install_btn, mo, run_live, subprocess, sys):
         "[ -n \"$L\" ] && mkdir -p \"$D/lib64\" && ln -sf \"$L\" \"$D/lib64/libcudart.so\" && echo \"libcudart.so -> $L\"; done",
         "Persiapan compiler",
     )
-    # Playwright lives in the notebook kernel's Python (the agent tools run there), not in the vLLM venv.
+    # Playwright + Camoufox live in the notebook kernel's Python (agent tools), not in the vLLM venv.
     run_live(
-        f"(uv pip install --python {sys.executable} playwright || {sys.executable} -m pip install -q playwright) "
-        f"&& {sys.executable} -m playwright install --with-deps chromium firefox",
-        "Install Playwright + Chromium + Firefox",
+        f"(uv pip install --python {sys.executable} 'camoufox[geoip]' || {sys.executable} -m pip install -q 'camoufox[geoip]') "
+        f"&& {sys.executable} -m playwright install --with-deps chromium firefox "
+        f"&& {sys.executable} -m camoufox fetch",
+        "Install Camoufox + Playwright + Chromium + Firefox",
     )
     if VLLM_OK.exists():
         mo.output.replace(mo.md(f"vLLM sudah terpasang di `{VENV}`, Playwright siap."))
@@ -308,6 +311,7 @@ def _(
     PORT,
     PROCS,
     REASONING,
+    SAMPLING,
     SERVED_NAME,
     VLLM_BIN,
     VLLM_LOG,
@@ -336,6 +340,9 @@ def _(
     else:
         # A crashed run can leave EngineCore children holding VRAM.
         vllm_kill(signal.SIGKILL, wait=15)
+        # vLLM menjalankan Qwen3.8-27B: kembalikan sampler thinking dari model card Qwen
+        SAMPLING.clear()
+        SAMPLING.update({"temperature": 1.0, "top_p": 0.95, "top_k": 20, "min_p": 0.0})
         _yarn = ctx_len.value > 262144
         _cmd = [
             str(VLLM_BIN), "serve", MODEL,
@@ -347,17 +354,15 @@ def _(
             # BF16 KV scored best at native context; with YaRN, FP8 KV scored the same (MRCR v2, n=15).
             "--kv-cache-dtype", "fp8" if _yarn else "auto",
             # One long conversation: give it all the memory and no batch sharing.
-            "--gpu-memory-utilization", "0.95",
+            "--gpu-memory-utilization", "0.94",
             "--max-num-seqs", "1",
             # Every turn resends the whole history; prefix caching reuses its KV instead of recomputing it.
             "--enable-prefix-caching",
             # Larger prefill chunks speed up the first pass over a long history.
-            "--max-num-batched-tokens", "16384",
+            "--max-num-batched-tokens", "8192",
             "--reasoning-parser", "qwen3",
             "--enable-auto-tool-choice",
             "--tool-call-parser", "qwen3_coder",
-            # A long chat replays every earlier image and video, so allow many per prompt.
-            "--limit-mm-per-prompt", json.dumps({"image": 64, "video": 4}),
             "--default-chat-template-kwargs", json.dumps({"reasoning_effort": REASONING, "preserve_thinking": True}),
         ]
         if _yarn:
@@ -386,6 +391,7 @@ def _(
             env={
                 **os.environ,
                 "VLLM_ALLOW_LONG_MAX_MODEL_LEN": "1",
+                "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
                 # FlashInfer JIT looks for ninja and nvcc on PATH; molab does not export the CUDA bin dir.
                 "PATH": f"{VLLM_BIN.parent}:/usr/local/cuda/bin:{os.environ.get('PATH', '')}",
                 "CUDA_HOME": os.environ.get("CUDA_HOME", "/usr/local/cuda"),
@@ -407,8 +413,314 @@ def _(mo, stop_btn, vllm_kill):
     return
 
 
+@app.cell
+def _(PORT, Path, mo):
+    LLAMA_DIR = Path.home() / "llama.cpp"
+    LLAMA_LOG = Path("/tmp/qwen-chat/llama.log")
+    LLAMA_PID = Path("/tmp/qwen-chat/llama.pid")
+    LLAMA_PORT = PORT + 2  # llama-server di sini; proxy memakai PORT supaya jendela chat nggak perlu diubah
+    _QWEN40_MMPROJ = ("https://huggingface.co/mradermacher/Qwen3.8-40B-Ultimate-Heretic-Uncensored-Build2-GGUF"
+                      "/resolve/main/Qwen3.8-40B-Ultimate-Heretic-Uncensored-Build2.mmproj-Q8_0.gguf")
+    # Sampler Dark-Gemistry dari model card Nimbz (temp 0.75-1.0, top_k 0, top_p 0.95, min_p 0.05,
+    # tanpa repetition penalty/DRY karena melawan "suara" StyleTune di lm_head).
+    _DG_SAMPLING = {"temperature": 0.9, "top_p": 0.95, "top_k": 0, "min_p": 0.05,
+                    "repetition_penalty": 1.0, "frequency_penalty": 0, "presence_penalty": 0}
+    # gguf = "repo:quant". mmproj None = teks saja (Dark-Gemistry tidak punya mmproj).
+    # mtp = draft MTP (khusus Qwen3.8). max_ctx = konteks native; yarn = boleh diperpanjang dengan YaRN.
+    LLAMA_MODELS = {
+        "Dark-Gemistry 31B HB16-Q8_0 (36.8GB, kualitas tertinggi)": {
+            "gguf": "ReadyArt/Nimbz_Gemma-4-Dark-Gemistry-31B-GGUF:HB16-Q8_0", "mmproj": None, "mtp": False,
+            "max_ctx": 262144, "yarn": False, "sampling": _DG_SAMPLING},
+        "Dark-Gemistry 31B HB16-Q6_K (29.7GB, lebih cepat)": {
+            "gguf": "ReadyArt/Nimbz_Gemma-4-Dark-Gemistry-31B-GGUF:HB16-Q6_K", "mmproj": None, "mtp": False,
+            "max_ctx": 262144, "yarn": False, "sampling": _DG_SAMPLING},
+        "Qwen3.8 40B Heretic Build2 i1-Q6_K (lama)": {
+            "gguf": "mradermacher/Qwen3.8-40B-Ultimate-Heretic-Uncensored-Build2-i1-GGUF:Q6_K", "mmproj": _QWEN40_MMPROJ,
+            "mtp": True, "max_ctx": 262144, "yarn": True,
+            "sampling": {"temperature": 0.85, "top_p": 0.95, "top_k": 64, "min_p": 0.05,
+                         "repetition_penalty": 1.0, "frequency_penalty": 0, "presence_penalty": 0}},
+    }
+    LLAMA_MMPROJ = _QWEN40_MMPROJ  # dipertahankan untuk kompatibilitas
+
+    llama_model = mo.ui.dropdown(
+        options=list(LLAMA_MODELS), value=next(iter(LLAMA_MODELS)), label="Model GGUF", full_width=True,
+    )
+    llama_gguf = mo.ui.text(
+        value="", label="Atau repo:quant sendiri (kosong = pakai pilihan di atas)", full_width=True,
+    )
+    llama_ctx = mo.ui.dropdown(
+        options={"128K": 131072, "262K (native)": 262144, "512K (YaRN, Qwen saja)": 524288,
+                 "1M (YaRN, Qwen saja, pakai Q5_K_M)": 1000000},
+        value="262K (native)",
+        label="Konteks llama.cpp",
+    )
+    llama_install_btn = mo.ui.run_button(label="Install llama.cpp")
+    llama_start_btn = mo.ui.run_button(label="Start llama.cpp", kind="success")
+    llama_stop_btn = mo.ui.run_button(label="Stop llama.cpp", kind="danger")
+    mo.vstack([
+        mo.md("### llama.cpp (GGUF). Stop vLLM dulu sebelum Start."),
+        llama_model,
+        llama_gguf,
+        mo.hstack([llama_ctx, llama_install_btn, llama_start_btn, llama_stop_btn], justify="start"),
+    ])
+    return (
+        LLAMA_DIR,
+        LLAMA_LOG,
+        LLAMA_MMPROJ,
+        LLAMA_MODELS,
+        LLAMA_PID,
+        LLAMA_PORT,
+        llama_ctx,
+        llama_gguf,
+        llama_model,
+        llama_install_btn,
+        llama_start_btn,
+        llama_stop_btn,
+    )
+
+
+@app.cell
+def _(LLAMA_DIR, json, llama_install_btn, mo, run_live):
+    mo.stop(not llama_install_btn.value)
+
+    import urllib.request as _ur
+
+    _rels = json.load(_ur.urlopen("https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=10", timeout=30))
+    _pick = lambda a: "ubuntu-cuda-13" in a["name"] and a["name"].endswith("-x64.tar.gz")
+    _rel = next(r for r in _rels if any(_pick(a) for a in r["assets"]))
+    _urls = [a["browser_download_url"] for a in _rel["assets"] if _pick(a)]
+    run_live(
+        f"set -e; rm -rf {LLAMA_DIR}; mkdir -p {LLAMA_DIR}; cd {LLAMA_DIR}; "
+        + "; ".join(f"curl -fsSL '{u}' | tar xz" for u in _urls)
+        + "; find . -name llama-server -type f",
+        f"Install llama.cpp {_rel['tag_name']} (CUDA 13)",
+    )
+    return
+
+
+@app.cell
+def _(
+    API_KEY,
+    LLAMA_DIR,
+    LLAMA_LOG,
+    LLAMA_MODELS,
+    LLAMA_PID,
+    LLAMA_PORT,
+    PORT,
+    PROCS,
+    Path,
+    SAMPLING,
+    SERVED_NAME,
+    json,
+    llama_ctx,
+    llama_gguf,
+    llama_model,
+    llama_start_btn,
+    mo,
+    os,
+    run_live,
+    subprocess,
+    sys,
+    vllm_alive,
+):
+    mo.stop(not llama_start_btn.value)
+    mo.stop(vllm_alive(), mo.callout(mo.md("vLLM masih jalan. Klik **Stop** vLLM dulu, GPU nggak cukup untuk dua server."), kind="danger"))
+    mo.stop("llama" in PROCS and PROCS["llama"].poll() is None, mo.md("llama.cpp sudah jalan. Stop dulu kalau mau ganti model."))
+
+    import threading as _threading
+    import urllib.error as _uerr
+    import urllib.request as _ureq
+    from http.server import BaseHTTPRequestHandler as _Base, ThreadingHTTPServer as _Server
+
+    _bin = next(LLAMA_DIR.rglob("llama-server"), None)
+    mo.stop(_bin is None, mo.callout(mo.md("llama.cpp belum terpasang. Klik **Install llama.cpp**."), kind="danger"))
+
+    _m = LLAMA_MODELS[llama_model.value]
+    _spec = llama_gguf.value.strip() or _m["gguf"]
+    mo.stop(
+        llama_ctx.value > _m["max_ctx"] and not _m["yarn"],
+        mo.callout(mo.md(f"Model ini maksimal {_m['max_ctx']:,} token (tanpa YaRN). Pilih konteks 262K atau lebih kecil."),
+                   kind="danger"),
+    )
+
+    # Download paralel lewat huggingface_hub (hf_xet), jauh lebih cepat dari downloader bawaan llama.cpp.
+    _gdir = Path.home() / "gguf"
+    _repo, _, _quant = _spec.partition(":")
+    _files = [s["rfilename"] for s in json.load(_ureq.urlopen(f"https://huggingface.co/api/models/{_repo}", timeout=30))["siblings"]]
+    _q = _quant.lower()
+    # cocokkan akhiran persis lalu ambil nama terpendek: "HB16-Q8_0" tidak boleh terambil "ATTN8-HB16-Q8_0",
+    # "Q8_0" tidak boleh terambil "HB16-Q8_0"
+    _cands = [f for f in _files if f.endswith(".gguf") and "mmproj" not in f.lower()
+              and f.lower().rsplit("/", 1)[-1].endswith((f"-{_q}.gguf", f".{_q}.gguf", f"_{_q}.gguf"))]
+    _gguf = min(_cands, key=len) if _cands else None
+    mo.stop(_gguf is None, mo.callout(mo.md(f"Quant `{_quant}` nggak ditemukan di `{_repo}`."), kind="danger"))
+    # mmproj: dari preset (Qwen 40B), atau file mmproj di repo yang sama, atau tidak ada (teks saja)
+    if _m["mmproj"] and not llama_gguf.value.strip():
+        _mm_repo, _mm_file = _m["mmproj"].split("huggingface.co/", 1)[1].split("/resolve/main/", 1)
+    else:
+        _mm = sorted((f for f in _files if "mmproj" in f.lower() and f.endswith(".gguf")), key=len)
+        _mm_repo, _mm_file = (_repo, _mm[0]) if _mm else (None, None)
+    _dl = f"d('{_repo}', '{_gguf}', local_dir='{_gdir}'); " + (
+        f"d('{_mm_repo}', '{_mm_file}', local_dir='{_gdir}'); " if _mm_file else "")
+    _rc = run_live(
+        f"({sys.executable} -c 'import hf_xet' 2>/dev/null || uv pip install --python {sys.executable} -U 'huggingface_hub[hf_xet]') && "
+        f"{sys.executable} -c \"from huggingface_hub import hf_hub_download as d; {_dl}print('download selesai')\"",
+        f"Download {_gguf}",
+    )
+    mo.stop(_rc != 0, mo.callout(mo.md("Download gagal. Lihat output di atas."), kind="danger"))
+
+    _libdirs = sorted({str(p.parent) for p in LLAMA_DIR.rglob("*.so*")})
+    _cmd = [
+        str(_bin), "-m", str(_gdir / _gguf),
+        "--alias", SERVED_NAME, "--host", "127.0.0.1", "--port", str(LLAMA_PORT), "--api-key", API_KEY,
+        "-c", str(llama_ctx.value), "-ngl", "999", "-np", "1", "-fa", "on",
+        "--jinja", "--reasoning-format", "deepseek",
+        "-ctk", "q8_0", "-ctv", "q8_0",
+    ]
+    if _mm_file:
+        _cmd += ["--mmproj", str(_gdir / _mm_file)]
+    if llama_ctx.value > 262144:
+        _cmd += ["--rope-scaling", "yarn", "--rope-scale", "4" if llama_ctx.value > 524288 else "2", "--yarn-orig-ctx", "262144"]
+    if _m["mtp"]:
+        # draft MTP hanya ada di Qwen3.8; GGUF Gemma 4 tidak punya kepala MTP
+        _cmd += ["--spec-type", "draft-mtp", "--spec-draft-n-max", "2", "-ctkd", "q8_0", "-ctvd", "q8_0"]
+    # jendela chat langsung memakai sampler model ini (tanpa menjalankan ulang sel chat)
+    SAMPLING.clear()
+    SAMPLING.update(_m["sampling"])
+    _proc = subprocess.Popen(
+        _cmd, stdin=subprocess.DEVNULL, stdout=open(LLAMA_LOG, "w"), stderr=subprocess.STDOUT, start_new_session=True,
+        env={**os.environ, "LD_LIBRARY_PATH": ":".join(_libdirs + [os.environ.get("LD_LIBRARY_PATH", "")])},
+    )
+    LLAMA_PID.write_text(str(_proc.pid))
+    PROCS["llama"] = _proc
+
+    _up = f"http://127.0.0.1:{LLAMA_PORT}"
+    _ctx = llama_ctx.value
+
+
+    class _Proxy(_Base):
+        """Teruskan ke llama-server; tambahkan max_model_len di /v1/models dan /tokenize ala vLLM."""
+
+        def log_message(self, *a):
+            pass
+
+        def _call(self, method, path, body=None):
+            hdr = {k: v for k, v in self.headers.items() if k.lower() in ("authorization", "content-type", "accept")}
+            return _ureq.urlopen(_ureq.Request(_up + path, data=body, method=method, headers=hdr), timeout=3600)
+
+        def _json(self, code, obj):
+            data = json.dumps(obj).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def _handle(self, method):
+            body = self.rfile.read(int(self.headers.get("Content-Length") or 0)) if method == "POST" else None
+            try:
+                if method == "GET" and self.path.startswith("/v1/models"):
+                    d = json.loads(self._call("GET", self.path).read())
+                    for m in d.get("data", []):
+                        m["max_model_len"] = _ctx
+                    return self._json(200, d)
+                if method == "POST" and self.path == "/tokenize" and b'"messages"' in (body or b""):
+                    req = json.loads(body)
+                    req.pop("model", None)
+                    prompt = json.loads(self._call("POST", "/apply-template", json.dumps(req).encode()).read())["prompt"]
+                    toks = json.loads(self._call("POST", "/tokenize", json.dumps({"content": prompt}).encode()).read())["tokens"]
+                    return self._json(200, {"count": len(toks)})
+                resp = self._call(method, self.path, body)
+                self.send_response(resp.status)
+                self.send_header("Content-Type", resp.headers.get("Content-Type", "application/json"))
+                self.end_headers()
+                while True:
+                    chunk = resp.read1(65536)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+            except _uerr.HTTPError as e:
+                self._json(e.code, {"error": e.read().decode("utf-8", "replace")[:2000]})
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            except Exception as e:
+                self._json(503, {"error": f"{type(e).__name__}: {e}"})
+
+        def do_GET(self):
+            self._handle("GET")
+
+        def do_POST(self):
+            self._handle("POST")
+
+
+    _srv = _Server(("127.0.0.1", PORT), _Proxy)
+    _threading.Thread(target=_srv.serve_forever, daemon=True).start()
+    PROCS["llama_proxy"] = _srv
+    mo.output.append(mo.md(
+        f"llama.cpp dimulai: `{_gguf}` (pid `{_proc.pid}`, port {LLAMA_PORT}), proxy di port {PORT}. "
+        f"mmproj: {'`' + _mm_file + '`' if _mm_file else 'tidak (teks saja)'}. "
+        f"Sampler chat: `{json.dumps(SAMPLING)}`. Pantau log di Sel 5."))
+    return
+
+
+@app.cell
+def _(LLAMA_PID, PROCS, llama_stop_btn, mo, os, signal, time):
+    mo.stop(not llama_stop_btn.value)
+    _srv = PROCS.pop("llama_proxy", None)
+    if _srv is not None:
+        _srv.shutdown()
+        _srv.server_close()
+    try:
+        _pid = int(LLAMA_PID.read_text())
+        os.killpg(_pid, signal.SIGTERM)
+        for _ in range(30):
+            if "llama" in PROCS:
+                PROCS["llama"].poll()
+            try:
+                os.killpg(_pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(1)
+        else:
+            os.killpg(_pid, signal.SIGKILL)
+        LLAMA_PID.unlink(missing_ok=True)
+        PROCS.pop("llama", None)
+        mo.output.replace(mo.md(f"llama.cpp (pid `{_pid}`) dan proxy dihentikan."))
+    except (FileNotFoundError, ProcessLookupError, ValueError):
+        mo.output.replace(mo.md("llama.cpp tidak jalan."))
+    return
+
+
+@app.cell
+def _(HEALTH_URL, LLAMA_LOG, PROCS, http_get, mo, tail, time):
+    def _watch_llama():
+        _me = mo.current_thread()
+        while not _me.should_exit:
+            _alive = "llama" in PROCS and PROCS["llama"].poll() is None
+            _ready = _alive and http_get(HEALTH_URL)[0] == 200
+            _badge = (mo.callout(mo.md("**llama.cpp READY**, jendela chat sudah bisa dipakai."), kind="success") if _ready
+                      else mo.callout(mo.md("**llama.cpp loading / download…**"), kind="neutral") if _alive
+                      else mo.callout(mo.md("llama.cpp tidak jalan."), kind="neutral"))
+            mo.output.replace(mo.vstack([_badge, mo.accordion({"Log llama.cpp": mo.plain_text(tail(LLAMA_LOG, 40))})]))
+            time.sleep(3)
+
+    mo.Thread(target=_watch_llama, daemon=True).start()
+    return
+
+
 @app.cell(hide_code=True)
-def _(HEALTH_URL, VLLM_LOG, VLLM_PID, http_get, log_errors, mo, tail, time, vllm_alive):
+def _(
+    HEALTH_URL,
+    VLLM_LOG,
+    VLLM_PID,
+    http_get,
+    log_errors,
+    mo,
+    tail,
+    time,
+    vllm_alive,
+):
     # A mo.Thread keeps updating while the kernel is busy elsewhere.
     def _watch_server():
         me = mo.current_thread()
@@ -591,25 +903,503 @@ def _(DB_PATH, json, re, sqlite3, threading, time):
                 self._open()
 
     STORE = Store(DB_PATH)
-    return STORE, fts_query
+    return (STORE,)
 
 
 @app.cell(hide_code=True)
-def _(API_KEY, BASE_URL, HEALTH_URL, REASONING, ROOT_URL, SERVED_NAME, STORE, Path):
-    import types
-    import urllib.request as _request
+def _(
+    API_KEY,
+    BASE_URL,
+    HEALTH_URL,
+    REASONING,
+    ROOT_URL,
+    SAMPLING,
+    SERVED_NAME,
+    STORE,
+    re,
+    urllib,
+):
+    import types as _types
 
-    # The chat app lives in qwen_chat_app.py so a running notebook can update it by re-running this cell only.
-    # A local copy next to the notebook wins; otherwise it is fetched from the GitHub repo.
-    _local = Path(__file__).parent / "qwen_chat_app.py" if "__file__" in globals() else None
-    if _local is not None and _local.exists():
-        _src = _local.read_text(encoding="utf-8")
-    else:
-        _src = _request.urlopen(
-            "https://raw.githubusercontent.com/Hanzamas/qwen-chat-molab/main/qwen_chat_app.py", timeout=30
-        ).read().decode("utf-8")
-    _app = types.ModuleType("qwen_chat_app")
+    _src = urllib.request.urlopen(
+        "https://raw.githubusercontent.com/Hanzamas/qwen-chat-molab/376cee2d6bb1d2f8ab15523c8eb0aaaa805a9191/qwen_chat_app.py",
+        timeout=30,
+    ).read().decode("utf-8")
+
+    # Kembalikan browser stealth + Camoufox yang dihapus dari file remote.
+    _STEALTH = r'''import os
+    import random
+
+    _CHROMIUM_UA = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36 Edg/125.0.0.0",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+    ]
+    _FIREFOX_UA = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:127.0) Gecko/20100101 Firefox/127.0",
+        "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0",
+    ]
+
+    # Menyamar sebagai browser manusia: hapus flag otomasi, navigator.webdriver,
+    # user-agent "Headless", dan isi hal-hal yang biasanya dipakai untuk deteksi bot.
+    _STEALTH_JS = r"""
+    () => {
+      const def = Object.defineProperty;
+      try { def(Navigator.prototype, 'webdriver', { get: () => undefined }); } catch (e) {}
+      try { def(navigator, 'webdriver', { get: () => undefined }); } catch (e) {}
+      try { def(navigator, 'languages', { get: () => ['en-US', 'en'] }); } catch (e) {}
+      try { def(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] }); } catch (e) {}
+      try { def(navigator, 'hardwareConcurrency', { get: () => 8 }); } catch (e) {}
+      try { def(navigator, 'deviceMemory', { get: () => 8 }); } catch (e) {}
+      // Headless Chromium kadang tidak punya window.chrome, jadi dibuatkan yang minimal.
+      if (!window.chrome) window.chrome = { runtime: {}, csi() {}, loadTimes() {} };
+      if (window.navigator.permissions && window.navigator.permissions.query) {
+        const q = window.navigator.permissions.query.bind(window.navigator.permissions);
+        window.navigator.permissions.query = (p) =>
+          p && p.name === 'notifications' ? Promise.resolve({ state: Notification.permission }) : q(p);
+      }
+    }
+    """
+
+    def _launch(p, browser):
+        if browser == "firefox":
+            return p.firefox.launch(headless=True)
+        return p.chromium.launch(
+            headless=True,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--disable-features=IsolateOrigins,site-per-process",
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--disable-infobars",
+                "--hide-scrollbars",
+                "--mute-audio",
+                "--disable-extensions",
+            ],
+            ignore_default_args=["--enable-automation"],
+        )
+
+    def _new_page(b, browser):
+        """Buat halaman dengan user-agent manusia dan patch anti-deteksi."""
+        ua = random.choice(_FIREFOX_UA if browser == "firefox" else _CHROMIUM_UA)
+        ctx = b.new_context(
+            locale="en-US",
+            timezone_id="Asia/Jakarta",
+            user_agent=ua,
+            viewport={"width": random.choice([1366, 1440, 1536, 1920]), "height": random.choice([768, 900, 1080])},
+            screen={"width": 1920, "height": 1080},
+            color_scheme="light",
+            is_mobile=False,
+            has_touch=False,
+            extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
+        )
+        ctx.add_init_script(_STEALTH_JS)
+        return ctx.new_page()
+
+    def _camoufox_page():
+        """Buka Camoufox (fork Firefox anti-detect). Balikan (cleanup, page)."""
+        from camoufox.sync_api import Camoufox
+
+        env = dict(os.environ)
+        # Firefox/Camoufox menolak start kalau $HOME bukan milik uid kita (molab jalan sebagai root).
+        if os.getuid() == 0 and os.path.isdir("/root"):
+            env["HOME"] = "/root"
+        # Sandbox yang kadang bikin Firefox crash di container.
+        env.setdefault("MOZ_DISABLE_CONTENT_SANDBOX", "1")
+        env.setdefault("MOZ_DISABLE_RDD_SANDBOX", "1")
+        env.setdefault("MOZ_DISABLE_GMP_SANDBOX", "1")
+
+        cam = Camoufox(
+            headless=True,
+            humanize=True,
+            geoip=True,
+            block_webrtc=True,
+            # WASM canvas-noise bisa crash di headless pada sebagian kernel/host.
+            canvas_noise=False,
+            env=env,
+        )
+        b = cam.__enter__()
+        try:
+            page = b.new_page()
+        except BaseException:
+            cam.__exit__(*sys.exc_info())
+            raise
+        return (lambda: cam.__exit__(None, None, None)), page
+
+
+    def _pw_page(browser):
+        """Buka Playwright chromium/firefox stealth lama. Balikan (cleanup, page)."""
+        from playwright.sync_api import sync_playwright
+
+        p = sync_playwright().start()
+        try:
+            b = _launch(p, browser)
+            page = _new_page(b, browser)
+        except BaseException:
+            p.stop()
+            raise
+
+        def cleanup():
+            try:
+                b.close()
+            finally:
+                p.stop()
+
+        return cleanup, page
+
+
+    def _launch_page(browser):
+        """Return (cleanup, page, warning). Camoufox diutamakan; fallback ke stealth Chromium."""
+        if browser == "camoufox":
+            try:
+                cleanup, page = _camoufox_page()
+                return cleanup, page, ""
+            except Exception as e:
+                warn = f"camoufox gagal start ({type(e).__name__}: {str(e)[:120]}); pakai chromium"
+                cleanup, page = _pw_page("chromium")
+                return cleanup, page, warn
+        cleanup, page = _pw_page(browser)
+        return cleanup, page, ""
+
+
+    def web_search(query, engine="auto", max_results=8, browser="camoufox"):
+        """Search lewat browser stealth (default Camoufox). CAPTCHA = engine itu gagal, lanjut engine berikutnya."""
+        order = ["google", "bing"] if engine in (None, "", "auto") else [engine]
+        cleanup, page, warn = _launch_page(browser)
+        notes = [warn] if warn else []
+        try:
+            for eng in order:
+                if eng not in _SEARCH_URL:
+                    notes.append(f"{eng}: mesin tidak dikenal")
+                    continue
+                try:
+                    page.goto(_SEARCH_URL[eng].format(urllib.parse.quote(query)), wait_until="domcontentloaded", timeout=30000)
+                    page.wait_for_timeout(2500)
+                    if "/sorry/" in page.url or "consent." in page.url or "unusual traffic" in page.content().lower():
+                        notes.append(f"{eng}: diblokir (CAPTCHA/consent)")
+                        continue
+                    rows = page.evaluate(_SEARCH_JS[eng])
+                except Exception as e:
+                    notes.append(f"{eng}: {type(e).__name__}: {str(e)[:150]}")
+                    continue
+                if rows:
+                    return json.dumps(
+                        {"engine": eng, "query": query, "results": rows[: int(max_results)], "notes": notes},
+                        ensure_ascii=False,
+                    )
+                notes.append(f"{eng}: tidak ada hasil (mungkin diblokir atau tata letak halaman berubah)")
+        finally:
+            cleanup()
+        return json.dumps({"error": "Semua mesin pencari gagal.", "notes": notes}, ensure_ascii=False)
+
+
+    def visit(url, max_chars=15000, browser="camoufox", screenshot=False):
+        """Buka halaman dengan JavaScript aktif dan kembalikan teks yang terbaca."""
+        if not re.match(r"^https?://", url or ""):
+            return json.dumps({"error": "URL harus diawali http:// atau https://"}), None
+        cleanup, page, warn = _launch_page(browser)
+        try:
+            resp = page.goto(url, wait_until="domcontentloaded", timeout=45000)
+            page.wait_for_timeout(1500)
+            final_url, title = page.url, page.title()
+            text = page.evaluate("() => document.body ? document.body.innerText : ''")
+            shot = page.screenshot(type="jpeg", quality=70) if screenshot else None
+        finally:
+            cleanup()
+        text = re.sub(r"\n\s*\n\s*\n+", "\n\n", text or "").strip()
+        limit = max(1000, min(int(max_chars), 60000))
+        out = {
+            "url": final_url,
+            "status": resp.status if resp else None,
+            "title": title,
+            "text": text[:limit],
+            "truncated": len(text) > limit,
+            "notes": [warn] if warn else [],
+        }
+        if shot:
+            out["screenshot"] = "terlampir sebagai gambar"
+        return json.dumps(out, ensure_ascii=False), shot'''
+
+    _src = re.sub(
+        r"def _launch\(p, browser\):.*?(?=\ndef _fn\()",
+        lambda _m: _STEALTH,
+        _src,
+        count=1,
+        flags=re.DOTALL,
+    )
+    _src = _src.replace('"browser": "chromium"', '"browser": "camoufox"')
+    _src = _src.replace('s.browser || "chromium"', 's.browser || "camoufox"')
+    _src = _src.replace('.get("browser", "chromium")', '.get("browser", "camoufox")')
+    _src = _src.replace(
+        '<option value="chromium">Chromium</option><option value="firefox">Firefox</option>',
+        '<option value="chromium">Chromium</option><option value="firefox">Firefox</option><option value="camoufox">Camoufox</option>',
+    )
+    # Buang duckduckgo dari daftar engine (ke-block di IP datacenter ini)
+    _src = _src.replace('engine \'auto\' tries Google, then Bing, then DuckDuckGo.', 'engine \'auto\' tries Google, then Bing.')
+    _src = _src.replace('["auto", "google", "bing", "duckduckgo"]', '["auto", "google", "bing"]')
+
+    # ============================================================
+    # PATCH 1: Sampling parameters — dari dict SAMPLING yang diisi sel Start (vLLM / llama.cpp)
+    # sesuai model yang sedang jalan. Patch lama menyisipkan sampler SEBELUM
+    # "temperature": 1.0, "top_k": 20 di stream(), sehingga tertimpa dan tidak pernah berlaku.
+    # ============================================================
+    _old_sampling = '"temperature": 1.0, "top_p": 0.95, "top_k": 20, "chat_template_kwargs": template_kwargs,'
+    assert _old_sampling in _src, "struktur stream() di qwen_chat_app.py berubah; patch sampler perlu disesuaikan"
+    _src = _src.replace(_old_sampling, '**SAMPLING, "chat_template_kwargs": template_kwargs,', 1)
+
+    # Gemma 4 (Dark-Gemistry) membaca enable_thinking, Qwen3.8 membaca reasoning_effort: kirim keduanya.
+    _old_kwargs = 'template_kwargs = {"reasoning_effort": reasoning, "preserve_thinking": True}'
+    assert _old_kwargs in _src, "template_kwargs di qwen_chat_app.py berubah; patch thinking perlu disesuaikan"
+    _src = _src.replace(
+        _old_kwargs,
+        'template_kwargs = {"reasoning_effort": reasoning, "enable_thinking": True, "preserve_thinking": True}', 1)
+
+
+    # ============================================================
+    # PATCH 2: Fix reasoning — pakai xhigh, bukan low
+    # ============================================================
+    # (diperbaiki di build() call di bawah)
+
+
+    # ============================================================
+    # PATCH 3: Tombol Compact manual
+    # ============================================================
+
+    # 3a. Tambah tombol "Compact" di top bar (frontend ESM)
+    _src = _src.replace(
+        '<button type="button" data-act="settings">Pengaturan</button>',
+        '<button type="button" data-act="settings">Pengaturan</button>'
+        '<button type="button" data-act="compact" title="Padatkan konteks lama jadi ringkasan" '
+        'style="font-size:12px;padding:2px 10px">Compact</button>',
+    )
+
+    # 3b. Tambah click handler untuk "compact" di frontend
+    _src = _src.replace(
+        'else if (act === "toggle") el.classList.toggle("qc-side-open");',
+        'else if (act === "toggle") el.classList.toggle("qc-side-open");\n'
+        '    else if (act === "compact") command("compact");',
+    )
+
+    # 3c. maybe_compact menerima force=True dan melewati dua pengecekan ambang batas
+    _src = re.sub(r'def maybe_compact\(([^)]*)\):', r'def maybe_compact(\1, force=False):', _src)
+    _src = _src.replace(
+        'if state["last_used"] and state["last_used"] < 0.7 * maxc:',
+        'if not force and state["last_used"] and state["last_used"] < 0.7 * maxc:',
+    )
+    _src = _src.replace('if used < COMPACT_AT * maxc:', 'if not force and used < COMPACT_AT * maxc:')
+    print("maybe_compact patched:", "force=False" in _src, "| threshold patched:", "not force and used" in _src)
+
+    # 3d. Handler tombol Compact: jalan di thread supaya kernel nggak beku selama meringkas
+    _compact_handler_code = '''
+        def _compact_handler(change):
+            cmd = change["new"] or {}
+            if cmd.get("action") != "compact":
+                return
+            if widget.busy:
+                widget.status = "Tunggu balasan selesai dulu."
+                return
+            if not widget.chat_id:
+                widget.status = "Buka chat dulu sebelum compact."
+                return
+
+            def _run():
+                widget.busy = True
+                widget.status = "Compacting..."
+                try:
+                    tools = TOOLS if (widget.settings or {}).get("tools", True) else None
+                    used = maybe_compact(widget.chat_id, tools, lambda m: setattr(widget, "status", m), force=True)
+                    widget.history = load_display(widget.chat_id)
+                    state["last_used"] = used or 0
+                    widget.ctx = {"used": state["last_used"], "max": max_context()}
+                    widget.status = ""
+                except Exception as e:
+                    widget.status = f"Compact gagal: {type(e).__name__}: {e}"
+                finally:
+                    widget.busy = False
+
+            mo.Thread(target=_run, daemon=True).start()
+
+        widget.observe(_compact_handler, names="command")
+
+    '''
+    _src = _src.replace(
+        '    def on_settings(',
+        _compact_handler_code + '    def on_settings(',
+    )
+
+    # PATCH 4: setiap ringkasan compaction (tahap 2) juga disimpan ke memory lintas chat
+    _src = _src.replace(
+        '            store.x("INSERT INTO summaries (chat_id, upto_seq, text, created) VALUES (?, ?, ?, ?)", (chat_id, cutoff, text, time.time()))',
+        '            store.x("INSERT INTO summaries (chat_id, upto_seq, text, created) VALUES (?, ?, ?, ?)", (chat_id, cutoff, text, time.time()))\n'
+        '            _title = store.one("SELECT title FROM chats WHERE id = ?", (chat_id,))\n'
+        '            store.x("INSERT INTO memories (text, created) VALUES (?, ?)",\n'
+        '                    (f"[Ringkasan chat \'{_title[\'title\'] if _title else chat_id}\', pesan #1-#{cutoff}]\\n" + text, time.time()))',
+    )
+    print("compaction -> memory patched:", "INSERT INTO memories (text, created)" in _src and "Ringkasan chat" in _src)
+
+    # PATCH 5a: aturan tetap untuk chat baru
+    _RULES = """# Aturan penulisan
+    - Kalimat bahasa Jerman ditulis UTUH dalam satu tanda kutip. JANGAN dipecah per kata atau disambung pakai "...".
+    - Terjemahannya SATU kali untuk seluruh kalimat, dalam kurung, tepat setelah tanda kutip penutup.
+      Benar: "Das ist ein guter Indikator." (Itu indikator yang bagus.)
+      Salah: "Das..." (Itu) "...ist..." (adalah) "...ein..." (satu)
+    - Jangan pernah menulis terjemahan dua kali. "(Iya.) (Iya)" salah, "(Iya.)" benar.
+    - Kalimat yang sudah berbahasa Indonesia, nama orang, dan nama tempat tidak diterjemahkan.
+    - Pakai bahasa Jerman yang benar (misalnya "der Beste", bukan "gutesten").
+    - Kalau ada pola salah di pesan-pesan sebelumnya, jangan ditiru."""
+    _src = _src.replace("BASE_SYSTEM = ", "CHAT_RULES = " + repr(_RULES) + "\n\nBASE_SYSTEM = ", 1)
+
+    # PATCH 5b: tabel snapshot memory per chat
+    _src = _src.replace(
+        "CREATE INDEX IF NOT EXISTS attachments_msg ON attachments (message_id);",
+        "CREATE INDEX IF NOT EXISTS attachments_msg ON attachments (message_id);\n"
+        "CREATE TABLE IF NOT EXISTS chat_memory_snapshot (chat_id INTEGER PRIMARY KEY, text TEXT NOT NULL);",
+    )
+
+    # PATCH 5c: aturan + memory dibekukan ke system prompt saat chat baru dimulai
+    _src = _src.replace(
+        r'''        if summ:
+                parts.append(''',
+        r'''        _snap = store.one("SELECT text FROM chat_memory_snapshot WHERE chat_id = ?", (chat_id,))
+            if _snap is None:
+                # Frozen once per chat so the system prompt (and the server's prefix cache) never changes mid-chat.
+                _n = store.one("SELECT COUNT(*) AS n FROM messages WHERE chat_id = ?", (chat_id,))["n"]
+                _txt = ""
+                if _n <= 1:
+                    _rows = store.q("SELECT id, text FROM memories ORDER BY id DESC LIMIT 40")
+                    _mem = "\n".join(f"- (#{r['id']}) {r['text'][:800]}" for r in reversed(_rows))[:12000]
+                    _txt = CHAT_RULES + ("\n\n# Memory dari chat sebelumnya (dibekukan saat chat ini dimulai)\n" + _mem if _mem else "")
+                store.x("INSERT INTO chat_memory_snapshot (chat_id, text) VALUES (?, ?)", (chat_id, _txt))
+                _snap = {"text": _txt}
+            if _snap["text"]:
+                parts.append(_snap["text"])
+            if summ:
+                parts.append(''',
+        1,
+    )
+
+    # PATCH 5d: memory relevan disuntik ke tiap pesan (disimpan bersama pesan, tidak tampil di layar)
+    _src = _src.replace(
+        r'''        full = "\n\n".join([text] + blocks).strip()''',
+        r'''        _mq = fts_query(text)
+            _hits = store.q(
+                "SELECT m.id, m.text FROM memories_fts f JOIN memories m ON m.id = f.rowid "
+                "WHERE memories_fts MATCH ? ORDER BY bm25(memories_fts) LIMIT 5", (_mq,)) if _mq else []
+            if _hits:
+                blocks = blocks + ["[Memory relevan, diambil otomatis, bukan tulisan pengguna]\n" + "\n".join(f"- (#{r['id']}) {r['text'][:800]}" for r in _hits)]
+            full = "\n\n".join([text] + blocks).strip()''',
+        1,
+    )
+    print("patch 5:", "CHAT_RULES = " in _src, "chat_memory_snapshot" in _src, "Memory relevan" in _src)
+
+    # PATCH 6a: helper dedup + pembatasan ringkasan di memory
+    _MEM_HELPERS = r'''
+    def _norm_words(s):
+        return set(re.findall(r"\w+", (s or "").lower()))
+
+
+    def prune_summary_memories(store, keep=30):
+        """Keep only the newest compaction summaries in memory; facts are never pruned automatically."""
+        store.x(
+            "DELETE FROM memories WHERE text LIKE '[Ringkasan chat %' AND id NOT IN "
+            "(SELECT id FROM memories WHERE text LIKE '[Ringkasan chat %' ORDER BY id DESC LIMIT ?)",
+            (keep,),
+        )
+
+
+    def memory_save_dedup(store, text):
+        """Insert a memory unless an existing one says nearly the same thing (word overlap >= 80%)."""
+        words = _norm_words(text)
+        q = fts_query(text)
+        cands = store.q(
+            "SELECT m.id, m.text FROM memories_fts f JOIN memories m ON m.id = f.rowid "
+            "WHERE memories_fts MATCH ? ORDER BY bm25(memories_fts) LIMIT 10", (q,)) if q else []
+        for c in cands:
+            other = _norm_words(c["text"])
+            if words and other and len(words & other) / len(words | other) >= 0.8:
+                return json.dumps({"duplicate_of": c["id"], "note": "Sudah ada memory yang sama; tidak disimpan ulang."})
+        mid = store.x("INSERT INTO memories (text, created) VALUES (?, ?)", (text, time.time()))
+        return json.dumps({"saved": mid})
+    '''
+    _src = _src.replace("class QwenChat(anywidget.AnyWidget):", _MEM_HELPERS + "\n\nclass QwenChat(anywidget.AnyWidget):", 1)
+
+    # PATCH 6b: tool memory_save pakai dedup
+    _src = _src.replace(
+        r'''            elif name == "memory_save":
+                    mid = store.x("INSERT INTO memories (text, created) VALUES (?, ?)", (str(args["text"]).strip(), time.time()))
+                    res = json.dumps({"saved": mid})''',
+        r'''            elif name == "memory_save":
+                    res = memory_save_dedup(store, str(args["text"]).strip())''',
+        1,
+    )
+
+    # PATCH 6c: bersihkan ringkasan lama tiap kali chat dibuka dan setelah compaction menyimpan ringkasan
+    _src = _src.replace("    ensure_schema()\n    widget = QwenChat()", "    ensure_schema()\n    prune_summary_memories(store)\n    widget = QwenChat()", 1)
+    _src = _src.replace(
+        "pesan #1-#{cutoff}]\\n\" + text, time.time()))",
+        "pesan #1-#{cutoff}]\\n\" + text, time.time()))\n            prune_summary_memories(store)",
+        1,
+    )
+
+    # PATCH 6d: snapshot chat baru = 60 fakta terbaru (dipendekkan) + 3 ringkasan terakhir
+    _src = _src.replace(
+        r'''                _rows = store.q("SELECT id, text FROM memories ORDER BY id DESC LIMIT 40")
+                    _mem = "\n".join(f"- (#{r['id']}) {r['text'][:800]}" for r in reversed(_rows))[:12000]''',
+        r'''                _facts = store.q("SELECT id, text FROM memories WHERE text NOT LIKE '[Ringkasan chat %' ORDER BY id DESC LIMIT 60")
+                    _sums = store.q("SELECT id, text FROM memories WHERE text LIKE '[Ringkasan chat %' ORDER BY id DESC LIMIT 3")
+                    _mem = "\n".join(f"- (#{r['id']}) {r['text'][:500]}" for r in reversed(_facts))[:9000]
+                    if _sums:
+                        _mem += "\n\n" + "\n\n".join(r["text"][:1500] for r in reversed(_sums))''',
+        1,
+    )
+    print("patch 6:", "def memory_save_dedup" in _src, "memory_save_dedup(store, str(args" in _src,
+          "prune_summary_memories(store)\n    widget" in _src, "_facts = store.q" in _src)
+
+    # PATCH 7a: hapus terjemahan kurung yang dobel sebelum jawaban disimpan,
+    # supaya riwayat chat nggak berisi contoh salah yang ditiru model.
+    _DEDUPE = r'''
+    def dedupe_parens(text):
+        """Drop a parenthetical that repeats the one right before it, e.g. "(Iya.) (Iya)" -> "(Iya.)"."""
+        parts = re.split(r"(\([^()\n]{1,300}\))", text or "")
+        out, last = [], None
+        for p in parts:
+            if p.startswith("(") and p.endswith(")"):
+                norm = re.sub(r"[\s.!?,…]+", " ", p[1:-1]).strip().lower()
+                if norm == last:
+                    while out and not out[-1].strip():
+                        out.pop()
+                    continue
+                last = norm
+            elif p.strip():
+                last = None
+            out.append(p)
+        return "".join(out)
+    '''
+    _src = _src.replace("class QwenChat(anywidget.AnyWidget):", _DEDUPE + "\n\nclass QwenChat(anywidget.AnyWidget):", 1)
+    _src = _src.replace(
+        'add_message(chat_id, "assistant", acc["content"], acc["reasoning"], calls or None)',
+        'add_message(chat_id, "assistant", dedupe_parens(acc["content"]), acc["reasoning"], calls or None)',
+        1,
+    )
+
+
+
+    _app = _types.ModuleType("qwen_chat_app")
+    _app.__dict__["SAMPLING"] = SAMPLING  # dict yang sama: diubah sel Start, langsung terbaca stream()
     exec(compile(_src, "qwen_chat_app.py", "exec"), _app.__dict__)
+
+
+    # Perbaiki selector Google: hasil sekarang pakai redirect google.com/goto,
+    # jadi jangan buang link ber-host google.com.
+    _app._SEARCH_JS['google'] = '''() => [...document.querySelectorAll('a h3')].map((h) => {
+        const a = h.closest('a');
+        const box = a.closest('div[data-hveid]') || a.parentElement;
+        const snippet = (box ? box.innerText : '').replace(h.innerText, '').trim().slice(0, 300);
+        return { title: h.innerText, url: a ? a.href : null, snippet };
+    }).filter((r) => r.url && r.url.startsWith('http'))'''
+
     chat = _app.build(
         STORE,
         dict(
@@ -618,7 +1408,7 @@ def _(API_KEY, BASE_URL, HEALTH_URL, REASONING, ROOT_URL, SERVED_NAME, STORE, Pa
             root_url=ROOT_URL,
             health_url=HEALTH_URL,
             served_name=SERVED_NAME,
-            reasoning=REASONING,
+            reasoning=REASONING,  # xhigh, dari cell vblA
         ),
     )
     chat
@@ -637,6 +1427,31 @@ def _(mo):
 def _(mo, run_live, shell_btn, shell_cmd):
     mo.stop(not shell_btn.value)
     run_live(shell_cmd.value, "Shell")
+    return
+
+
+@app.cell
+def _(PROCS, mo):
+    import os as _os
+
+    def _size(path):
+        total = 0
+        for root, _, files in _os.walk(_os.path.expanduser(path)):
+            for f in files:
+                try:
+                    total += _os.path.getsize(_os.path.join(root, f))
+                except OSError:
+                    pass
+        return f"{total / 1e9:.2f} GB"
+
+    _p = PROCS.get("llama")
+    _lines = [
+        f"proses llama-server: {'hidup' if _p and _p.poll() is None else 'MATI, exit ' + str(_p.poll() if _p else None)}",
+        f"~/.cache/llama.cpp: {_size('~/.cache/llama.cpp')}",
+        f"~/.cache/huggingface: {_size('~/.cache/huggingface')}",
+        f"/tmp/qwen-chat/llama.log: {_os.path.getsize('/tmp/qwen-chat/llama.log') if _os.path.exists('/tmp/qwen-chat/llama.log') else 0} byte",
+    ]
+    mo.plain_text("\n".join(_lines))
     return
 
 
