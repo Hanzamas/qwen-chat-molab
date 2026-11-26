@@ -65,6 +65,7 @@ TOOL_STUDIO = [
 class ToolBox:
     def __init__(self, store, cards, stories, world, memory, web):
         self.store, self.cards, self.stories, self.world, self.mem, self.web = store, cards, stories, world, memory, web
+        self.on_call = None  # set by the chat app: called with (chat_id, tool name) after every tool call
 
     def specs(self, c):
         kind = c["kind"]
@@ -91,7 +92,14 @@ class ToolBox:
                 args["src_chat"] = args.pop("chat_id")
             if "from" in args:
                 args["start"] = args.pop("from")
-            res = fn(chat_id, message_id, **args)
+            try:
+                res = fn(chat_id, message_id, **args)
+            finally:
+                if self.on_call:
+                    try:
+                        self.on_call(chat_id, name)
+                    except Exception:
+                        pass
             media = []
             if isinstance(res, tuple):
                 res, media = res
@@ -303,9 +311,18 @@ class ToolBox:
     def t_card_draft_update(self, chat_id, mid, type, field, value, card_id=None):
         drafts, st = self._drafts(chat_id)
         if card_id:
-            if not self.cards.get(int(card_id)):
+            card = self.cards.get(int(card_id))
+            if not card:
                 return {"error": f"kartu #{card_id} tidak ada"}
+            if card["type"] != type:
+                return {"error": f"kartu #{card_id} ({card['name']}) bertipe {card['type']}, bukan {type}. "
+                                 f"Tanpa card_id, card_draft_update membuat kartu {type} baru."}
             cid = self.cards.set_field(int(card_id), field, value)
+            ids = drafts.get(type)
+            ids = ids if isinstance(ids, list) else [ids] if ids else []
+            if cid not in ids:  # a library card edited here is part of this studio session from now on
+                drafts[type] = ids + [cid] if type == "character" else cid
+                self.store.chat_settings(chat_id, studio=st)
         else:
             existing = drafts.get(type)
             if type != "character" and existing:
@@ -321,7 +338,11 @@ class ToolBox:
                     drafts[type] = cid
                 self.store.chat_settings(chat_id, studio=st)
         report = self._field_report(cid, field, value)
-        return {"card_id": cid, "field": field, **({"ok": True} if not report.get("error") else {}), **report}
+        card = self.cards.get(cid)
+        if not card["data"].get("name") and not card["data"].get("title"):
+            report["note"] = "Kartu ini belum punya nama: isi field name (title untuk skenario)."
+        return {"card_id": cid, "name": card["name"], "field": field,
+                **({"ok": True} if not report.get("error") else {}), **report}
 
     def t_lore_add(self, chat_id, mid, title, text, keys="", kind="istilah", core=False, world_card_id=None):
         wid = int(world_card_id) if world_card_id else self._world_id(chat_id)

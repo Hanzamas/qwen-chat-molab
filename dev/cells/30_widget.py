@@ -26,6 +26,7 @@ class ChatWidget(_aw.AnyWidget):
     compose = _tl.Dict({}).tag(sync=True)
     queue = _tl.Int(0).tag(sync=True)
     notice = _tl.Dict({}).tag(sync=True)
+    rev = _tl.Int(0).tag(sync=True)  # bumped when data shown on request (memory list) may have changed
 
 
 class ChatApp:
@@ -36,6 +37,11 @@ class ChatApp:
         self.engine = Engine(emit=self.on_event)
         self.limit = EngineView.DISPLAY_LIMIT
         self._live_t = 0.0
+        self._cards_lock = threading.Lock()
+        self._cards_timer = None
+        self._cards_ids = set()
+        CARDS.on_change = self._cards_changed
+        TOOLS.on_call = lambda chat_id, name: self._cards_changed("tool")
         self.w.boot = self.boot()
         self.w.observe(self.on_command, names="command")
         self.refresh_chats()
@@ -100,6 +106,34 @@ class ChatApp:
                               "latest": c["version"], "avatar": c["avatar"]})
         return {"id": sid, "title": s["title"], "canon": s["data"]["canon"], "never_forget": s["data"]["never_forget"],
                 "cards": links, "pending": [p["text"] for p in STORIES.pending_list(sid, chat["id"])]}
+
+    def _cards_changed(self, card_id):
+        """Cards, story, memory and facts change during a turn (Studio, tools): refresh what shows them,
+        at most about once a second."""
+        with self._cards_lock:
+            self._cards_ids.add(card_id)
+            if self._cards_timer is None:
+                self._cards_timer = threading.Timer(0.8, self._cards_refresh)
+                self._cards_timer.daemon = True
+                self._cards_timer.start()
+
+    def _cards_refresh(self):
+        with self._cards_lock:
+            ids, self._cards_ids, self._cards_timer = self._cards_ids, set(), None
+        try:
+            if self.w.library:
+                self.w.library = self.library_info()
+            cur = self._cur()
+            chat = STORE.chat(cur) if cur else None
+            if chat:
+                self.w.story = self.story_info(chat)
+            open_id = (self.w.card or {}).get("id")
+            if open_id and (open_id in ids or None in ids or "tool" in ids):
+                self.w.card = self.card_info(open_id)
+            if "tool" in ids:
+                self.w.rev = self.w.rev + 1
+        except Exception:
+            pass
 
     def library_info(self):
         return {"cards": CARDS.list(), "stories": STORIES.list()}

@@ -191,6 +191,9 @@ UI_CSS = r"""
 .qr-notice { max-width:800px; margin:0 auto 6px; display:flex; align-items:flex-start; gap:8px; font-size:13.5px; background:var(--panel);
   border:1px solid var(--line); border-radius:12px; padding:8px 10px; }
 .qr-notice span { flex:1; }
+.qr-stale { display:flex; align-items:center; gap:8px; font-size:13px; color:var(--warn); background:var(--panel);
+  border:1px solid var(--line); border-radius:10px; padding:8px 10px; margin-bottom:10px; }
+.qr-stale span { flex:1; }
 .qr-cmp-grid { display:grid; grid-template-columns:1fr 1fr; gap:14px; }
 .qr-cmp-msg { border-top:1px solid var(--line); padding:8px 0; }
 .qr-cmp-msg.user .qr-md { color:var(--muted); }

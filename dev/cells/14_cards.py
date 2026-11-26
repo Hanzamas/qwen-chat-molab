@@ -12,7 +12,15 @@ class Cards:
 
     def __init__(self, store):
         self.store = store
+        self.on_change = None  # set by the chat app: called with a card id (None = some lore/timeline entry)
         self.ensure_defaults()
+
+    def _changed(self, card_id):
+        if self.on_change:
+            try:
+                self.on_change(card_id)
+            except Exception:
+                pass
 
     # ---------- schemas ----------
 
@@ -208,6 +216,7 @@ class Cards:
                                    (type_, name, json.dumps(data), avatar, now, now))
             self.store.x("INSERT INTO card_versions (card_id, version, data, created) VALUES (?, 1, ?, ?)",
                          (card_id, json.dumps(data), now))
+            self._changed(card_id)
             return card_id
         if json.loads(cur["data"] or "{}") != data:
             ver = cur["version"] + 1
@@ -219,6 +228,7 @@ class Cards:
             self.store.x("UPDATE cards SET name = ?, updated = ? WHERE id = ?", (name, now, card_id))
         if avatar is not None:
             self.store.x("UPDATE cards SET avatar = ? WHERE id = ?", (avatar or None, card_id))
+        self._changed(card_id)
         return card_id
 
     def set_field(self, card_id, key, value):
@@ -232,6 +242,7 @@ class Cards:
         self.store.x("DELETE FROM lore_entries WHERE card_id = ?", (card_id,))
         self.store.x("DELETE FROM timeline WHERE card_id = ?", (card_id,))
         self.store.x("DELETE FROM story_cards WHERE card_id = ?", (card_id,))
+        self._changed(card_id)
 
     def versions(self, card_id):
         return self.store.q("SELECT version, created FROM card_versions WHERE card_id = ? ORDER BY version DESC", (card_id,))
@@ -307,12 +318,15 @@ class Cards:
         if entry_id:
             self.store.x("UPDATE lore_entries SET title = ?, text = ?, keys = ?, kind = ?, core = ?, updated = ? WHERE id = ?",
                          (title, text, keys, kind, int(core), time.time(), entry_id))
-            return entry_id
-        return self.store.x("INSERT INTO lore_entries (card_id, kind, title, keys, text, core, updated) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                            (card_id, kind, title, keys, text, int(core), time.time()))
+        else:
+            entry_id = self.store.x("INSERT INTO lore_entries (card_id, kind, title, keys, text, core, updated) "
+                                    "VALUES (?, ?, ?, ?, ?, ?, ?)", (card_id, kind, title, keys, text, int(core), time.time()))
+        self._changed(card_id)
+        return entry_id
 
     def lore_delete(self, entry_id):
         self.store.x("DELETE FROM lore_entries WHERE id = ?", (entry_id,))
+        self._changed(None)
 
     def timeline(self, card_id):
         return self.store.q("SELECT * FROM timeline WHERE card_id = ? ORDER BY at", (card_id,))
@@ -320,11 +334,14 @@ class Cards:
     def timeline_save(self, card_id, at, title, text="", entry_id=None):
         if entry_id:
             self.store.x("UPDATE timeline SET at = ?, title = ?, text = ? WHERE id = ?", (at, title, text, entry_id))
-            return entry_id
-        return self.store.x("INSERT INTO timeline (card_id, at, title, text) VALUES (?, ?, ?, ?)", (card_id, at, title, text))
+        else:
+            entry_id = self.store.x("INSERT INTO timeline (card_id, at, title, text) VALUES (?, ?, ?, ?)", (card_id, at, title, text))
+        self._changed(card_id)
+        return entry_id
 
     def timeline_delete(self, entry_id):
         self.store.x("DELETE FROM timeline WHERE id = ?", (entry_id,))
+        self._changed(None)
 
     # ---------- export / import ----------
 

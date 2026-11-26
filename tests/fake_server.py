@@ -89,6 +89,14 @@ def _reply(body):
         if last_role == "tool":
             return {"content": "Buku cerita diperbarui."}
         return {"tool_calls": [{"name": "canon_set", "arguments": json.dumps({"section": "Catatan", "text": "Sersan lebih tua."})}]}
+    if "CARDTEST" in user_texts:
+        if last_role == "tool":
+            return {"content": "Kartu dibuat."}
+        return {"tool_calls": [
+            {"name": "card_draft_update", "arguments": json.dumps({"type": "character", "field": "name", "value": "Weber"})},
+            {"name": "memory_save", "arguments": json.dumps({"text": f"Catatan uji {user_texts.count('CARDTEST')}", "scope": "user"})},
+            {"name": "card_draft_update", "arguments": json.dumps({"type": "world", "field": "stats",
+                                                                   "value": f"lapar, Lapar, 0, 100, {20 + user_texts.count('CARDTEST')}, 4"})}]}
     if "SLOWTEST" in text:
         return {"content": NARRATION + "\n\n" + NARRATION, "slow": 0.15}
     if "TOOLTEST" in user_texts and last_role == "user":

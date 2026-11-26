@@ -367,6 +367,8 @@ function render({ model, el }) {
     const cards = st.studio ? st.cards || [] : [];
     // only a card that belongs to this studio session may be shown
     if (!cards.some((x) => x.id === state.studioCard)) state.studioCard = cards.length ? cards[0].id : null;
+    // keep a form with unsaved edits; onCard shows a reload notice instead
+    const keep = state.formDirty && state.formDirty === state.studioCard ? pane.querySelector(".qr-studio-form") : null;
     const quick = [["Lengkapi yang kosong", "Lengkapi field kartu yang masih kosong dengan usulan yang konsisten."],
       ["Cek konsistensi", "Cek konsistensi antar kartu (dan anakronisme kalau dunia berbasis dunia nyata), lalu perbaiki."],
       ["Uji adegan", "Uji adegan: tulis satu paragraf pembuka dengan kartu Gaya dan GM yang sekarang."],
@@ -384,6 +386,7 @@ function render({ model, el }) {
         .filter((f) => f.visibility !== "ui" || ["greetings", "opening"].includes(f.key)).map((f) => `<option value="${esc(f.key)}">${esc(f.label)}</option>`).join("")}</select>
         <button class="qr-btn qr-sm" data-act="variations">${icon("sparkles")}Variasi</button></div>` : ""}
       <div class="qr-studio-form">${state.studioCard && card.id === state.studioCard ? cardForm(card, true) : ""}</div>`;
+    if (keep) pane.querySelector(".qr-studio-form").replaceWith(keep);
     if (state.studioCard && card.id !== state.studioCard) send("card_open", { card_id: state.studioCard });
   }
 
@@ -411,7 +414,7 @@ function render({ model, el }) {
     const sections = {};
     for (const f of c.fields || []) (sections[f.section || "Lainnya"] ||= []).push(f);
     const lore = c.type === "world" || c.type === "character";
-    return `<div class="qr-card-form" data-card="${c.id}">
+    return `<div class="qr-card-form" data-card="${c.id}" data-version="${c.version}">
       <div class="qr-card-top">${c.avatar ? `<img class="qr-avatar" src="data:image/png;base64,${c.avatar}" alt="">` : `<div class="qr-avatar qr-noav">${icon("card")}</div>`}
         <div><div class="qr-muted">${esc((get("boot").types || {})[c.type] || c.type)} · versi ${c.version}</div><b>${esc(c.name)}</b></div></div>
       ${Object.entries(sections).map(([s, fs]) => `<fieldset><legend>${esc(s)}</legend>${fs.map((f) => `<div class="qr-field">${fieldInput(f, c.data[f.key])}</div>`).join("")}</fieldset>`).join("")}
@@ -465,8 +468,9 @@ function render({ model, el }) {
     if (drawer.hidden) return;
     $(".qr-tabs").innerHTML = Object.keys(TAB_NAMES).map((t) => `<button class="qr-tabbtn ${t === state.tab ? "on" : ""}" data-act="tab" data-tab="${t}">${icon(TAB_ICONS[t])}${TAB_NAMES[t]}</button>`).join("");
     const fn = { chat: tabChat, story: tabStory, cards: tabCards, memory: tabMemory, model: tabModel, learn: tabLearn }[state.tab];
-    const active = document.activeElement;
+    const active = el.getRootNode().activeElement || document.activeElement;  // the widget lives in a shadow root
     if (active && dbody.contains(active) && (active.tagName === "TEXTAREA" || active.tagName === "INPUT")) return;
+    if (state.tab === "cards" && state.cardView && state.formDirty === state.cardView && dbody.querySelector(".qr-card-form")) return;
     dbody.innerHTML = fn();
   }
   function tabChat() {
@@ -658,6 +662,10 @@ function render({ model, el }) {
     const form = el.querySelector(".qr-drawer .qr-card-form");
     if (f && form) send("card_save", { card_id: Number(form.dataset.card), data: collectCard(form), avatar: await readB64(f) });
   });
+  // typing in a card form marks it as having unsaved edits
+  const markDirty = (e) => { const f = e.target.closest && e.target.closest(".qr-card-form"); if (f && !e.target.closest(".qr-lore-edit, .qr-tl")) state.formDirty = Number(f.dataset.card); };
+  el.addEventListener("input", markDirty);
+  el.addEventListener("change", markDirty);
   dbody.addEventListener("input", (e) => {
     const t = e.target;
     if (t.dataset.smp && t.type === "range") t.nextElementSibling.textContent = t.value;
@@ -732,7 +740,8 @@ function render({ model, el }) {
       case "think-follow": { const box = btn.parentElement.querySelector(".qr-think-box"); thinkFollow = true; btn.hidden = true; box.scrollTop = box.scrollHeight; break; }
       case "think-full": { const d = btn.closest(".qr-think"); d.classList.toggle("full"); btn.textContent = d.classList.contains("full") ? "Ringkas" : "Tampilkan penuh"; break; }
       case "quick": send("send", { text: btn.dataset.text }); break;
-      case "studio-card": state.studioCard = id; send("card_open", { card_id: id }); break;
+      case "studio-card": state.formDirty = null; state.studioCard = id; send("card_open", { card_id: id }); break;
+      case "card-reload": state.formDirty = null; renderStudio(); if (state.tab === "cards") renderDrawer(); break;
       case "studio-finish": {
         const g = get("story").greetings || [];
         openModal("Mulai RP dari Studio", `<label>Judul<input class="sf-title" placeholder="Kosong = dari skenario"></label>
@@ -751,18 +760,18 @@ function render({ model, el }) {
       case "side-logs": send("side_logs"); break;
       case "notice-close": send("notice_clear"); break;
       case "compare": { const ids = [...el.querySelectorAll(".qr-cmp:checked")].map((i) => Number(i.value)); if (ids.length === 2) send("compare", { a: ids[0], b: ids[1] }); else toast("Pilih tepat 2 cabang.", "warn"); break; }
-      case "card-save": { const form = btn.closest(".qr-card-form"); send("card_save", { card_id: Number(form.dataset.card), data: collectCard(form) }); break; }
+      case "card-save": { const form = btn.closest(".qr-card-form"); state.formDirty = null; send("card_save", { card_id: Number(form.dataset.card), data: collectCard(form) }); break; }
       case "card-avatar": $(".qr-file-avatar").click(); break;
       case "card-export": { const form = btn.closest(".qr-card-form"); send("card_export", { card_id: Number(form.dataset.card), fmt: btn.dataset.fmt }); break; }
       case "card-delete": { const form = btn.closest(".qr-card-form"); if (confirm("Hapus kartu ini beserta lore dan garis waktunya?")) { send("card_delete", { card_id: Number(form.dataset.card) }); state.cardView = null; } break; }
       case "card-new": send("card_new", { type: btn.dataset.type }); state.cardView = "new"; break;
       case "card-import": $(".qr-file-card").click(); break;
-      case "open-card": state.tab = "cards"; state.cardView = id; drawer.hidden = false; send("card_open", { card_id: id }); renderDrawer(); break;
-      case "cards-back": state.cardView = null; send("library"); renderDrawer(); break;
+      case "open-card": state.formDirty = null; state.tab = "cards"; state.cardView = id; drawer.hidden = false; send("card_open", { card_id: id }); renderDrawer(); break;
+      case "cards-back": state.formDirty = null; state.cardView = null; send("library"); renderDrawer(); break;
       case "schema": send("schema_get", { type: btn.dataset.type }); break;
       case "schema-save": send("schema_save", { schema: el.querySelector(".qr-schema-text").value }); break;
-      case "row-add": { const tbl = btn.closest(".qr-table"); const n = Number(tbl.dataset.cols); const r = document.createElement("div"); r.className = "qr-trow"; r.innerHTML = Array(n).fill("<input>").join("") + `<button class="qr-icon qr-xs" data-act="row-del">${icon("x")}</button>`; tbl.insertBefore(r, btn); break; }
-      case "row-del": btn.closest(".qr-trow").remove(); break;
+      case "row-add": { const tbl = btn.closest(".qr-table"); state.formDirty = Number(btn.closest(".qr-card-form").dataset.card); const n = Number(tbl.dataset.cols); const r = document.createElement("div"); r.className = "qr-trow"; r.innerHTML = Array(n).fill("<input>").join("") + `<button class="qr-icon qr-xs" data-act="row-del">${icon("x")}</button>`; tbl.insertBefore(r, btn); break; }
+      case "row-del": state.formDirty = Number(btn.closest(".qr-card-form").dataset.card); btn.closest(".qr-trow").remove(); break;
       case "lore-save": { const box = btn.closest(".qr-lore-edit"), form = btn.closest(".qr-card-form"); const v = (c) => box.querySelector(c).value;
         if (!v(".le-title").trim()) { toast("Judul lore kosong.", "warn"); break; }
         send("lore_save", { card_id: Number(form.dataset.card), title: v(".le-title"), text: v(".le-text"), keys: v(".le-keys"), kind: v(".le-kind") || "istilah", core: box.querySelector(".le-core").checked, entry_id: box.dataset.entry ? Number(box.dataset.entry) : null }); break; }
@@ -867,6 +876,16 @@ function render({ model, el }) {
   const onCard = () => {
     const card = get("card");
     if (state.cardView === "new" && card.id) state.cardView = card.id;
+    const forms = [...el.querySelectorAll(`.qr-card-form[data-card="${card.id}"]`)];
+    if (state.formDirty === card.id && forms.some((f) => Number(f.dataset.version) !== card.version)) {
+      for (const f of forms) {
+        const note = f.querySelector(".qr-stale");
+        const html = `${icon("warn")}<span>Kartu ini sudah diubah (versi ${card.version}). Perubahanmu yang belum disimpan ada di form ini.</span>
+          <button class="qr-btn qr-sm" data-act="card-reload">Muat versi baru</button>`;
+        if (note) note.innerHTML = html; else f.insertAdjacentHTML("afterbegin", `<div class="qr-stale">${html}</div>`);
+      }
+      return;
+    }
     renderStudio();
     if (state.tab === "cards") renderDrawer();
   };
@@ -879,6 +898,7 @@ function render({ model, el }) {
     "change:server": () => { renderTop(); if (state.tab === "model") renderDrawer(); }, "change:backup": renderBackup,
     "change:library": () => { if (state.tab === "cards" || state.tab === "story") renderDrawer(); renderWizard(); },
     "change:card": onCard, "change:story": () => { renderStudio(); if (state.tab === "story") renderDrawer(); },
+    "change:rev": () => { if (state.tab === "memory" && !drawer.hidden) send("memory", { q: (state.memory || {}).q || "" }); },
     "change:aux": onAux, "change:notice": onNotice, "change:export": onExport, "change:compose": onCompose, "change:boot": renderDrawer,
   };
   for (const [ev, fn] of Object.entries(handlers)) model.on(ev, fn);

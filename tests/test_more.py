@@ -273,3 +273,56 @@ def test_card_get_repairs_tables_stored_as_text(nb):
     wid = C.save(None, "world", {"name": "Lama"})
     S.x("UPDATE cards SET data = ? WHERE id = ?", (json.dumps({"name": "Lama", "stats": '[["haus","Haus",0,100,10,5]]'}), wid))
     assert C.get(wid)["data"]["stats"] == [["haus", "Haus", "0", "100", "10", "5"]]
+
+
+def test_studio_card_changes_reach_the_widget(engine, nb):
+    T, C = nb["TOOLS"], nb["CARDS"]
+    seen = []
+    old = C.on_change
+    C.on_change = seen.append
+    try:
+        chat = engine.new_chat("studio", "Studio NPC")
+        res = json.loads(T.call(chat, None, "card_draft_update", json.dumps({"type": "character", "field": "backstory",
+                                                                           "value": "Lahir di Wina"}))[0])
+        cid = res["card_id"]
+        assert cid in seen and "note" in res  # no name yet: the model is told
+        gm = C.save(None, "gm", {"name": "GM uji"})
+        res, failed, _ = T.call(chat, None, "card_draft_update", json.dumps({"type": "character", "card_id": gm,
+                                                                           "field": "name", "value": "Otto"}))
+        assert failed and "bertipe gm" in res and C.get(gm)["name"] == "GM uji"
+        lib = C.save(None, "character", {"name": "Frau Brunner"})
+        T.call(chat, None, "card_draft_update", json.dumps({"type": "character", "card_id": lib, "field": "age", "value": "70"}))
+        drafts = nb["STORE"].chat(chat)["settings"]["studio"]["drafts"]["character"]
+        assert drafts == [cid, lib]
+        world = C.save(None, "world", {"name": "W"})
+        seen.clear()
+        C.lore_save(world, "Kiez", "lingkungan")
+        C.timeline_save(world, "2026-11-01 08:00", "Mulai")
+        assert seen == [world, world]
+    finally:
+        C.on_change = old
+
+
+def test_widget_refreshes_library_after_card_change(nb):
+    import time as _t
+    app = nb["CHAT_APP"]
+    app.w.library = app.library_info()
+    cid = nb["CARDS"].save(None, "character", {"name": "Weber Widget"})
+    for _ in range(60):
+        if any(c["id"] == cid for c in app.w.library["cards"]):
+            break
+        _t.sleep(0.05)
+    assert any(c["id"] == cid for c in app.w.library["cards"])
+
+
+def test_tool_calls_refresh_widget(nb, engine):
+    import time as _t
+    app = nb["CHAT_APP"]
+    rev = app.w.rev
+    chat = engine.new_chat("chat", "memori")
+    nb["TOOLS"].call(chat, None, "memory_save", json.dumps({"text": "Pemain suka kopi tubruk.", "scope": "user"}))
+    for _ in range(60):
+        if app.w.rev > rev:
+            break
+        _t.sleep(0.05)
+    assert app.w.rev > rev
