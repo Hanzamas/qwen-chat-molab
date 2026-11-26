@@ -233,3 +233,43 @@ def test_failed_camoufox_start_does_not_break_chromium_fallback(nb, monkeypatch)
         web._run(web._close)
     finally:
         asyncio.set_event_loop_policy(policy)
+
+
+def test_table_fields_accept_what_models_send(engine, nb):
+    T, C = nb["TOOLS"], nb["CARDS"]
+    chat = engine.new_chat("studio", "Studio tabel")
+    res = json.loads(T.call(chat, None, "card_draft_update", json.dumps({"type": "world", "field": "name", "value": "M"}))[0])
+    wid = res["card_id"]
+
+    def put(field, value):
+        out, failed, _ = T.call(chat, None, "card_draft_update", json.dumps({"type": "world", "card_id": wid,
+                                                                          "field": field, "value": value}))
+        return json.loads(out), C.get(wid)["data"][field]
+
+    # a JSON string of rows (what the screenshot's model sent)
+    rep, rows = put("stats", json.dumps([["energi", "Energi", 0, 100, 88, -2], ["lapar", "Lapar", 0, 100, 42, 4]]))
+    assert rows == [["energi", "Energi", "0", "100", "88", "-2"], ["lapar", "Lapar", "0", "100", "42", "4"]] and rep["rows"] == 2
+    # markdown table with a header and separator row
+    _, rows = put("stats", "| key | label | min | max | awal | laju per jam |\n|---|---|---|---|---|---|\n| mandi | Mandi | 0 | 3 | 1 | |")
+    assert rows == [["mandi", "Mandi", "0", "3", "1", ""]]
+    # objects with the model's own key names
+    _, rows = put("climate", [{"month": "11", "min": -1, "max": 6, "weather": ["berawan", "hujan"]}])
+    assert rows == [["11", "-1", "6", "berawan, hujan"]]
+    # CSV lines: the extra commas belong to the last column
+    _, rows = put("climate", "12, -3, 3, salju, berawan")
+    assert rows == [["12", "-3", "3", "salju, berawan"]]
+    # a mapping for a two-column table
+    _, rows = put("terms", {"Tach": "salam santai", "Kiez": "lingkungan"})
+    assert rows == [["Tach", "salam santai"], ["Kiez", "lingkungan"]]
+    rep, _ = put("terms", "|---|")
+    assert "error" in rep
+    defs = nb["WORLD"].stat_defs({"world": {"data": {"stats": "lapar, Lapar, 0, 100, 20, 4"}}})
+    assert defs[0]["key"] == "lapar" and defs[0]["rate"] == 4.0  # a raw string never crashes the engine
+    assert C.get(wid)["data"]["stats"][0][0] == "mandi"
+
+
+def test_card_get_repairs_tables_stored_as_text(nb):
+    C, S = nb["CARDS"], nb["STORE"]
+    wid = C.save(None, "world", {"name": "Lama"})
+    S.x("UPDATE cards SET data = ? WHERE id = ?", (json.dumps({"name": "Lama", "stats": '[["haus","Haus",0,100,10,5]]'}), wid))
+    assert C.get(wid)["data"]["stats"] == [["haus", "Haus", "0", "100", "10", "5"]]

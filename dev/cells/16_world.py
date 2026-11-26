@@ -64,11 +64,10 @@ class World:
 
     def stat_defs(self, cards):
         """[{key, label, min, max, start, rate}] from the world card, start values overridden by the scenario."""
-        rows = ((cards.get("world") or {}).get("data") or {}).get("stats") or []
+        rows = Cards.table_rows(((cards.get("world") or {}).get("data") or {}).get("stats") or [],
+                                ["key", "label", "min", "max", "awal", "laju per jam"])
         defs = []
-        for r in rows:
-            cells = r if isinstance(r, list) else [r.get(c) for c in ("key", "label", "min", "max", "awal", "laju per jam")]
-            cells = (list(cells) + [""] * 6)[:6]
+        for cells in rows:
 
             def num(x, d=None):
                 try:
@@ -79,9 +78,9 @@ class World:
                 continue
             defs.append({"key": str(cells[0]).strip(), "label": str(cells[1] or cells[0]).strip(),
                          "min": num(cells[2]), "max": num(cells[3]), "start": num(cells[4], 0.0), "rate": num(cells[5], 0.0)})
-        overrides = ((cards.get("scenario") or {}).get("data") or {}).get("start_stats") or []
-        for r in overrides:
-            cells = r if isinstance(r, list) else [r.get("key"), r.get("nilai")]
+        overrides = Cards.table_rows(((cards.get("scenario") or {}).get("data") or {}).get("start_stats") or [],
+                                     ["key", "nilai"])
+        for cells in overrides:
             for d in defs:
                 if len(cells) > 1 and d["key"] == str(cells[0]).strip():
                     try:
@@ -192,10 +191,10 @@ class World:
     # ---------- weather and timeline ----------
 
     def weather(self, story_id, cards, dt):
-        rows = ((cards.get("world") or {}).get("data") or {}).get("climate") or []
+        rows = Cards.table_rows(((cards.get("world") or {}).get("data") or {}).get("climate") or [],
+                                ["bulan", "suhu min", "suhu max", "cuaca"])
         pick = None
-        for r in rows:
-            cells = r if isinstance(r, list) else [r.get(c) for c in ("bulan", "suhu min", "suhu max", "cuaca")]
+        for cells in rows:
             key = str(cells[0]).strip().lower()
             if key == str(dt.month) or self.MONTHS.get(key) == dt.month:
                 pick = cells

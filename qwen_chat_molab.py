@@ -1885,7 +1885,7 @@ def _():
 
 
 @app.cell(hide_code=True)
-def _(DEFAULT_CARDS, DEFAULT_SCHEMAS, STORE, base64, json, time):
+def _(DEFAULT_CARDS, DEFAULT_SCHEMAS, STORE, base64, json, re, time):
     import struct as _struct
     import zlib as _zlib
 
@@ -1937,6 +1937,131 @@ def _(DEFAULT_CARDS, DEFAULT_SCHEMAS, STORE, base64, json, time):
                          (sch["type"], sch["version"], json.dumps(sch)))
             return sch
 
+        # ---------- field values ----------
+
+        # Other names models use for table columns (compared without case, spaces or punctuation).
+        COLUMN_ALIASES = {"awal": ("start", "initial", "nilaiawal", "value", "nilai"),
+                          "lajuperjam": ("laju", "rate", "perjam", "rateperhour", "perhour"),
+                          "suhumin": ("min", "tmin", "minimum"), "suhumax": ("max", "tmax", "maximum"),
+                          "istilah": ("term", "kata", "nama"), "arti": ("meaning", "definisi", "definition", "penjelasan"),
+                          "bulan": ("month", "musim", "season", "periode"), "cuaca": ("weather",),
+                          "label": ("nama", "name"), "key": ("kunci", "id")}
+
+        @staticmethod
+        def _norm_key(s):
+            return re.sub(r"[^a-z0-9]", "", str(s).lower())
+
+        @staticmethod
+        def _cell(v):
+            if v is None:
+                return ""
+            if isinstance(v, (list, tuple)):
+                return ", ".join(str(x).strip() for x in v)
+            if isinstance(v, float) and v.is_integer():
+                return str(int(v))
+            return (json.dumps(v, ensure_ascii=False) if isinstance(v, dict) else str(v)).strip()
+
+        @classmethod
+        def _split_row(cls, line):
+            line = re.sub(r"^\s*(?:[*\u2022]|-(?=\s)|\d+[.)](?=\s))\s*", "", line).strip()
+            if not line or re.fullmatch(r"[|:\-\s]+", line):  # empty, or a markdown separator row
+                return None
+            for sep in ("|", "\t", ";", ","):
+                if sep in line:
+                    return [c.strip() for c in line.strip("|").split(sep)] if sep == "|" else [c.strip() for c in line.split(sep)]
+            return [line]
+
+        @classmethod
+        def _row_from_dict(cls, r, cols):
+            nk = {cls._norm_key(k): v for k, v in r.items()}
+            cells, hits = [], 0
+            for c in cols:
+                key = cls._norm_key(c)
+                names = (key,) + cls.COLUMN_ALIASES.get(key, ())
+                hit = next((n for n in names if n in nk), None)
+                if hit is None:
+                    hit = next((k for k in nk if len(k) >= 3 and key.startswith(k)), None)
+                if hit is not None:
+                    hits += 1
+                    cells.append(nk.pop(hit))
+                else:
+                    cells.append("")
+            return cells if hits else list(r.values())
+
+        @classmethod
+        def table_rows(cls, value, columns):
+            """A table field as rows of strings in column order. Accepts an array of arrays or of objects, a JSON
+            string of either, an object of rows, or text with one row per line (| ; , or tab separated)."""
+            cols = list(columns or ["nilai"])
+            if isinstance(value, str) and value.strip()[:1] in "[{":
+                try:
+                    value = json.loads(value)
+                except ValueError:
+                    pass
+            if isinstance(value, dict):
+                rows = value.get("rows") or value.get("data")
+                if isinstance(rows, list):
+                    value = rows
+                elif any(cls._norm_key(k) in {cls._norm_key(c) for c in cols} for k in value):
+                    value = [value]
+                else:  # {"term": "meaning", ...}
+                    value = [[k, v] for k, v in value.items()]
+            if isinstance(value, str):
+                value = [r for r in (cls._split_row(line) for line in value.splitlines()) if r]
+            if not isinstance(value, list):
+                return []
+            out = []
+            for r in value:
+                if isinstance(r, dict):
+                    cells = cls._row_from_dict(r, cols)
+                elif isinstance(r, (list, tuple)):
+                    cells = list(r)
+                elif isinstance(r, str):
+                    cells = cls._split_row(r) or []
+                elif r is not None:
+                    cells = [r]
+                else:
+                    continue
+                cells = [cls._cell(c) for c in cells]
+                if len(cells) > len(cols):  # extra cells belong to the last column (e.g. "cerah, berawan, hujan")
+                    cells = cells[:len(cols) - 1] + [", ".join(c for c in cells[len(cols) - 1:] if c)]
+                cells += [""] * (len(cols) - len(cells))
+                if any(cells):
+                    out.append(cells)
+            names = {cls._norm_key(c) for c in cols}
+            if out and all(cls._norm_key(c) in names for c in out[0] if c):  # the header row, repeated by the model
+                out = out[1:]
+            return out
+
+        def normalize(self, type_, data):
+            """Field values in the shape the UI and the engine read: tables as rows of strings, lists as arrays."""
+            try:
+                fields = {f["key"]: f for f in self.schema(type_)["fields"]}
+            except Exception:
+                return data
+            out = dict(data)
+            for k, v in data.items():
+                f = fields.get(k)
+                if not f or v in (None, "", [], {}):
+                    continue
+                t = f.get("type")
+                if t == "table":
+                    out[k] = self.table_rows(v, f.get("columns"))
+                elif t in ("list", "tags"):
+                    if isinstance(v, str) and v.strip()[:1] == "[":
+                        try:
+                            v = json.loads(v)
+                        except ValueError:
+                            pass
+                    if isinstance(v, str):
+                        parts = re.split(r"\n|,", v) if t == "tags" else v.splitlines()
+                        v = [re.sub(r"^\s*(?:[*\u2022]|-(?=\s)|\d+[.)](?=\s))\s*", "", p).strip() for p in parts]
+                    if isinstance(v, list):
+                        out[k] = [self._cell(x) for x in v if self._cell(x)]
+                elif t in ("text", "longtext", "select") and isinstance(v, (list, dict)):
+                    out[k] = "\n".join(map(self._cell, v)) if isinstance(v, list) else self._cell(v)
+            return out
+
         # ---------- cards ----------
 
         def list(self, type_=None):
@@ -1953,13 +2078,13 @@ def _(DEFAULT_CARDS, DEFAULT_SCHEMAS, STORE, base64, json, time):
                 v = self.store.one("SELECT data FROM card_versions WHERE card_id = ? AND version = ?", (card_id, version))
                 if v:
                     c["data"], c["version"] = v["data"], version
-            c["data"] = json.loads(c["data"] or "{}")
+            c["data"] = self.normalize(c["type"], json.loads(c["data"] or "{}"))
             c["avatar"] = base64.b64encode(c["avatar"]).decode() if c["avatar"] else None
             return c
 
         def save(self, card_id, type_, data, name=None, avatar=None):
             """Create or update a card. Every change of data makes a new version. Returns the card id."""
-            data = dict(data or {})
+            data = self.normalize(type_, dict(data or {}))
             name = (name or data.get("name") or data.get("title") or "Tanpa nama").strip()
             now = time.time()
             if card_id:
@@ -2314,7 +2439,18 @@ def _(CARDS, STORE, json, time):
 
 
 @app.cell(hide_code=True)
-def _(CARDS, STORE, STORIES, datetime, json, random, re, time, timedelta):
+def _(
+    CARDS,
+    Cards,
+    STORE,
+    STORIES,
+    datetime,
+    json,
+    random,
+    re,
+    time,
+    timedelta,
+):
     class World:
         """Things the code computes so the model cannot fudge them: world clock, player stats (with per-hour rates),
         character status, dice, weather, timeline events, and off-screen events. Everything follows the message tree:
@@ -2381,11 +2517,10 @@ def _(CARDS, STORE, STORIES, datetime, json, random, re, time, timedelta):
 
         def stat_defs(self, cards):
             """[{key, label, min, max, start, rate}] from the world card, start values overridden by the scenario."""
-            rows = ((cards.get("world") or {}).get("data") or {}).get("stats") or []
+            rows = Cards.table_rows(((cards.get("world") or {}).get("data") or {}).get("stats") or [],
+                                    ["key", "label", "min", "max", "awal", "laju per jam"])
             defs = []
-            for r in rows:
-                cells = r if isinstance(r, list) else [r.get(c) for c in ("key", "label", "min", "max", "awal", "laju per jam")]
-                cells = (list(cells) + [""] * 6)[:6]
+            for cells in rows:
 
                 def num(x, d=None):
                     try:
@@ -2396,9 +2531,9 @@ def _(CARDS, STORE, STORIES, datetime, json, random, re, time, timedelta):
                     continue
                 defs.append({"key": str(cells[0]).strip(), "label": str(cells[1] or cells[0]).strip(),
                              "min": num(cells[2]), "max": num(cells[3]), "start": num(cells[4], 0.0), "rate": num(cells[5], 0.0)})
-            overrides = ((cards.get("scenario") or {}).get("data") or {}).get("start_stats") or []
-            for r in overrides:
-                cells = r if isinstance(r, list) else [r.get("key"), r.get("nilai")]
+            overrides = Cards.table_rows(((cards.get("scenario") or {}).get("data") or {}).get("start_stats") or [],
+                                         ["key", "nilai"])
+            for cells in overrides:
                 for d in defs:
                     if len(cells) > 1 and d["key"] == str(cells[0]).strip():
                         try:
@@ -2509,10 +2644,10 @@ def _(CARDS, STORE, STORIES, datetime, json, random, re, time, timedelta):
         # ---------- weather and timeline ----------
 
         def weather(self, story_id, cards, dt):
-            rows = ((cards.get("world") or {}).get("data") or {}).get("climate") or []
+            rows = Cards.table_rows(((cards.get("world") or {}).get("data") or {}).get("climate") or [],
+                                    ["bulan", "suhu min", "suhu max", "cuaca"])
             pick = None
-            for r in rows:
-                cells = r if isinstance(r, list) else [r.get(c) for c in ("bulan", "suhu min", "suhu max", "cuaca")]
+            for cells in rows:
                 key = str(cells[0]).strip().lower()
                 if key == str(dt.month) or self.MONTHS.get(key) == dt.month:
                     pick = cells
@@ -4188,9 +4323,23 @@ def _(CARDS, MEM, Memory, STORE, STORIES, TXT, WEB, WORLD, World, json):
             if field not in keys and field not in target["data"]:
                 return {"error": f"field '{field}' tidak ada di skema {target['type']}. Field: {', '.join(sorted(keys))}"}
             self.cards.set_field(target["id"], field, value)
+            report = self._field_report(target["id"], field, value)
+            if report.get("error"):
+                return {"card_id": target["id"], **report}
             shown = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
             self.stories.pending(sid, chat_id, f"Kartu {target['name']} · {field}: {shown[:600]}")
-            return {"card_id": target["id"], "version": self.cards.get(target["id"])["version"], "ok": True}
+            return {"card_id": target["id"], "version": self.cards.get(target["id"])["version"], "ok": True, **report}
+
+        def _field_report(self, card_id, field, value):
+            card = self.cards.get(card_id)
+            f = next((x for x in self.cards.schema(card["type"])["fields"] if x["key"] == field), None)
+            if not f or f.get("type") != "table":
+                return {}
+            rows = card["data"].get(field) or []
+            if value not in (None, "", [], {}) and not rows:
+                return {"error": f"Tabel '{field}' kosong setelah dibaca. Kirim array of array sesuai kolom "
+                                 f"{f.get('columns')}, satu array per baris."}
+            return {"rows": len(rows), "columns": f.get("columns"), "first_row": rows[0] if rows else None}
 
         # ---------- studio ----------
 
@@ -4219,7 +4368,8 @@ def _(CARDS, MEM, Memory, STORE, STORIES, TXT, WEB, WORLD, World, json):
                     else:
                         drafts[type] = cid
                     self.store.chat_settings(chat_id, studio=st)
-            return {"card_id": cid, "field": field, "ok": True}
+            report = self._field_report(cid, field, value)
+            return {"card_id": cid, "field": field, **({"ok": True} if not report.get("error") else {}), **report}
 
         def t_lore_add(self, chat_id, mid, title, text, keys="", kind="istilah", core=False, world_card_id=None):
             wid = int(world_card_id) if world_card_id else self._world_id(chat_id)

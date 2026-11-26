@@ -275,9 +275,23 @@ class ToolBox:
         if field not in keys and field not in target["data"]:
             return {"error": f"field '{field}' tidak ada di skema {target['type']}. Field: {', '.join(sorted(keys))}"}
         self.cards.set_field(target["id"], field, value)
+        report = self._field_report(target["id"], field, value)
+        if report.get("error"):
+            return {"card_id": target["id"], **report}
         shown = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
         self.stories.pending(sid, chat_id, f"Kartu {target['name']} · {field}: {shown[:600]}")
-        return {"card_id": target["id"], "version": self.cards.get(target["id"])["version"], "ok": True}
+        return {"card_id": target["id"], "version": self.cards.get(target["id"])["version"], "ok": True, **report}
+
+    def _field_report(self, card_id, field, value):
+        card = self.cards.get(card_id)
+        f = next((x for x in self.cards.schema(card["type"])["fields"] if x["key"] == field), None)
+        if not f or f.get("type") != "table":
+            return {}
+        rows = card["data"].get(field) or []
+        if value not in (None, "", [], {}) and not rows:
+            return {"error": f"Tabel '{field}' kosong setelah dibaca. Kirim array of array sesuai kolom "
+                             f"{f.get('columns')}, satu array per baris."}
+        return {"rows": len(rows), "columns": f.get("columns"), "first_row": rows[0] if rows else None}
 
     # ---------- studio ----------
 
@@ -306,7 +320,8 @@ class ToolBox:
                 else:
                     drafts[type] = cid
                 self.store.chat_settings(chat_id, studio=st)
-        return {"card_id": cid, "field": field, "ok": True}
+        report = self._field_report(cid, field, value)
+        return {"card_id": cid, "field": field, **({"ok": True} if not report.get("error") else {}), **report}
 
     def t_lore_add(self, chat_id, mid, title, text, keys="", kind="istilah", core=False, world_card_id=None):
         wid = int(world_card_id) if world_card_id else self._world_id(chat_id)
