@@ -957,3 +957,17 @@ def test_message_metadata_and_quant(nb, engine):
     wait_idle(engine)
     stats = nb["STORE"].msg(nb["STORE"].chat(chat)["head_id"])["meta"]["stats"]
     assert "quant" in stats and "yarn" in stats and "seed" in stats
+
+
+def test_chapters_end_compaction_pieces(engine, nb):
+    comp = engine.compactor
+    path = [{"id": i, "role": "user" if i % 2 == 0 else "assistant", "content": "x" * 3000, "reasoning": ""} for i in range(1, 41)]
+    old = comp.CHUNK_TOKENS
+    comp.CHUNK_TOKENS = 10_000
+    try:
+        plain = comp.chunks(path, 0, 39)
+        marked = comp.chunks(path, 0, 39, chapters=[path[9]["id"]])  # a chapter starts at the user message path[9]
+    finally:
+        comp.CHUNK_TOKENS = old
+    assert not any(b == 8 for _, b in plain)
+    assert any(b == 8 for _, b in marked)  # the piece before the chapter ends right before it

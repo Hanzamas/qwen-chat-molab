@@ -32,6 +32,7 @@ function render({ model, el }) {
       <button class="qr-icon qr-toggle" data-act="toggle-side" aria-label="Daftar chat">${icon("menu")}</button>
       <div class="qr-title" title="Klik dua kali untuk ganti nama"></div>
       <div class="qr-chips"></div>
+      <button class="qr-icon qr-toc-btn" data-act="toc" title="Daftar bab" hidden>${icon("bookmark")}</button>
       <button class="qr-icon" data-act="compact" title="Compact: padatkan konteks lama">${icon("archive")}</button>
       <button class="qr-icon" data-act="open-tab" data-tab="story" title="Cerita dan kartu">${icon("book")}</button>
       <button class="qr-icon" data-act="open-tab" data-tab="chat" title="Pengaturan">${icon("sliders")}</button>
@@ -296,6 +297,7 @@ function render({ model, el }) {
   }
   function renderHistory() {
     const h = model.get("history") || { items: [] };
+    $(".qr-toc-btn").hidden = !(h.chapters || []).length;
     const items = h.items || [];
     $(".qr-more").hidden = !(h.total > items.length);
     const empty = $(".qr-empty");
@@ -905,6 +907,8 @@ function render({ model, el }) {
       case "attach-card": { const cid = dbody.querySelector(".qr-attach-card").value; if (cid) send("story_attach", { card_id: Number(cid), role: dbody.querySelector(".qr-attach-role").value }); break; }
       case "detach": send("story_detach", { card_id: id, role: btn.dataset.role }); break;
       case "canon-save": { const box = btn.closest(".qr-canon"); const sec = box.dataset.sec || box.querySelector(".qr-canon-new").value.trim(); if (sec) send("canon", { section: sec, text: box.querySelector("textarea").value }); break; }
+      case "toc": { const h = model.get("history") || {}, cid = get("chat").id;
+        openModal("Daftar bab", (h.chapters || []).map((c) => `<button class="qr-libitem" data-act="jump-to" data-chat="${cid}" data-id="${c.id}">${icon("bookmark")}<b>${esc(c.title)}</b><span class="qr-muted">pesan ${c.n}</span></button>`).join("") || "Belum ada bab. Tandai dengan /bab atau tombol bab di balasan."); break; }
       case "props-make": send("proposals_make"); toast("Menyusun usulan…"); break;
       case "prop-yes": case "prop-no": send("proposal", { pid: Number(btn.closest("[data-pid]").dataset.pid), accept: act === "prop-yes" }); break;
       case "thread-add": { const box = btn.closest(".qr-threads"), title = box.querySelector(".qr-thread-title").value.trim();

@@ -4784,7 +4784,8 @@ def _(TXT, re, threading, time):
             budget = min(32768, max(4096, maxc // 16))
             think = 12000 if self.prompt.kwargs(self.prompt.ctx(chat_id)).get("enable_thinking", True) else 0
             done_any = False
-            for a, b in self.chunks(path, done_pos + 1, cutoff):
+            chapters = [r["message_id"] for r in self.store.q("SELECT message_id FROM chapters WHERE chat_id = ?", (chat_id,))]
+            for a, b in self.chunks(path, done_pos + 1, cutoff, chapters):
                 if self.cancel.is_set():
                     break
                 label = f"Meringkas pesan {a + 1}–{b + 1}…"
@@ -4809,13 +4810,19 @@ def _(TXT, re, threading, time):
                 self.prompt.new_epoch(chat_id)
             return self.measure(chat_id, tools)
 
-        def chunks(self, path, start, end):
-            """Split path[start..end] into ~CHUNK_TOKENS pieces that end right before a user message."""
+        def chunks(self, path, start, end, chapters=()):
+            """Split path[start..end] into ~CHUNK_TOKENS pieces that end right before a user message. A chapter mark on the
+            next turn ends a piece early (once it has a third of the size), so a summary does not straddle two chapters."""
             out, a, size = [], start, 0
+            chapters = set(chapters)
             for i in range(start, end + 1):
                 size += self.llm.estimate([{"content": path[i]["content"], "reasoning_content": path[i]["reasoning"]}])
                 nxt = path[i + 1] if i + 1 < len(path) else None
-                if size >= self.CHUNK_TOKENS and nxt is not None and nxt["role"] == "user" and i < end:
+                if nxt is None or nxt["role"] != "user" or i >= end:
+                    continue
+                turn = [path[j]["id"] for j in range(i + 1, min(len(path), i + 4)) if j == i + 1 or path[j]["role"] != "user"]
+                new_chapter = any(t in chapters for t in turn)
+                if size >= self.CHUNK_TOKENS or (new_chapter and size >= self.CHUNK_TOKENS / 3):
                     out.append((a, i))
                     a, size = i + 1, 0
             if a <= end:
@@ -7472,6 +7479,7 @@ def _():
           <button class="qr-icon qr-toggle" data-act="toggle-side" aria-label="Daftar chat">${icon("menu")}</button>
           <div class="qr-title" title="Klik dua kali untuk ganti nama"></div>
           <div class="qr-chips"></div>
+          <button class="qr-icon qr-toc-btn" data-act="toc" title="Daftar bab" hidden>${icon("bookmark")}</button>
           <button class="qr-icon" data-act="compact" title="Compact: padatkan konteks lama">${icon("archive")}</button>
           <button class="qr-icon" data-act="open-tab" data-tab="story" title="Cerita dan kartu">${icon("book")}</button>
           <button class="qr-icon" data-act="open-tab" data-tab="chat" title="Pengaturan">${icon("sliders")}</button>
@@ -7736,6 +7744,7 @@ def _():
       }
       function renderHistory() {
         const h = model.get("history") || { items: [] };
+        $(".qr-toc-btn").hidden = !(h.chapters || []).length;
         const items = h.items || [];
         $(".qr-more").hidden = !(h.total > items.length);
         const empty = $(".qr-empty");
@@ -8345,6 +8354,8 @@ def _():
           case "attach-card": { const cid = dbody.querySelector(".qr-attach-card").value; if (cid) send("story_attach", { card_id: Number(cid), role: dbody.querySelector(".qr-attach-role").value }); break; }
           case "detach": send("story_detach", { card_id: id, role: btn.dataset.role }); break;
           case "canon-save": { const box = btn.closest(".qr-canon"); const sec = box.dataset.sec || box.querySelector(".qr-canon-new").value.trim(); if (sec) send("canon", { section: sec, text: box.querySelector("textarea").value }); break; }
+          case "toc": { const h = model.get("history") || {}, cid = get("chat").id;
+            openModal("Daftar bab", (h.chapters || []).map((c) => `<button class="qr-libitem" data-act="jump-to" data-chat="${cid}" data-id="${c.id}">${icon("bookmark")}<b>${esc(c.title)}</b><span class="qr-muted">pesan ${c.n}</span></button>`).join("") || "Belum ada bab. Tandai dengan /bab atau tombol bab di balasan."); break; }
           case "props-make": send("proposals_make"); toast("Menyusun usulan…"); break;
           case "prop-yes": case "prop-no": send("proposal", { pid: Number(btn.closest("[data-pid]").dataset.pid), accept: act === "prop-yes" }); break;
           case "thread-add": { const box = btn.closest(".qr-threads"), title = box.querySelector(".qr-thread-title").value.trim();
