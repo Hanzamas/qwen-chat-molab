@@ -219,7 +219,7 @@ function render({ model, el }) {
     const b = (act, ic, title, id = it.id) => `<button class="qr-icon qr-xs" data-act="${act}" data-id="${id}" title="${title}">${icon(ic)}</button>`;
     const ba = (act, ic, title) => b(act, ic, title, it.answer_id || it.id);
     if (it.kind === "user") return `<div class="qr-actions">${sw}${it.has_note ? b("note-view", "eye", "Catatan sistem giliran ini") : ""}${b("copy", "copy", "Salin")}${b("edit", "edit", "Edit (membuat cabang)")}${b("pin", "pin", it.pinned ? "Lepas pin" : "Pin")}${b("branch", "branch", "Cabang dari sini")}${b("delete", "trash", "Hapus")}</div>`;
-    return `<div class="qr-actions">${sw}${b("copy", "copy", "Salin")}${b("reroll", "refresh", "Jawab ulang")}${b("continue", "forward", "Lanjutkan")}${ba("edit", "edit", "Edit")}${ba("pin", "pin", it.pinned ? "Lepas pin" : "Pin")}${ba("chapter", "bookmark", "Tandai bab")}${ba("fact-check", "flag", "Cek fakta")}${b("branch", "branch", "Cabang dari sini")}${b("delete", "trash", "Hapus")}</div>`;
+    return `<div class="qr-actions">${sw}${b("copy", "copy", "Salin")}${b("reroll", "refresh", "Jawab ulang")}${b("continue", "forward", "Lanjutkan")}${ba("edit", "edit", "Edit")}${ba("pin", "pin", it.pinned ? "Lepas pin" : "Pin")}${ba("chapter", "bookmark", "Tandai bab")}${ba("fact-check", "flag", "Cek fakta")}${ba("continuity", "users", "Cek kontinuitas")}${b("branch", "branch", "Cabang dari sini")}${b("delete", "trash", "Hapus")}</div>`;
   }
   function statsLine(st) {
     if (!st) return "";
@@ -265,7 +265,8 @@ function render({ model, el }) {
     const think = it.reasoning ? thinkBlock(`${k}-th`, it.reasoning, `Dipikirkan${it.stats && it.stats.think_s ? ` ${it.stats.think_s.toFixed(0)} dtk` : ""}`) : "";
     const dice = (it.dice || []).map((d) => `<span class="qr-dice ${d.success ? "ok" : "bad"}">${icon("dice")}${esc(d.event)} · ${Math.round(d.odds * 100)}% · ${d.success ? "berhasil" : "gagal"}</span>`).join("");
     const flags = (it.flags || []).map((f) => `<span class="qr-flag" title="${esc(f.text)}">${icon("warn")}${esc(f.text.length > 70 ? f.text.slice(0, 70) + "…" : f.text)}</span>`).join("");
-    const facts = (it.fact_warnings || []).map((f) => `<div class="qr-fact">${icon("flag")}<div><b>${esc(f.claim)}</b><br>${esc(f.correction)} ${f.source && /^https?:/.test(f.source) ? `<a href="${esc(f.source)}" target="_blank" rel="noopener noreferrer">sumber</a>` : esc(f.source || "")}</div></div>`).join("");
+    const cont = (it.continuity || []).map((x) => `<div class="qr-fact">${icon("warn")}<div><b>${esc(x.kind)}${x.who ? ` · ${esc(x.who)}` : ""}</b><br>${esc(x.text)}${x.fix ? ` <span class="qr-muted">→ ${esc(x.fix)}</span>` : ""}</div></div>`).join("");
+    const facts = cont + (it.fact_warnings || []).map((f) => `<div class="qr-fact">${icon("flag")}<div><b>${esc(f.claim)}</b><br>${esc(f.correction)} ${f.source && /^https?:/.test(f.source) ? `<a href="${esc(f.source)}" target="_blank" rel="noopener noreferrer">sumber</a>` : esc(f.source || "")}</div></div>`).join("");
     const choices = it.choices && it.choices.problems ? `<div class="qr-choices">${it.choices.problems.map((p, pi) => `
       <div class="qr-problem"><div class="qr-q">${esc(p.question)}</div>
       ${p.options.map((o, oi) => `<div class="qr-opt"><button class="qr-opt-main" data-act="choose" data-text="${esc(o)}">${esc(o)}</button>
@@ -818,6 +819,7 @@ function render({ model, el }) {
       case "pin": { const it = (model.get("history").items || []).find((x) => x.id === mid || x.answer_id === mid); send("pin", { mid, on: !(it && it.pinned) }); break; }
       case "chapter": { const t = prompt("Judul bab:"); if (t) send("chapter", { mid, title: t }); break; }
       case "fact-check": send("fact_check", { mid }); toast("Memeriksa fakta…"); break;
+      case "continuity": send("continuity", { mid }); toast("Cek kontinuitas…"); break;
       case "choose": send("choose", { text: btn.dataset.text }); fol.jump(); break;
       case "choose-edit": input.value = btn.dataset.text; grow(); input.focus(); break;
       case "think-follow": { const box = btn.parentElement.querySelector(".qr-think-box"); thinkFollow = true; btn.hidden = true; box.scrollTop = box.scrollHeight; break; }

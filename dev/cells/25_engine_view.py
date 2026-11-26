@@ -43,7 +43,7 @@ class EngineView:
                     sib = [k["id"] for k in kids.get(parent, []) if k["role"] == "assistant"]
                     cur = {"kind": "bot", "id": m["id"], "root": m["id"], "n": n, "ids": [], "content": "", "reasoning": "",
                            "tools": [], "stats": None, "flags": [], "choices": None, "dice": [], "pinned": False,
-                           "partial": False, "ooc": False, "fact_warnings": [],
+                           "partial": False, "ooc": False, "fact_warnings": [], "continuity": [],
                            "swipe": [sib.index(m["id"]) + 1 if m["id"] in sib else 1, max(1, len(sib))]}
                     items.append(cur)
                 cur["ids"].append(m["id"])
@@ -63,6 +63,7 @@ class EngineView:
                     cur["flags"] = meta.get("flags") or cur["flags"]
                     cur["choices"] = meta.get("choices") or cur["choices"]
                     cur["fact_warnings"] = meta.get("fact_warnings") or cur["fact_warnings"]
+                    cur["continuity"] = meta.get("continuity") or cur["continuity"]
                     cur["pinned"] = cur["pinned"] or bool(m["pinned"])
                     cur["partial"] = m["status"] == "partial"
                     cur["ooc"] = bool(m["ooc"])

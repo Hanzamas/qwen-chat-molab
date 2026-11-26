@@ -5284,7 +5284,7 @@ def _(TXT, hashlib, io, json, re, time, zipfile):
                         sib = [k["id"] for k in kids.get(parent, []) if k["role"] == "assistant"]
                         cur = {"kind": "bot", "id": m["id"], "root": m["id"], "n": n, "ids": [], "content": "", "reasoning": "",
                                "tools": [], "stats": None, "flags": [], "choices": None, "dice": [], "pinned": False,
-                               "partial": False, "ooc": False, "fact_warnings": [],
+                               "partial": False, "ooc": False, "fact_warnings": [], "continuity": [],
                                "swipe": [sib.index(m["id"]) + 1 if m["id"] in sib else 1, max(1, len(sib))]}
                         items.append(cur)
                     cur["ids"].append(m["id"])
@@ -5304,6 +5304,7 @@ def _(TXT, hashlib, io, json, re, time, zipfile):
                         cur["flags"] = meta.get("flags") or cur["flags"]
                         cur["choices"] = meta.get("choices") or cur["choices"]
                         cur["fact_warnings"] = meta.get("fact_warnings") or cur["fact_warnings"]
+                        cur["continuity"] = meta.get("continuity") or cur["continuity"]
                         cur["pinned"] = cur["pinned"] or bool(m["pinned"])
                         cur["partial"] = m["status"] == "partial"
                         cur["ooc"] = bool(m["ooc"])
@@ -5476,6 +5477,7 @@ def _(
     EMB,
     EngineView,
     Files,
+    KNOW,
     LLM_CLIENT,
     MEM,
     PROMPT,
@@ -5527,6 +5529,17 @@ def _(
     Jangan mengulang yang sudah tercatat dan jangan menebak hal yang tidak ada di narasi. Kalau tidak ada yang perlu dicatat,
     jawab "selesai" tanpa memanggil tool."""
 
+    CONTINUITY_CHECK = """Cek kontinuitas jawaban terakhir terhadap data di bawah. Tandai HANYA pertentangan yang jelas:
+    - pengetahuan: tokoh mengatakan atau memakai hal yang tidak ada di ingatannya (dan tidak ia saksikan di jawaban ini);
+    - lokasi: tokoh muncul atau bicara di tempat pemain padahal sedang di tempat lain dan tidak diceritakan datang;
+    - keadaan: tokoh yang mati, pergi, pingsan, atau ditahan bertindak seolah tidak;
+    - dadu: narasi tidak mengikuti hasil dadu giliran ini;
+    - suara: gaya bicara tokoh jauh dari contoh ucapannya.
+    Jangan menandai hal yang masuk akal atau tidak pasti. Jawab HANYA JSON:
+    {{"issues": [{{"kind": "pengetahuan|lokasi|keadaan|dadu|suara", "who": "nama", "text": "apa yang salah", "fix": "seharusnya"}}]}}
+
+    {data}"""
+
     FACTCHECK_CLAIMS = """Periksa jawaban terakhir. Daftarkan klaim fakta {kind} yang spesifik di dalamnya (tanggal, angka, nama
     satuan, senjata, pangkat, tempat, prosedur), bukan hal fiksi cerita. Maksimal 6. Jawab HANYA JSON: {{"claims": ["..."]}}"""
 
@@ -5568,6 +5581,7 @@ def _(
             self.last_activity = time.time()
             self.bg_busy = False
             self.fact_jobs = []
+            self.continuity_jobs = []
             self.backfilled = False
             self.dead = False
             self.importing = False
@@ -5662,6 +5676,7 @@ def _(
                 with self.lock:
                     self.queue.clear()
                 self.fact_jobs.clear()
+                self.continuity_jobs.clear()
                 self.last_used.clear()
                 self.active_chat = 0
                 EMB.cache.clear()
@@ -6127,6 +6142,28 @@ def _(
                             self._rewriting = False
             elif mode == "latar":
                 self.fact_jobs.append((chat_id, mid))
+            # continuity
+            cmode = self.prompt.gm(c).get("continuity_check") or "latar"
+            if cmode == "ketat" and not getattr(self, "_rewriting", False) and not self.stop.is_set():
+                self.emit("live", {"active": True, "content": m["content"], "phase": "Cek kontinuitas…", "reasoning": "",
+                                   "tools": [], "chat_id": chat_id})
+                issues = self._continuity_check(chat_id, mid, True, stop=self.stop)
+                self.emit("live", {})
+                if issues and not self.stop.is_set():
+                    u = self._turn_user(chat_id, mid)
+                    if u:
+                        self.store.set_head(chat_id, u["id"])
+                        note = "Koreksi kontinuitas untuk giliran ini (jawaban sebelumnya keliru):\n" + "\n".join(
+                            f"- {i.get('who', '')}: {i.get('text', '')} -> {i.get('fix', '')}" for i in issues)
+                        self.emit("toast", {"text": f"{len(issues)} masalah kontinuitas; jawaban ditulis ulang. Versi lama bisa digeser.",
+                                            "kind": "warn"})
+                        self._rewriting = True
+                        try:
+                            self._turn(chat_id, extra=[note])
+                        finally:
+                            self._rewriting = False
+            elif cmode == "latar":
+                self.continuity_jobs.append((chat_id, mid))
 
         def _state_check(self, chat_id, mid, c, path, full):
             """Side task after a turn: record what the narration shows but no tool recorded. Thinking off, few tokens.
@@ -6291,6 +6328,72 @@ def _(
             if announce:
                 self.emit("toast", {"text": f"Cek fakta: {len(warnings)} klaim salah." if warnings else "Cek fakta: tidak ada yang salah."})
             return warnings
+
+        # ---------- continuity ----------
+
+        def continuity_data(self, chat_id, mid):
+            """What the check compares the reply with: who is where and in what state, what the named people know,
+            the dice of this turn, and how each speaks."""
+            c = self.prompt.ctx(chat_id)
+            path = self.store.path(chat_id, head=mid)
+            ids = [x["id"] for x in path]
+            full, _ = self._turn_text(path, mid)
+            st = self.world.state(chat_id, ids)
+            status = st["status"]
+            here = (status.get("player") or {}).get("location") or "?"
+            low = full.lower()
+            lines = [f"Lokasi pemain: {here}"]
+            for ch in c["cards"]["character"]:
+                s = status.get(ch["name"]) or {}
+                names = [ch["name"]] + list(ch["data"].get("aliases") or [])
+                named = any(n and n.lower() in low for n in names)
+                lines.append(f"- {ch['name']}: lokasi {s.get('location') or '?'}, keadaan {s.get('keadaan') or 'hidup'}"
+                             + ("" if named else " (tidak disebut di jawaban ini)"))
+                if named:
+                    heads = KNOW.relevant(chat_id, ch["name"], full, limit=12)
+                    if heads:
+                        lines.append("  ingatan:\n" + "\n".join("  " + KNOW.line(r) for r in heads))
+                    samples = ch["data"].get("speech_samples") or []
+                    if samples:
+                        lines.append("  contoh ucapan: " + " / ".join(f'"{x}"' for x in samples[:5]))
+            start = ids.index(mid) if mid in ids else len(ids) - 1
+            while start > 0 and path[start - 1]["role"] != "user":
+                start -= 1
+            dice = [d for i in ids[start:] for d in self.world.dice_for([i]).get(i, [])]
+            if dice:
+                lines.append("Hasil dadu giliran ini:\n" + "\n".join(
+                    f"- {d['event']}: {'BERHASIL' if d['success'] else 'GAGAL'} ({d['odds']:.0%})" for d in dice))
+            return "\n".join(lines), full
+
+        def _continuity_check(self, chat_id, mid, announce=False, stop=None):
+            stop = stop or (self.stop if announce else self.bg_cancel)
+            c = self.prompt.ctx(chat_id)
+            m = self.store.msg(mid)
+            if not m or c["kind"] not in ("rp", "group"):
+                return []
+            data, full = self.continuity_data(chat_id, mid)
+            if not full.strip():
+                return []
+            acc = self.llm.complete(self.prompt.side(chat_id, CONTINUITY_CHECK.format(data=data), path=self.store.path(chat_id, head=mid)),
+                                    kwargs=self.prompt.kwargs(c), sampling={"temperature": 0.2}, max_tokens=6000,
+                                    tools=self.tools.specs(c), stop=stop)
+            if acc["finish"] == "stopped" or stop.is_set():
+                if not announce:
+                    self.continuity_jobs.insert(0, (chat_id, mid))
+                return []
+            issues = []
+            for i in (self._json(acc["content"]) or {}).get("issues") or []:
+                if isinstance(i, dict) and str(i.get("text", "")).strip():
+                    issues.append({k: str(i.get(k, ""))[:400] for k in ("kind", "who", "text", "fix")})
+            m = self.store.msg(mid)
+            m["meta"]["continuity"] = issues[:8]
+            m["meta"]["continuity_checked"] = True
+            self.store.update_message(mid, meta=m["meta"])
+            self.store.side_log("continuity", {"issues": issues, "data": data}, chat_id, mid)
+            self.emit("history", chat_id)
+            if announce:
+                self.emit("toast", {"text": f"Cek kontinuitas: {len(issues)} masalah." if issues else "Cek kontinuitas: aman."})
+            return issues
 
         # ---------- tree operations ----------
 
@@ -6503,6 +6606,10 @@ def _(
                 while self.fact_jobs and not self.busy and not self.bg_cancel.is_set():
                     chat_id, mid = self.fact_jobs.pop(0)
                     self._fact_check(chat_id, mid, False)
+                while self.continuity_jobs and not self.busy and not self.bg_cancel.is_set():
+                    chat_id, mid = self.continuity_jobs.pop(0)
+                    if self.store.msg(mid):
+                        self._continuity_check(chat_id, mid, False)
                 chat_id = self.active_chat
                 chat = self.store.chat(chat_id) if chat_id else None
                 if not chat:
@@ -7107,7 +7214,7 @@ def _():
         const b = (act, ic, title, id = it.id) => `<button class="qr-icon qr-xs" data-act="${act}" data-id="${id}" title="${title}">${icon(ic)}</button>`;
         const ba = (act, ic, title) => b(act, ic, title, it.answer_id || it.id);
         if (it.kind === "user") return `<div class="qr-actions">${sw}${it.has_note ? b("note-view", "eye", "Catatan sistem giliran ini") : ""}${b("copy", "copy", "Salin")}${b("edit", "edit", "Edit (membuat cabang)")}${b("pin", "pin", it.pinned ? "Lepas pin" : "Pin")}${b("branch", "branch", "Cabang dari sini")}${b("delete", "trash", "Hapus")}</div>`;
-        return `<div class="qr-actions">${sw}${b("copy", "copy", "Salin")}${b("reroll", "refresh", "Jawab ulang")}${b("continue", "forward", "Lanjutkan")}${ba("edit", "edit", "Edit")}${ba("pin", "pin", it.pinned ? "Lepas pin" : "Pin")}${ba("chapter", "bookmark", "Tandai bab")}${ba("fact-check", "flag", "Cek fakta")}${b("branch", "branch", "Cabang dari sini")}${b("delete", "trash", "Hapus")}</div>`;
+        return `<div class="qr-actions">${sw}${b("copy", "copy", "Salin")}${b("reroll", "refresh", "Jawab ulang")}${b("continue", "forward", "Lanjutkan")}${ba("edit", "edit", "Edit")}${ba("pin", "pin", it.pinned ? "Lepas pin" : "Pin")}${ba("chapter", "bookmark", "Tandai bab")}${ba("fact-check", "flag", "Cek fakta")}${ba("continuity", "users", "Cek kontinuitas")}${b("branch", "branch", "Cabang dari sini")}${b("delete", "trash", "Hapus")}</div>`;
       }
       function statsLine(st) {
         if (!st) return "";
@@ -7153,7 +7260,8 @@ def _():
         const think = it.reasoning ? thinkBlock(`${k}-th`, it.reasoning, `Dipikirkan${it.stats && it.stats.think_s ? ` ${it.stats.think_s.toFixed(0)} dtk` : ""}`) : "";
         const dice = (it.dice || []).map((d) => `<span class="qr-dice ${d.success ? "ok" : "bad"}">${icon("dice")}${esc(d.event)} · ${Math.round(d.odds * 100)}% · ${d.success ? "berhasil" : "gagal"}</span>`).join("");
         const flags = (it.flags || []).map((f) => `<span class="qr-flag" title="${esc(f.text)}">${icon("warn")}${esc(f.text.length > 70 ? f.text.slice(0, 70) + "…" : f.text)}</span>`).join("");
-        const facts = (it.fact_warnings || []).map((f) => `<div class="qr-fact">${icon("flag")}<div><b>${esc(f.claim)}</b><br>${esc(f.correction)} ${f.source && /^https?:/.test(f.source) ? `<a href="${esc(f.source)}" target="_blank" rel="noopener noreferrer">sumber</a>` : esc(f.source || "")}</div></div>`).join("");
+        const cont = (it.continuity || []).map((x) => `<div class="qr-fact">${icon("warn")}<div><b>${esc(x.kind)}${x.who ? ` · ${esc(x.who)}` : ""}</b><br>${esc(x.text)}${x.fix ? ` <span class="qr-muted">→ ${esc(x.fix)}</span>` : ""}</div></div>`).join("");
+        const facts = cont + (it.fact_warnings || []).map((f) => `<div class="qr-fact">${icon("flag")}<div><b>${esc(f.claim)}</b><br>${esc(f.correction)} ${f.source && /^https?:/.test(f.source) ? `<a href="${esc(f.source)}" target="_blank" rel="noopener noreferrer">sumber</a>` : esc(f.source || "")}</div></div>`).join("");
         const choices = it.choices && it.choices.problems ? `<div class="qr-choices">${it.choices.problems.map((p, pi) => `
           <div class="qr-problem"><div class="qr-q">${esc(p.question)}</div>
           ${p.options.map((o, oi) => `<div class="qr-opt"><button class="qr-opt-main" data-act="choose" data-text="${esc(o)}">${esc(o)}</button>
@@ -7706,6 +7814,7 @@ def _():
           case "pin": { const it = (model.get("history").items || []).find((x) => x.id === mid || x.answer_id === mid); send("pin", { mid, on: !(it && it.pinned) }); break; }
           case "chapter": { const t = prompt("Judul bab:"); if (t) send("chapter", { mid, title: t }); break; }
           case "fact-check": send("fact_check", { mid }); toast("Memeriksa fakta…"); break;
+          case "continuity": send("continuity", { mid }); toast("Cek kontinuitas…"); break;
           case "choose": send("choose", { text: btn.dataset.text }); fol.jump(); break;
           case "choose-edit": input.value = btn.dataset.text; grow(); input.focus(); break;
           case "think-follow": { const box = btn.parentElement.querySelector(".qr-think-box"); thinkFollow = true; btn.hidden = true; box.scrollTop = box.scrollHeight; break; }
@@ -8757,6 +8866,9 @@ def _(
 
         def c_recall_test(self):
             self.engine.recall_test(self._cur())
+
+        def c_continuity(self, mid):
+            self.engine.run(self.engine._continuity_check, self._cur(), int(mid), True)
 
         def c_fact_check(self, mid):
             self.engine.run(self.engine._fact_check, self._cur(), int(mid), True)

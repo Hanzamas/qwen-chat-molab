@@ -487,6 +487,9 @@ class ChatApp:
     def c_recall_test(self):
         self.engine.recall_test(self._cur())
 
+    def c_continuity(self, mid):
+        self.engine.run(self.engine._continuity_check, self._cur(), int(mid), True)
+
     def c_fact_check(self, mid):
         self.engine.run(self.engine._fact_check, self._cur(), int(mid), True)
 

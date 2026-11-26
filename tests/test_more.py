@@ -752,3 +752,43 @@ def test_panel_shows_only_what_the_player_sees(engine, nb):
     S.chat_settings(chat, gm_view=True)
     p = engine.panels(chat)
     assert p["characters_gm"]["Lotte Braun"]["plan_now"] == "Kabur malam ini" and "Otto" in p["characters_gm"]
+
+
+def test_continuity_check_flags_and_strict_rewrites(engine, nb, fake):
+    chat, _ = _story(nb, engine)
+    S, W, K, C = nb["STORE"], nb["WORLD"], nb["KNOW"], nb["CARDS"]
+    S.chat_settings(chat, length="pendek")
+    engine.send(chat, "Halo.")
+    wait_idle(engine)
+    head = S.chat(chat)["head_id"]
+    W.status_update(chat, head, "player", {"location": "Dapur"})
+    W.status_update(chat, head, "Lotte Braun", {"location": "Dapur"})
+    K.add(chat, head, ["Lotte Braun"], "Raka suka kopi hitam")
+    W.roll(chat, head, "membuka pintu macet", 0.3)
+    data, _ = engine.continuity_data(chat, head)
+    assert "Lotte Braun: lokasi Dapur" in data and "Raka suka kopi hitam" in data
+    # background mode only queues the job
+    engine.continuity_jobs.clear()
+    fake["script"].append({"content": "Lotte bilang kamu dulu tinggal di Wina."})
+    engine.send(chat, "Lotte, ingat aku?")
+    wait_idle(engine)
+    assert engine.continuity_jobs
+    mid = engine.continuity_jobs.pop(0)[1]
+    fake["script"].append({"content": json.dumps({"issues": [{"kind": "pengetahuan", "who": "Lotte Braun",
+                                                              "text": "tahu soal Wina", "fix": "Lotte tidak tahu"}]})})
+    issues = engine._continuity_check(chat, mid, True)
+    assert issues and issues[0]["kind"] == "pengetahuan"
+    item = engine.display(chat)["items"][-1]
+    assert item["continuity"][0]["who"] == "Lotte Braun"
+    # strict mode writes the turn again with the correction
+    gm = nb["STORIES"].cards_of(S.chat(chat)["story_id"])["gm"]
+    C.set_field(gm["id"], "continuity_check", "ketat")
+    nb["STORIES"].refresh_versions(S.chat(chat)["story_id"])
+    fake["script"] += [{"content": "Lotte bilang kamu dulu tinggal di Wina."},
+                       {"content": json.dumps({"issues": [{"kind": "pengetahuan", "who": "Lotte Braun", "text": "Wina",
+                                                           "fix": "tidak tahu"}]})},
+                       {"content": "Lotte menatapmu, mencoba mengingat."}]
+    engine.send(chat, "Kita pernah bertemu?")
+    wait_idle(engine, 60)
+    last = engine.display(chat)["items"][-1]
+    assert last["content"].startswith("Lotte menatapmu") and last["swipe"] == [2, 2]
