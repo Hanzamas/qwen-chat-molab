@@ -212,7 +212,7 @@ class World:
         kinds = [x.strip() for x in str(pick[3] or "cerah").split(",") if x.strip()] or ["cerah"]
         a = round(rng.uniform(lo, (lo + hi) / 2))
         b = round(rng.uniform((lo + hi) / 2, hi))
-        return {"text": f"{rng.choice(kinds)}, {a}-{b}°C"}
+        return {"text": f"{rng.choice(kinds)}, {a}° s/d {b}°C"}
 
     def due_timeline(self, chat_id, cards, now, path_ids):
         world = cards.get("world")

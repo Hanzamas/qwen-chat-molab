@@ -150,9 +150,14 @@ class TXT:
 
     @staticmethod
     def split_dialogue(text):
-        """Count quotes that hold only one or two words and are followed by a short translation,
-        the "Das..." (Itu) "...ist..." pattern."""
-        return len(re.findall(r"[\"“„][^\"”“]{0,25}[\"”]\s*\([^()]{1,30}\)", text or ""))
+        """Count quote fragments followed by a short translation: the "Das..." (Itu) "...ist..." pattern.
+        A fragment has an ellipsis or at most two words; a whole short sentence does not count."""
+        n = 0
+        for m in re.finditer(r"[\"“„]([^\"”“]{0,40})[\"”]\s*\(([^()]{1,30})\)", text or ""):
+            inner = m.group(1).strip()
+            if "..." in inner or "…" in inner or len(inner.split()) <= 2:
+                n += 1
+        return n
 
     ACTS_FOR_USER = re.compile(
         r"\b(kamu|Kamu|anda|Anda)\s+(berkata|bilang|menjawab|bertanya|berteriak|berbisik|mengatakan|memutuskan|"

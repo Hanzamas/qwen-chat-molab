@@ -179,6 +179,9 @@ class Engine(EngineView):
         self.active_chat = chat_id
         if parsed["kind"] == "slash":
             return self.slash(chat_id, parsed["cmd"], parsed["arg"])
+        m = re.match(r"^\s*ubah\s*:\s*(.+)$", parsed.get("text", ""), re.S | re.I)
+        if parsed["kind"] == "ooc" and m and (self.store.chat(chat_id) or {}).get("kind") in ("rp", "group"):
+            return self.slash(chat_id, "studio", m.group(1).strip())
         return self.run(self._send, chat_id, parsed, files or [], queue_text=text)
 
     def slash(self, chat_id, cmd, arg):

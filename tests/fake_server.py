@@ -6,6 +6,7 @@ Replies are chosen from the last message, so every feature of the chat has a pre
 
 import json
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 STATE = {"max_len": 200_000, "log": [], "script": [], "fail_next": False}
@@ -18,6 +19,20 @@ NARRATION = "\n\n".join(
     f"Dia menunggu jawabanmu dengan alis sedikit terangkat."
     for i in range(1, 7)
 )
+
+
+SYNONYMS = {"coffee": "kopi", "kaffee": "kopi", "tea": "teh", "tee": "teh"}
+
+
+def _embed(text):
+    """Bag of words hashed into 64 dims, with a few synonyms folded together, so a paraphrase can match
+    where keyword search cannot."""
+    import re
+    vec = [0.0] * 64
+    for w in re.findall(r"\w+", text.split("Query: ")[-1].lower()):
+        w = SYNONYMS.get(w, w)
+        vec[sum(map(ord, w)) % 64] += 1.0
+    return vec
 
 
 def _last_text(messages):
@@ -74,6 +89,8 @@ def _reply(body):
         if last_role == "tool":
             return {"content": "Buku cerita diperbarui."}
         return {"tool_calls": [{"name": "canon_set", "arguments": json.dumps({"section": "Catatan", "text": "Sersan lebih tua."})}]}
+    if "SLOWTEST" in text:
+        return {"content": NARRATION + "\n\n" + NARRATION, "slow": 0.15}
     if "TOOLTEST" in user_texts and last_role == "user":
         return {"tool_calls": [
             {"name": "world_advance", "arguments": json.dumps({"minutes": 30})},
@@ -106,6 +123,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
+        if self.path == "/v1/embeddings":
+            return self._json({"data": [{"index": i, "embedding": _embed(t)} for i, t in enumerate(body["input"])]})
         if self.path == "/tokenize":
             return self._json({"count": len(json.dumps(body.get("messages", []), ensure_ascii=False)) // 3})
         if self.path != "/v1/chat/completions":
@@ -128,8 +147,12 @@ class Handler(BaseHTTPRequestHandler):
         if r.get("reasoning"):
             send({"choices": [{"index": 0, "delta": {"reasoning_content": r["reasoning"]}}]})
         content = r.get("content", "")
-        for i in range(0, len(content), max(1, len(content) // 3 + 1)):
-            send({"choices": [{"index": 0, "delta": {"content": content[i:i + len(content) // 3 + 1]}}]})
+        pieces = 40 if r.get("slow") else 3
+        step = max(1, len(content) // pieces + 1)
+        for i in range(0, len(content), step):
+            send({"choices": [{"index": 0, "delta": {"content": content[i:i + step]}}]})
+            if r.get("slow"):
+                time.sleep(r["slow"])
         for i, tc in enumerate(r.get("tool_calls") or []):
             send({"choices": [{"index": 0, "delta": {"tool_calls": [
                 {"index": i, "id": f"call_{len(STATE['log'])}_{i}", "function": {"name": tc["name"], "arguments": tc["arguments"]}}]}}]})

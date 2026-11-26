@@ -21,6 +21,7 @@ def test_sentences_and_shape(nb):
     assert T.fts_query("yang dan di") == ""
     assert T.dedupe_parens('"Ja." (Iya.) (Iya)') == '"Ja." (Iya.)'
     assert T.split_dialogue('"Das..." (Itu) "...ist..." (adalah) "...gut" (bagus)') == 3
+    assert T.split_dialogue('"Es ist kalt heute." (Hari ini dingin.) "Komm mit mir nach Hause." (Ikut aku pulang.)') == 0
     assert T.acts_for_user("Kamu berkata pelan bahwa kamu lelah.")
 
 
@@ -250,3 +251,54 @@ def test_export_and_misc(engine, nb):
     assert pv["tokens"] > 0 and "Kartu" in pv["system"]
     eng.delete_msg(chat, nb["STORE"].chat(chat)["head_id"])
     assert eng.display(chat)["items"][-1]["kind"] == "user"
+
+
+def test_ubah_routes_to_story_book(engine, nb):
+    eng = engine
+    chat, _ = _story(nb, eng)
+    eng.send(chat, "((ubah: sersannya jadi lebih tua))")
+    wait_idle(eng)
+    sid = nb["STORE"].chat(chat)["story_id"]
+    assert nb["STORIES"].get(sid)["data"]["canon"].get("Catatan") == "Sersan lebih tua."
+    assert nb["STORIES"].pending_list(sid, chat)
+
+
+def test_afk_catch_up_runs_world_tick(engine, nb):
+    eng = engine
+    chat, _ = _story(nb, eng)
+    nb["STORE"].chat_settings(chat, world_sync=time.time() - 3 * 3600)
+    eng.send(chat, "Aku kembali ke ruang tengah.")
+    wait_idle(eng)
+    p = eng.panels(chat)
+    assert p["time"].endswith(("00:00", "00:01")), p["time"]  # 21:00 + 3 jam
+    assert any("Frau Brunner" in e["text"] for e in p["events"])
+
+
+def test_group_chat_note(engine, nb, fake):
+    C = nb["CARDS"]
+    a = C.save(None, "character", {"name": "Anna"})
+    b = C.save(None, "character", {"name": "Ben"})
+    chat = engine.start_story({"character": [a, b]})
+    assert nb["STORE"].chat(chat)["kind"] == "group"
+    engine.send(chat, "@Ben halo semua")
+    wait_idle(engine)
+    main = next(b for b in reversed(fake["log"]) if "halo semua" in json.dumps(b["messages"][-1], ensure_ascii=False))
+    assert "yang bereaksi/bicara: Ben" in json.dumps(main["messages"][-1], ensure_ascii=False)
+
+
+def test_hybrid_recall_with_embedder(nb, monkeypatch):
+    import os
+    base = os.environ["QCHAT_BASE_URL"].removesuffix("/v1")
+    monkeypatch.setenv("QCHAT_EMBED_URL", base)
+    M, E, S = nb["MEM"], nb["EMB"], nb["STORE"]
+    assert E.ready()
+    ctx = {"chat_id": None, "story_id": None, "card_ids": []}
+    mid = M.save("Raka selalu minum kopi tubruk tiap pagi", "user", ctx)["saved"]
+    for _ in range(100):
+        if S.one("SELECT 1 AS x FROM vectors WHERE kind = 'mem' AND ref_id = ?", (mid,)):
+            break
+        time.sleep(0.05)
+    E.cache.clear()
+    rows = M.search("coffee", ctx, limit=5)  # no keyword overlap: only the vector side can find it
+    assert any(r["id"] == mid for r in rows), rows
+    monkeypatch.setenv("QCHAT_EMBED_URL", "http://127.0.0.1:9")

@@ -1587,9 +1587,14 @@ def _(re):
 
         @staticmethod
         def split_dialogue(text):
-            """Count quotes that hold only one or two words and are followed by a short translation,
-            the "Das..." (Itu) "...ist..." pattern."""
-            return len(re.findall(r"[\"“„][^\"”“]{0,25}[\"”]\s*\([^()]{1,30}\)", text or ""))
+            """Count quote fragments followed by a short translation: the "Das..." (Itu) "...ist..." pattern.
+            A fragment has an ellipsis or at most two words; a whole short sentence does not count."""
+            n = 0
+            for m in re.finditer(r"[\"“„]([^\"”“]{0,40})[\"”]\s*\(([^()]{1,30})\)", text or ""):
+                inner = m.group(1).strip()
+                if "..." in inner or "…" in inner or len(inner.split()) <= 2:
+                    n += 1
+            return n
 
         ACTS_FOR_USER = re.compile(
             r"\b(kamu|Kamu|anda|Anda)\s+(berkata|bilang|menjawab|bertanya|berteriak|berbisik|mengatakan|memutuskan|"
@@ -2216,7 +2221,7 @@ def _(CARDS, STORE, json, time):
 
 
     STORIES = Stories(STORE, CARDS)
-    return (STORIES,)
+    return STORIES, Stories
 
 
 @app.cell(hide_code=True)
@@ -2435,7 +2440,7 @@ def _(CARDS, STORE, STORIES, datetime, json, random, re, time, timedelta):
             kinds = [x.strip() for x in str(pick[3] or "cerah").split(",") if x.strip()] or ["cerah"]
             a = round(rng.uniform(lo, (lo + hi) / 2))
             b = round(rng.uniform((lo + hi) / 2, hi))
-            return {"text": f"{rng.choice(kinds)}, {a}-{b}°C"}
+            return {"text": f"{rng.choice(kinds)}, {a}° s/d {b}°C"}
 
         def due_timeline(self, chat_id, cards, now, path_ids):
             world = cards.get("world")
@@ -4262,7 +4267,7 @@ def _(TXT, hashlib, io, json, re, time, zipfile):
                     "characters": {k: v for k, v in st["status"].items() if k != "player"},
                     "weather": wthr["text"] if wthr else "", "events": [{"id": e["id"], "time": e["world_time"], "text": e["text"],
                                                                          "new": not e["shown"]} for e in events],
-                    "time_skips": gm.get("time_skips") or [], "persona": persona["name"] if persona else "",
+                    "time_skips": gm.get("time_skips") or ["2 jam", "1 hari", "1 minggu"], "persona": persona["name"] if persona else "",
                     "story": (c["story"] or {}).get("title", "")}
 
         def branches(self, chat_id):
@@ -4572,6 +4577,9 @@ def _(
             self.active_chat = chat_id
             if parsed["kind"] == "slash":
                 return self.slash(chat_id, parsed["cmd"], parsed["arg"])
+            m = re.match(r"^\s*ubah\s*:\s*(.+)$", parsed.get("text", ""), re.S | re.I)
+            if parsed["kind"] == "ooc" and m and (self.store.chat(chat_id) or {}).get("kind") in ("rp", "group"):
+                return self.slash(chat_id, "studio", m.group(1).strip())
             return self.run(self._send, chat_id, parsed, files or [], queue_text=text)
 
         def slash(self, chat_id, cmd, arg):
@@ -5294,6 +5302,1836 @@ def _(
                 self.emit("toast", {"text": "Tunggu balasan selesai dulu.", "kind": "warn"})
                 return
             threading.Thread(target=job, daemon=True).start()
+
+    return (Engine,)
+
+
+@app.cell(hide_code=True)
+def _():
+    UI_BASE_JS = r"""
+    const ICONS = {
+      plus: '<path d="M12 5v14M5 12h14"/>',
+      send: '<path d="M12 19V5M5 12l7-7 7 7"/>',
+      stop: '<rect x="6.5" y="6.5" width="11" height="11" rx="2"/>',
+      copy: '<rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/>',
+      edit: '<path d="M4 20h4L19 9l-4-4L4 16v4z"/><path d="M13.5 6.5l4 4"/>',
+      refresh: '<path d="M20 11a8 8 0 0 0-14.9-3.8L4 8"/><path d="M4 4v4h4"/><path d="M4 13a8 8 0 0 0 14.9 3.8L20 16"/><path d="M20 20v-4h-4"/>',
+      trash: '<path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13"/>',
+      left: '<path d="M15 6l-6 6 6 6"/>', right: '<path d="M9 6l6 6-6 6"/>', down: '<path d="M6 9l6 6 6-6"/>',
+      menu: '<path d="M4 6h16M4 12h16M4 18h16"/>',
+      sliders: '<path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12"/><circle cx="16" cy="6" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="18" cy="18" r="2"/>',
+      search: '<circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/>',
+      clip: '<path d="M21 11l-8.5 8.5a5 5 0 0 1-7-7L14 4a3.5 3.5 0 0 1 5 5l-8.5 8.5a2 2 0 0 1-3-3L15 7"/>',
+      arrowdown: '<path d="M12 5v14M5 12l7 7 7-7"/>',
+      branch: '<circle cx="6" cy="5" r="2"/><circle cx="6" cy="19" r="2"/><circle cx="18" cy="8" r="2"/><path d="M6 7v10M18 10c0 4-6 3-12 7"/>',
+      pin: '<path d="M9 4h6l-1 6 3 3H7l3-3-1-6zM12 13v7"/>',
+      book: '<path d="M4 5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2V5z"/><path d="M4 19a2 2 0 0 1 2-2h13"/>',
+      sparkles: '<path d="M12 3l1.8 4.7 4.7 1.8-4.7 1.8L12 16l-1.8-4.7-4.7-1.8 4.7-1.8L12 3z"/><path d="M19 15l.8 2 2 .8-2 .8-.8 2-.8-2-2-.8 2-.8.8-2z"/>',
+      archive: '<rect x="3" y="4" width="18" height="4" rx="1"/><path d="M5 8v11h14V8M10 12h4"/>',
+      chat: '<path d="M4 5h16v11H8l-4 4V5z"/>',
+      users: '<circle cx="9" cy="8" r="3"/><path d="M3 20a6 6 0 0 1 12 0"/><circle cx="17" cy="9" r="2.5"/><path d="M15 14a5 5 0 0 1 6 5"/>',
+      cloud: '<path d="M7 18h10a4 4 0 0 0 .5-8A6 6 0 0 0 6 9a4.5 4.5 0 0 0 1 9z"/>',
+      clock: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
+      dice: '<rect x="4" y="4" width="16" height="16" rx="3"/><circle cx="9" cy="9" r="1"/><circle cx="15" cy="15" r="1"/><circle cx="15" cy="9" r="1"/><circle cx="9" cy="15" r="1"/>',
+      warn: '<path d="M12 4l9 16H3L12 4z"/><path d="M12 10v4M12 17v.5"/>',
+      check: '<path d="M5 12l5 5 9-10"/>', x: '<path d="M6 6l12 12M18 6L6 18"/>',
+      wand: '<path d="M4 20L15 9M14 4v3M18 6h-3M20 10h-3M17 13v-3"/>',
+      forward: '<path d="M5 6l7 6-7 6M13 6l7 6-7 6"/>',
+      eye: '<path d="M2 12s4-7 10-7 10 7 10 7-4 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/>',
+      lock: '<rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/>',
+      download: '<path d="M12 4v11M7 10l5 5 5-5M5 20h14"/>', upload: '<path d="M12 20V9M7 14l5-5 5 5M5 4h14"/>',
+      brain: '<path d="M9 4a3 3 0 0 0-3 3 3 3 0 0 0-2 5 3 3 0 0 0 3 5 3 3 0 0 0 5 1V5a3 3 0 0 0-3-1zM15 4a3 3 0 0 1 3 3 3 3 0 0 1 2 5 3 3 0 0 1-3 5 3 3 0 0 1-5 1"/>',
+      tool: '<path d="M14 6a4 4 0 0 0 5 5l-9 9-3-3 9-9a4 4 0 0 0-2-2z"/>',
+      globe: '<circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c3 3 3 15 0 18M12 3c-3 3-3 15 0 18"/>',
+      card: '<rect x="4" y="3" width="16" height="18" rx="2"/><circle cx="12" cy="10" r="3"/><path d="M8 17a4 4 0 0 1 8 0"/>',
+      bookmark: '<path d="M6 3h12v18l-6-4-6 4V3z"/>',
+      learn: '<path d="M2 9l10-5 10 5-10 5-10-5z"/><path d="M6 11v5c3 2 9 2 12 0v-5"/>',
+      cpu: '<rect x="6" y="6" width="12" height="12" rx="2"/><path d="M9 2v4M15 2v4M9 18v4M15 18v4M2 9h4M2 15h4M18 9h4M18 15h4"/>',
+      more: '<circle cx="5" cy="12" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/>',
+      flag: '<path d="M5 21V4h11l-2 4 2 4H5"/>', skip: '<path d="M5 5l9 7-9 7V5zM17 5v14"/>',
+      map: '<path d="M9 4l6 2 5-2v14l-5 2-6-2-5 2V6l5-2zM9 4v14M15 6v14"/>',
+    };
+    const icon = (n, cls = "") => `<svg class="qi ${cls}" viewBox="0 0 24 24" aria-hidden="true">${ICONS[n] || ""}</svg>`;
+    const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+    const words = (s) => (String(s || "").trim().match(/\S+/g) || []).length;
+    const fmtN = (n) => Number(n || 0).toLocaleString("id-ID");
+    const ago = (t) => {
+      if (!t) return "belum";
+      const m = Math.floor((Date.now() / 1000 - t) / 60);
+      return m < 1 ? "baru saja" : m < 60 ? `${m} mnt lalu` : m < 1440 ? `${Math.floor(m / 60)} jam lalu` : `${Math.floor(m / 1440)} hari lalu`;
+    };
+    const kb = (n) => n > 1048576 ? `${(n / 1048576).toFixed(1)} MB` : `${Math.max(1, Math.round(n / 1024))} KB`;
+    const readB64 = (f) => new Promise((ok, fail) => {
+      const r = new FileReader();
+      r.onload = () => ok(String(r.result).split(",")[1] || "");
+      r.onerror = () => fail(r.error);
+      r.readAsDataURL(f);
+    });
+
+    // Markdown subset, escape-first: nothing from the model is ever inserted as raw HTML.
+    function inline(s, learn) {
+      let t = esc(s);
+      t = t.replace(/`([^`\n]+)`/g, "<code>$1</code>");
+      t = t.replace(/\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+      t = t.replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>");
+      t = t.replace(/(^|[\s(])\*([^*\n]+)\*(?=[\s).,!?;:]|$)/g, "$1<em>$2</em>");
+      t = t.replace(/(^|[\s(])_([^_\n]+)_(?=[\s).,!?;:]|$)/g, "$1<em>$2</em>");
+      // dialogue: quoted speech, then a translation in parentheses right after it
+      t = t.replace(/(&quot;|“|„|«)([^\n]{1,600}?)(&quot;|”|“|»)(\s*)\(([^()\n]{1,400})\)/g,
+        (m, a, q, b, sp, tr) => `<span class="qq" data-q="${q.replace(/"/g, "&quot;")}">${a}${q}${b}</span>${sp}<span class="qtr">(${tr})</span>`);
+      return t;
+    }
+    function md(src, learn) {
+      const text = String(src || "").replace(/\r\n/g, "\n");
+      const out = [];
+      const lines = text.split("\n");
+      let i = 0, para = [];
+      const flush = () => { if (para.length) { out.push(`<p>${para.map((l) => inline(l, learn)).join("<br>")}</p>`); para = []; } };
+      while (i < lines.length) {
+        const line = lines[i];
+        if (/^```/.test(line)) {
+          flush();
+          const buf = [];
+          i++;
+          while (i < lines.length && !/^```/.test(lines[i])) buf.push(lines[i++]);
+          i++;
+          out.push(`<pre><code>${esc(buf.join("\n"))}</code></pre>`);
+          continue;
+        }
+        const h = line.match(/^(#{1,4})\s+(.*)$/);
+        if (h) { flush(); out.push(`<h${h[1].length + 2}>${inline(h[2], learn)}</h${h[1].length + 2}>`); i++; continue; }
+        if (/^\s*([-*]|\d+[.)])\s+/.test(line)) {
+          flush();
+          const ordered = /^\s*\d/.test(line);
+          const items = [];
+          while (i < lines.length && /^\s*([-*]|\d+[.)])\s+/.test(lines[i])) items.push(lines[i++].replace(/^\s*([-*]|\d+[.)])\s+/, ""));
+          out.push(`<${ordered ? "ol" : "ul"}>${items.map((x) => `<li>${inline(x, learn)}</li>`).join("")}</${ordered ? "ol" : "ul"}>`);
+          continue;
+        }
+        if (/^>\s?/.test(line)) {
+          flush();
+          const buf = [];
+          while (i < lines.length && /^>\s?/.test(lines[i])) buf.push(lines[i++].replace(/^>\s?/, ""));
+          out.push(`<blockquote>${buf.map((l) => inline(l, learn)).join("<br>")}</blockquote>`);
+          continue;
+        }
+        if (/^\s*\|.*\|\s*$/.test(line) && i + 1 < lines.length && /^\s*\|?\s*:?-{2,}/.test(lines[i + 1])) {
+          flush();
+          const row = (l) => l.trim().replace(/^\||\|$/g, "").split("|").map((c) => c.trim());
+          const head = row(line);
+          i += 2;
+          const body = [];
+          while (i < lines.length && /^\s*\|.*\|\s*$/.test(lines[i])) body.push(row(lines[i++]));
+          out.push(`<table><thead><tr>${head.map((c) => `<th>${inline(c)}</th>`).join("")}</tr></thead><tbody>${body.map((r) =>
+            `<tr>${r.map((c) => `<td>${inline(c)}</td>`).join("")}</tr>`).join("")}</tbody></table>`);
+          continue;
+        }
+        if (!line.trim()) { flush(); i++; continue; }
+        para.push(line);
+        i++;
+      }
+      flush();
+      return out.join("");
+    }
+
+    // Scroll that only follows new content while the user has not scrolled away.
+    function follower(box, onState) {
+      let follow = true, programmatic = false;
+      const atBottom = (gap = 8) => box.scrollHeight - box.scrollTop - box.clientHeight <= gap;
+      const leave = () => { if (follow) { follow = false; onState && onState(false); } };
+      box.addEventListener("wheel", (e) => { if (e.deltaY < 0) leave(); }, { passive: true });
+      box.addEventListener("touchmove", leave, { passive: true });
+      box.addEventListener("keydown", (e) => { if (["PageUp", "ArrowUp", "Home"].includes(e.key)) leave(); });
+      box.addEventListener("pointerdown", (e) => { if (e.offsetX > box.clientWidth) leave(); });
+      box.addEventListener("scroll", () => {
+        if (programmatic) { programmatic = false; return; }
+        if (atBottom()) { if (!follow) { follow = true; onState && onState(true); } }
+      }, { passive: true });
+      return {
+        get following() { return follow; },
+        stick() {
+          if (!follow) return;
+          const target = box.scrollHeight - box.clientHeight;
+          if (Math.abs(target - box.scrollTop) > 1) { programmatic = true; box.scrollTop = target; }
+        },
+        jump() { follow = true; onState && onState(true); programmatic = true; box.scrollTop = box.scrollHeight; },
+        release() { leave(); },
+      };
+    }
+    """
+    return (UI_BASE_JS,)
+
+
+@app.cell(hide_code=True)
+def _():
+    UI_APP_JS = r"""
+    const MAX_FILE = 25 * 1024 * 1024;
+    const TAB_ICONS = { chat: "sliders", story: "book", cards: "card", memory: "bookmark", model: "cpu", learn: "learn" };
+    const TAB_NAMES = { chat: "Chat", story: "Cerita", cards: "Kartu", memory: "Memory", model: "Model", learn: "Belajar" };
+    const KIND_ICON = { chat: "chat", rp: "book", group: "users", studio: "sparkles" };
+
+    function render({ model, el }) {
+      el.classList.add("qr");
+      el.innerHTML = `
+      <aside class="qr-side">
+        <div class="qr-brand">${icon("sparkles")}<span>Qwen Chat RP</span></div>
+        <div class="qr-new">
+          <button class="qr-btn qr-primary" data-act="new" data-kind="chat">${icon("plus")}Chat</button>
+          <button class="qr-btn" data-act="story-wizard">${icon("book")}Cerita</button>
+          <button class="qr-btn" data-act="studio">${icon("sparkles")}Studio</button>
+        </div>
+        <label class="qr-search">${icon("search")}<input class="qr-search-in" placeholder="Cari chat (Enter: cari isi pesan)"></label>
+        <nav class="qr-chats"></nav>
+        <div class="qr-side-foot">
+          <div class="qr-backup"></div>
+          <div class="qr-row"><button class="qr-btn qr-sm" data-act="save-db">${icon("download")}Simpan</button>
+            <button class="qr-btn qr-sm" data-act="load-db">${icon("upload")}Muat</button></div>
+        </div>
+      </aside>
+      <section class="qr-main">
+        <header class="qr-top">
+          <button class="qr-icon qr-toggle" data-act="toggle-side" aria-label="Daftar chat">${icon("menu")}</button>
+          <div class="qr-title" title="Klik dua kali untuk ganti nama"></div>
+          <div class="qr-chips"></div>
+          <button class="qr-icon" data-act="compact" title="Compact: padatkan konteks lama">${icon("archive")}</button>
+          <button class="qr-icon" data-act="open-tab" data-tab="story" title="Cerita dan kartu">${icon("book")}</button>
+          <button class="qr-icon" data-act="open-tab" data-tab="chat" title="Pengaturan">${icon("sliders")}</button>
+        </header>
+        <div class="qr-ctxbar"><div class="qr-ctxfill"></div></div>
+        <div class="qr-status-panel" hidden></div>
+        <div class="qr-body">
+          <div class="qr-scroll" tabindex="0">
+            <div class="qr-col">
+              <button class="qr-btn qr-sm qr-more" data-act="load-more" hidden>Muat pesan sebelumnya</button>
+              <div class="qr-empty"></div>
+              <div class="qr-list"></div>
+              <div class="qr-live"></div>
+            </div>
+          </div>
+          <aside class="qr-studio" hidden></aside>
+          <button class="qr-jump" data-act="jump" hidden aria-label="Ke pesan terbaru">${icon("arrowdown")}</button>
+        </div>
+        <div class="qr-world" hidden></div>
+        <div class="qr-composer">
+          <div class="qr-pending" hidden></div>
+          <div class="qr-statusline" hidden></div>
+          <form class="qr-form">
+            <button type="button" class="qr-icon" data-act="attach" title="Lampirkan file">${icon("clip")}</button>
+            <button type="button" class="qr-icon" data-act="impersonate" title="Draf balasanku (impersonate)">${icon("wand")}</button>
+            <textarea class="qr-input" rows="1" placeholder="Kirim pesan · Enter kirim · Shift+Enter baris baru · /ooc /note /bab /ingat /studio"></textarea>
+            <button type="button" class="qr-note-chip" data-act="open-tab" data-tab="chat" hidden></button>
+            <button type="submit" class="qr-send" aria-label="Kirim">${icon("send")}</button>
+          </form>
+        </div>
+        <div class="qr-drop" hidden>Lepas file untuk melampirkan</div>
+      </section>
+      <aside class="qr-drawer" hidden>
+        <div class="qr-drawer-head"><div class="qr-tabs"></div><button class="qr-icon" data-act="close-drawer" aria-label="Tutup">${icon("x")}</button></div>
+        <div class="qr-drawer-body"></div>
+      </aside>
+      <div class="qr-modal" hidden><div class="qr-modal-box"><div class="qr-modal-head"><span class="qr-modal-title"></span>
+        <button class="qr-icon" data-act="close-modal" aria-label="Tutup">${icon("x")}</button></div><div class="qr-modal-body"></div></div></div>
+      <div class="qr-toasts"></div>
+      <input type="file" class="qr-file-db" accept=".sqlite,.db" hidden>
+      <input type="file" class="qr-file-att" multiple hidden>
+      <input type="file" class="qr-file-card" accept=".json,.png" hidden>
+      <input type="file" class="qr-file-avatar" accept="image/*" hidden>`;
+
+      const $ = (q) => el.querySelector(q);
+      const scroll = $(".qr-scroll"), list = $(".qr-list"), liveBox = $(".qr-live"), input = $(".qr-input");
+      const drawer = $(".qr-drawer"), dbody = $(".qr-drawer-body"), modal = $(".qr-modal");
+      const state = { tab: "chat", pending: [], open: new Set(), cardView: null, learn: false, studioCard: null, libFilter: "" };
+      const els = new Map();
+      const fol = follower(scroll, (on) => { $(".qr-jump").hidden = on; });
+      new ResizeObserver(() => fol.stick()).observe($(".qr-col"));
+
+      const send = (action, extra = {}) => { model.set("command", { n: Date.now() + Math.random(), action, ...extra }); model.save_changes(); };
+      const get = (k) => model.get(k) || {};
+      const toast = (text, kind = "info", long = false) => {
+        const t = document.createElement("div");
+        t.className = `qr-toast qr-${kind}`;
+        t.textContent = text;
+        t.addEventListener("click", () => t.remove());
+        $(".qr-toasts").appendChild(t);
+        setTimeout(() => t.remove(), long ? 12000 : 4500);
+      };
+      const openModal = (title, html) => { $(".qr-modal-title").textContent = title; $(".qr-modal-body").innerHTML = html; modal.hidden = false; };
+      const closeModal = () => { modal.hidden = true; $(".qr-modal-body").innerHTML = ""; };
+
+      // theme follows marimo (dark class on the page) or the OS
+      const syncTheme = () => {
+        const d = document.documentElement, b = document.body;
+        const dark = d.classList.contains("dark") || b.classList.contains("dark") || d.dataset.theme === "dark" ||
+          (!d.classList.contains("light") && window.matchMedia("(prefers-color-scheme: dark)").matches);
+        el.dataset.theme = dark ? "dark" : "light";
+      };
+      syncTheme();
+      const themeObs = new MutationObserver(syncTheme);
+      themeObs.observe(document.documentElement, { attributes: true, attributeFilter: ["class", "data-theme"] });
+      themeObs.observe(document.body, { attributes: true, attributeFilter: ["class"] });
+
+      // ---------- sidebar ----------
+      function renderChats() {
+        const chats = model.get("chats") || [], cur = get("chat").id;
+        const q = $(".qr-search-in").value.trim().toLowerCase();
+        const groups = { Cerita: [], Studio: [], Chat: [] };
+        for (const c of chats) {
+          if (q && !c.title.toLowerCase().includes(q) && !(c.story_title || "").toLowerCase().includes(q)) continue;
+          (c.kind === "rp" || c.kind === "group" ? groups.Cerita : c.kind === "studio" ? groups.Studio : groups.Chat).push(c);
+        }
+        $(".qr-chats").innerHTML = Object.entries(groups).filter(([, v]) => v.length).map(([g, v]) => `
+          <div class="qr-group">${g}</div>
+          ${v.map((c) => `<div class="qr-chat ${c.id === cur ? "on" : ""}" data-chat="${c.id}">
+            ${icon(KIND_ICON[c.kind] || "chat")}<span class="qr-chat-t" title="${esc(c.title)}">${esc(c.title)}</span>
+            <button class="qr-icon qr-xs" data-act="rename-chat" data-id="${c.id}" title="Ganti nama">${icon("edit")}</button>
+            <button class="qr-icon qr-xs" data-act="delete-chat" data-id="${c.id}" title="Hapus">${icon("trash")}</button></div>`).join("")}`).join("")
+          || `<div class="qr-muted qr-pad">Belum ada chat.</div>`;
+      }
+      function renderBackup() {
+        const b = get("backup");
+        $(".qr-backup").innerHTML = b.enabled
+          ? `${icon("cloud")}<span>${b.busy ? "Backup…" : b.last_error ? "Backup gagal" : `Tersimpan ${ago(b.last_ok)}`}${b.dirty ? " · ada perubahan" : ""}</span>`
+          : `${icon("cloud")}<span>Backup HF mati · isi token di sel Backup</span>`;
+        $(".qr-backup").title = b.last_error || b.repo || "";
+      }
+
+      // ---------- top bar ----------
+      function renderTop() {
+        const c = get("chat"), s = get("server"), ctx = get("ctx"), p = get("panels");
+        $(".qr-title").textContent = c.title || "Chat baru";
+        const phaseCls = s.phase === "ready" ? "ok" : s.phase === "failed" ? "bad" : s.phase === "idle" ? "off" : "wait";
+        const short = (s.preset || "Model belum jalan").split(" · ")[0];
+        const preset = (get("boot").presets || []).find((x) => x.name === s.preset);
+        const lvl = (c.settings || {}).thinking || (preset ? preset.thinking[preset.thinking.length - 1] : "");
+        const pct = ctx.max ? Math.min(100, (ctx.used / ctx.max) * 100) : 0;
+        $(".qr-chips").innerHTML = `
+          <button class="qr-chip" data-act="open-tab" data-tab="model" title="${esc(s.preset || "")}"><i class="qr-dot ${phaseCls}"></i>${esc(short)}${s.ctx ? ` · ${Math.round(s.ctx / 1024)}K` : ""}</button>
+          ${lvl ? `<span class="qr-chip qr-ghost" title="Level thinking">${icon("brain")}${esc(lvl)}</span>` : ""}
+          ${ctx.max ? `<span class="qr-chip qr-ghost" title="${fmtN(ctx.used)} / ${fmtN(ctx.max)} token · compaction otomatis di 90%">${pct.toFixed(0)}%</span>` : ""}
+          ${p.time ? `<span class="qr-chip qr-ghost" title="Jam dunia">${icon("clock")}${esc(p.time)}</span>` : ""}`;
+        $(".qr-ctxfill").style.width = `${pct}%`;
+        $(".qr-ctxfill").classList.toggle("warn", pct > 85);
+        const note = (c.settings || {}).note;
+        $(".qr-note-chip").hidden = !note;
+        $(".qr-note-chip").textContent = note ? `Note: ${note.slice(0, 40)}${note.length > 40 ? "…" : ""}` : "";
+      }
+
+      // ---------- panels (game format) ----------
+      function renderPanels() {
+        const p = get("panels");
+        const sp = $(".qr-status-panel"), wp = $(".qr-world");
+        const game = p.format === "game";
+        sp.hidden = !game;
+        wp.hidden = !game;
+        if (!game) return;
+        const bar = (s) => {
+          const lo = s.min ?? 0, hi = s.max ?? 100;
+          const pct = hi > lo ? Math.max(0, Math.min(100, ((s.value - lo) / (hi - lo)) * 100)) : 0;
+          const ch = s.change && Math.abs(s.change.delta) >= 0.05 ? `<em class="${s.change.delta > 0 ? "up" : "dn"}">${s.change.delta > 0 ? "+" : ""}${Number(s.change.delta.toFixed(1))}</em>` : "";
+          return `<div class="qr-stat" title="${esc(s.change ? s.change.reason || "" : "")}"><span>${esc(s.label)}</span>
+            <div class="qr-sbar"><i style="width:${pct}%"></i></div><b>${Number(s.value)}</b>${ch}</div>`;
+        };
+        const status = Object.entries(p.status || {}).map(([k, v]) => `<span class="qr-tag">${esc(k)}: ${esc(Array.isArray(v) ? v.join(", ") : typeof v === "object" ? JSON.stringify(v) : v)}</span>`).join("");
+        sp.innerHTML = `<div class="qr-sp-head">${icon("clock")}<b>${esc(p.time)}</b><span>·</span>${icon("map")}<span>${esc(p.location || "-")}</span>
+            <span>·</span><span>Giliran ${p.turn}</span>${p.story ? `<span class="qr-muted">· ${esc(p.story)}</span>` : ""}</div>
+          ${p.stats && p.stats.length ? `<div class="qr-stats">${p.stats.map(bar).join("")}</div>` : ""}
+          ${status ? `<div class="qr-tags">${status}</div>` : ""}`;
+        const open = state.open.has("world");
+        wp.innerHTML = `<button class="qr-world-head" data-act="toggle-world">${icon("globe")}<b>Dunia</b>
+            <span class="qr-muted">${esc(p.weather || "")}</span>${(p.events || []).some((e) => e.new) ? '<i class="qr-dot ok"></i>' : ""}${icon(open ? "down" : "right")}</button>
+          <div class="qr-world-body" ${open ? "" : "hidden"}>
+            ${(p.events || []).map((e) => `<div class="qr-event ${e.new ? "new" : ""}"><span class="qr-muted">${esc(e.time)}</span> ${esc(e.text)}</div>`).join("") || '<div class="qr-muted">Belum ada kabar.</div>'}
+            ${(p.time_skips || []).length ? `<div class="qr-skips">${icon("skip")}${p.time_skips.map((t) => `<button class="qr-btn qr-sm" data-act="time-skip" data-label="${esc(t)}">${esc(t)}</button>`).join("")}</div>` : ""}
+          </div>`;
+      }
+
+      // ---------- messages ----------
+      function toolChips(tools, key) {
+        if (!tools || !tools.length) return "";
+        return `<div class="qr-tools">${tools.map((t, j) => {
+          const k = `${key}-t${j}`;
+          const st = t.running ? "jalan…" : t.error ? "gagal" : "";
+          let args = "";
+          try { args = Object.values(JSON.parse(t.args || "{}")).map((v) => typeof v === "object" ? JSON.stringify(v) : String(v)).join(", ").slice(0, 80); } catch (e) { args = String(t.args || "").slice(0, 80); }
+          return `<details class="qr-tool ${t.error ? "err" : ""}" data-key="${k}" ${state.open.has(k) ? "open" : ""}>
+            <summary>${icon("tool")}<b>${esc(t.name)}</b><span>${esc(args)}</span>${st ? `<em>${st}</em>` : ""}</summary>
+            <pre>${esc(t.result || (t.running ? "…" : ""))}</pre></details>`;
+        }).join("")}</div>`;
+      }
+      function thinkBlock(key, text, label, live) {
+        return `<details class="qr-think" data-key="${key}" ${state.open.has(key) || live ? "open" : ""}>
+          <summary>${icon("brain")}<span>${label}</span><span class="qr-muted">${fmtN(words(text))} kata</span></summary>
+          <div class="qr-think-box"><div class="qr-think-body">${esc(text)}</div></div>
+          ${live ? '<button class="qr-btn qr-sm qr-think-follow" data-act="think-follow" hidden>Ikuti</button>' : ""}
+          <button class="qr-btn qr-sm qr-think-full" data-act="think-full">Tampilkan penuh</button></details>`;
+      }
+      function actionsBar(it) {
+        const sw = it.swipe && it.swipe[1] > 1
+          ? `<span class="qr-swipe"><button class="qr-icon qr-xs" data-act="swipe" data-id="${it.id}" data-dir="-1">${icon("left")}</button>${it.swipe[0]}/${it.swipe[1]}<button class="qr-icon qr-xs" data-act="swipe" data-id="${it.id}" data-dir="1">${icon("right")}</button></span>` : "";
+        const b = (act, ic, title) => `<button class="qr-icon qr-xs" data-act="${act}" data-id="${it.id}" title="${title}">${icon(ic)}</button>`;
+        if (it.kind === "user") return `<div class="qr-actions">${sw}${b("copy", "copy", "Salin")}${b("edit", "edit", "Edit (membuat cabang)")}${b("pin", "pin", it.pinned ? "Lepas pin" : "Pin")}${b("branch", "branch", "Cabang dari sini")}${b("delete", "trash", "Hapus")}</div>`;
+        return `<div class="qr-actions">${sw}${b("copy", "copy", "Salin")}${b("reroll", "refresh", "Jawab ulang")}${b("continue", "forward", "Lanjutkan")}${b("edit", "edit", "Edit")}${b("pin", "pin", it.pinned ? "Lepas pin" : "Pin")}${b("chapter", "bookmark", "Tandai bab")}${b("fact-check", "flag", "Cek fakta")}${b("branch", "branch", "Cabang dari sini")}${b("delete", "trash", "Hapus")}</div>`;
+      }
+      function statsLine(st) {
+        if (!st) return "";
+        const bits = [];
+        if (st.tokens) bits.push(`${fmtN(st.tokens)} token`);
+        if (st.tps) bits.push(`${st.tps.toFixed(1)} tok/s`);
+        if (st.think_s) bits.push(`mikir ${st.think_s.toFixed(0)} dtk`);
+        if (st.tools) bits.push(`${st.tools} tool`);
+        if (st.total_s) bits.push(`total ${st.total_s.toFixed(0)} dtk`);
+        if (st.stopped) bits.push("dihentikan");
+        return bits.length ? `<div class="qr-stats-line" title="${esc(st.model || "")}">${bits.join(" · ")}</div>` : "";
+      }
+      function speakers(html) {
+        const c = get("chat");
+        if (c.kind !== "group") return html;
+        const av = {};
+        for (const x of (get("story").cards || [])) if (x.role === "character") av[x.name.toLowerCase()] = x.avatar;
+        return html.replace(/<p><strong>([^<]{1,60})<\/strong>/g, (m, name) => {
+          const key = name.replace(/[:：]$/, "").trim().toLowerCase();
+          if (!(key in av)) return m;
+          const img = av[key] ? `<img class="qr-avatar sm" src="data:image/png;base64,${av[key]}" alt="">` : `<span class="qr-avatar sm qr-noav">${icon("card")}</span>`;
+          return `<p class="qr-speaker">${img}<strong>${name}</strong>`;
+        });
+      }
+      function itemHTML(it) {
+        const chap = it.chapter ? `<div class="qr-chapter">${icon("bookmark")}${esc(it.chapter)}</div>` : "";
+        if (it.kind === "summary") {
+          const k = `sum-${it.id}`;
+          return `<div class="qr-msg qr-summary-row"><details class="qr-summary" data-key="${k}" ${state.open.has(k) ? "open" : ""}>
+            <summary>${icon("archive")}Konteks dipadatkan · pesan ${it.range[0]}–${it.range[1]}${it.level === "era" ? " (era)" : ""}</summary>
+            <div class="qr-md">${md(it.text)}</div></details></div>`;
+        }
+        if (it.kind === "user") {
+          if (it.time_skip) return `${chap}<div class="qr-msg qr-skip-row" data-id="${it.id}"><span class="qr-pill">${icon("skip")}Lompat waktu ${esc(it.time_skip)}</span>${actionsBar(it)}</div>`;
+          const atts = (it.attachments || []).map((a) => `<span class="qr-att">${icon("clip")}${esc(a.split(":").slice(1).join(":") || a)}</span>`).join("")
+            + (it.notes || []).map((n) => `<span class="qr-att warn">${esc(n)}</span>`).join("");
+          return `${chap}<div class="qr-msg qr-user ${it.ooc ? "ooc" : ""} ${it.pinned ? "pinned" : ""}" data-id="${it.id}">
+            ${atts ? `<div class="qr-atts">${atts}</div>` : ""}
+            <div class="qr-bubble">${it.ooc ? '<span class="qr-ooc">OOC</span>' : ""}${esc(it.content).replace(/\n/g, "<br>")}</div>
+            ${actionsBar(it)}</div>`;
+        }
+        const k = `m${it.root}`;
+        const think = it.reasoning ? thinkBlock(`${k}-th`, it.reasoning, `Dipikirkan${it.stats && it.stats.think_s ? ` ${it.stats.think_s.toFixed(0)} dtk` : ""}`) : "";
+        const dice = (it.dice || []).map((d) => `<span class="qr-dice ${d.success ? "ok" : "bad"}">${icon("dice")}${esc(d.event)} · ${Math.round(d.odds * 100)}% · ${d.success ? "berhasil" : "gagal"}</span>`).join("");
+        const flags = (it.flags || []).map((f) => `<span class="qr-flag" title="${esc(f.text)}">${icon("warn")}${esc(f.text.length > 70 ? f.text.slice(0, 70) + "…" : f.text)}</span>`).join("");
+        const facts = (it.fact_warnings || []).map((f) => `<div class="qr-fact">${icon("flag")}<div><b>${esc(f.claim)}</b><br>${esc(f.correction)} ${f.source && /^https?:/.test(f.source) ? `<a href="${esc(f.source)}" target="_blank" rel="noopener noreferrer">sumber</a>` : esc(f.source || "")}</div></div>`).join("");
+        const choices = it.choices && it.choices.problems ? `<div class="qr-choices">${it.choices.problems.map((p, pi) => `
+          <div class="qr-problem"><div class="qr-q">${esc(p.question)}</div>
+          ${p.options.map((o, oi) => `<div class="qr-opt"><button class="qr-opt-main" data-act="choose" data-text="${esc(o)}">${esc(o)}</button>
+            <button class="qr-icon qr-xs" data-act="choose-edit" data-text="${esc(o)}" title="Edit dulu">${icon("edit")}</button></div>`).join("")}</div>`).join("")}</div>` : "";
+        return `${chap}<div class="qr-msg qr-bot ${it.ooc ? "ooc" : ""} ${it.pinned ? "pinned" : ""}" data-id="${it.id}">
+          ${think}${toolChips(it.tools, k)}
+          ${dice ? `<div class="qr-dices">${dice}</div>` : ""}
+          <div class="qr-md">${it.ooc ? '<span class="qr-ooc">OOC</span>' : ""}${speakers(md(it.content, state.learn))}</div>
+          ${it.partial ? `<div class="qr-partial">${icon("warn")}Jawaban terpotong. <button class="qr-btn qr-sm" data-act="continue" data-id="${it.id}">Lanjutkan</button></div>` : ""}
+          ${it.error ? `<div class="qr-error">${esc(it.error)}</div>` : ""}
+          ${flags ? `<div class="qr-flags">${flags}<button class="qr-btn qr-sm" data-act="reroll" data-id="${it.id}">${icon("refresh")}Jawab ulang</button></div>` : ""}
+          ${facts}${choices}${statsLine(it.stats)}${actionsBar(it)}</div>`;
+      }
+      function renderHistory() {
+        const h = model.get("history") || { items: [] };
+        const items = h.items || [];
+        $(".qr-more").hidden = !(h.total > items.length);
+        const empty = $(".qr-empty");
+        const c = get("chat");
+        empty.hidden = items.length > 0 || !!(get("live").active);
+        empty.innerHTML = c.kind === "studio"
+          ? `<h2>Studio</h2><p>Ceritakan cerita yang kamu mau: dunia, siapa kamu, tokoh, nada. Model akan bertanya dan mengisi kartu di panel kanan.</p>`
+          : c.kind === "rp" || c.kind === "group" ? `<h2>${esc(c.title || "Cerita")}</h2><p>Tulis aksi pertamamu.</p>`
+          : `<h2>Mau ngobrol apa?</h2><p>Gambar, video, PDF, dan dokumen bisa dilampirkan atau di-drop ke sini.</p>`;
+        const keep = new Set();
+        let prev = null;
+        for (const it of items) {
+          const key = `${it.kind}-${it.kind === "bot" ? it.root : it.id}`;
+          keep.add(key);
+          const sig = JSON.stringify(it) + (state.learn ? "L" : "");
+          let node = els.get(key);
+          if (!node || node._sig !== sig) {
+            const tmp = document.createElement("div");
+            tmp.innerHTML = itemHTML(it);
+            const fresh = document.createElement("div");
+            fresh.className = "qr-item";
+            fresh.dataset.key = key;
+            while (tmp.firstChild) fresh.appendChild(tmp.firstChild);
+            fresh._sig = sig;
+            if (node) node.replaceWith(fresh); else list.appendChild(fresh);
+            node = fresh;
+            els.set(key, node);
+          }
+          const want = prev ? prev.nextSibling : list.firstChild;
+          if (want !== node) list.insertBefore(node, want);
+          prev = node;
+        }
+        for (const [k, node] of els) if (!keep.has(k)) { node.remove(); els.delete(k); }
+        fol.stick();
+      }
+
+      // live message
+      let liveParts = null, thinkFollow = true;
+      function renderLive() {
+        const lv = get("live");
+        if (!lv.active) { liveBox.innerHTML = ""; liveParts = null; thinkFollow = true; renderStatusLine(); return; }
+        $(".qr-empty").hidden = true;
+        if (!liveParts) {
+          liveBox.innerHTML = `<div class="qr-msg qr-bot qr-live-row">${thinkBlock("live-th", "", "Sedang berpikir", true)}
+            <div class="qr-live-tools"></div><div class="qr-md"></div><div class="qr-phase qr-muted"></div>
+            <div class="qr-typing"><span></span><span></span><span></span></div></div>`;
+          liveParts = { think: liveBox.querySelector(".qr-think"), sum: liveBox.querySelector(".qr-think summary span"),
+            box: liveBox.querySelector(".qr-think-box"), body: liveBox.querySelector(".qr-think-body"),
+            follow: liveBox.querySelector(".qr-think-follow"), tools: liveBox.querySelector(".qr-live-tools"),
+            md: liveBox.querySelector(".qr-live-row > .qr-md"), phase: liveBox.querySelector(".qr-phase"), typing: liveBox.querySelector(".qr-typing") };
+          liveParts.think.hidden = true;
+          const tb = liveParts.box;
+          const leave = () => { thinkFollow = false; liveParts.follow.hidden = false; };
+          tb.addEventListener("wheel", (e) => { if (e.deltaY < 0) leave(); }, { passive: true });
+          tb.addEventListener("touchmove", leave, { passive: true });
+          tb.addEventListener("scroll", () => { if (tb.scrollHeight - tb.scrollTop - tb.clientHeight < 6) { thinkFollow = true; liveParts.follow.hidden = true; } }, { passive: true });
+        }
+        const p = liveParts;
+        if (lv.reasoning) {
+          p.think.hidden = false;
+          p.sum.textContent = lv.content ? "Berpikir selesai" : "Sedang berpikir";
+          p.body.textContent = lv.reasoning;
+          if (thinkFollow) p.box.scrollTop = p.box.scrollHeight;
+        }
+        p.tools.innerHTML = toolChips(lv.tools, "live");
+        p.md.innerHTML = lv.content ? md(lv.content, state.learn) : "";
+        p.phase.textContent = lv.phase || "";
+        p.typing.hidden = !!lv.content;
+        fol.stick();
+      }
+      function renderStatusLine() {
+        const s = model.get("status") || "", q = model.get("queue") || 0;
+        const line = $(".qr-statusline");
+        const txt = [s, q ? `${q} pesan di antrian` : ""].filter(Boolean).join(" · ");
+        line.hidden = !txt;
+        line.textContent = txt;
+      }
+      function renderBusy() {
+        const busy = model.get("busy");
+        const b = $(".qr-send");
+        b.innerHTML = busy ? icon("stop") : icon("send");
+        b.classList.toggle("stop", !!busy);
+        b.setAttribute("aria-label", busy ? "Stop" : "Kirim");
+      }
+
+      // ---------- studio pane ----------
+      function renderStudio() {
+        const c = get("chat"), st = get("story"), pane = $(".qr-studio");
+        const on = c.kind === "studio";
+        pane.hidden = !on;
+        el.classList.toggle("studio-on", on);
+        if (!on) return;
+        const cards = st.studio ? st.cards || [] : [];
+        // only a card that belongs to this studio session may be shown
+        if (!cards.some((x) => x.id === state.studioCard)) state.studioCard = cards.length ? cards[0].id : null;
+        const quick = [["Lengkapi yang kosong", "Lengkapi field kartu yang masih kosong dengan usulan yang konsisten."],
+          ["Cek konsistensi", "Cek konsistensi antar kartu (dan anakronisme kalau dunia berbasis dunia nyata), lalu perbaiki."],
+          ["Uji adegan", "Uji adegan: tulis satu paragraf pembuka dengan kartu Gaya dan GM yang sekarang."],
+          ["Uji suara", "Uji suara tokoh utama: balas tiga situasi (santai, marah, sedih) sebagai tokoh itu."],
+          ["Wawancara", "Aku mau mewawancarai tokoh utama. Jawab sebagai tokoh itu mulai sekarang sampai aku bilang selesai."]];
+        const card = get("card");
+        pane.innerHTML = `<div class="qr-studio-head"><b>Kartu di Studio</b>
+            <button class="qr-btn qr-sm qr-primary" data-act="studio-finish" ${cards.length ? "" : "disabled"}>${icon("book")}Mulai RP</button></div>
+          <div class="qr-studio-quick">${quick.map(([l, t]) => `<button class="qr-btn qr-sm" data-act="quick" data-text="${esc(t)}">${esc(l)}</button>`).join("")}</div>
+          <div class="qr-studio-tabs">${cards.map((x) => `<button class="qr-tabbtn ${x.id === state.studioCard ? "on" : ""}" data-act="studio-card" data-id="${x.id}">${esc((get("boot").types || {})[x.type] || x.type)}: ${esc(x.name)}</button>`).join("") || '<span class="qr-muted">Belum ada kartu. Mulai ngobrol di kiri.</span>'}</div>
+          <div class="qr-studio-form">${state.studioCard && card.id === state.studioCard ? cardForm(card, true) : ""}</div>`;
+        if (state.studioCard && card.id !== state.studioCard) send("card_open", { card_id: state.studioCard });
+      }
+
+      // ---------- card form ----------
+      function fieldInput(f, v) {
+        const name = `f-${f.key}`;
+        const badge = `${f.core ? '<span class="qr-badge" title="Masuk prompt beku">inti</span>' : ""}${f.visibility === "secret" ? `<span class="qr-badge">${icon("lock")}rahasia</span>` : ""}${f.visibility === "ui" ? '<span class="qr-badge">hanya UI</span>' : ""}`;
+        const label = `<label class="qr-flabel" for="${name}">${esc(f.label)} ${badge}</label>${f.help ? `<div class="qr-help">${esc(f.help)}</div>` : ""}`;
+        if (f.type === "longtext") return `${label}<textarea id="${name}" data-field="${f.key}" data-type="longtext" rows="3">${esc(v ?? "")}</textarea>`;
+        if (f.type === "list") return `${label}<textarea id="${name}" data-field="${f.key}" data-type="list" rows="3" placeholder="Satu per baris">${esc((Array.isArray(v) ? v : v ? [v] : []).join("\n"))}</textarea>`;
+        if (f.type === "tags") return `${label}<input id="${name}" data-field="${f.key}" data-type="tags" value="${esc((Array.isArray(v) ? v : v ? [v] : []).join(", "))}" placeholder="Pisahkan dengan koma">`;
+        if (f.type === "select") return `${label}<select id="${name}" data-field="${f.key}" data-type="text"><option value=""></option>${(f.options || []).map((o) => `<option ${o === v ? "selected" : ""}>${esc(o)}</option>`).join("")}</select>`;
+        if (f.type === "number") return `${label}<input id="${name}" type="number" data-field="${f.key}" data-type="number" value="${esc(v ?? "")}">`;
+        if (f.type === "table") {
+          const cols = f.columns || ["nilai"];
+          const rows = Array.isArray(v) ? v : [];
+          return `${label}<div class="qr-table" data-field="${f.key}" data-type="table" data-cols="${cols.length}">
+            <div class="qr-trow qr-thead">${cols.map((c) => `<span>${esc(c)}</span>`).join("")}<span></span></div>
+            ${rows.map((r) => `<div class="qr-trow">${cols.map((c, ci) => `<input value="${esc(Array.isArray(r) ? r[ci] ?? "" : (r || {})[c] ?? "")}">`).join("")}<button class="qr-icon qr-xs" data-act="row-del">${icon("x")}</button></div>`).join("")}
+            <button class="qr-btn qr-sm" data-act="row-add">${icon("plus")}Baris</button></div>`;
+        }
+        return `${label}<input id="${name}" data-field="${f.key}" data-type="text" value="${esc(v ?? "")}">`;
+      }
+      function cardForm(c, compact) {
+        const sections = {};
+        for (const f of c.fields || []) (sections[f.section || "Lainnya"] ||= []).push(f);
+        const lore = c.type === "world" || c.type === "character";
+        return `<div class="qr-card-form" data-card="${c.id}">
+          <div class="qr-card-top">${c.avatar ? `<img class="qr-avatar" src="data:image/png;base64,${c.avatar}" alt="">` : `<div class="qr-avatar qr-noav">${icon("card")}</div>`}
+            <div><div class="qr-muted">${esc((get("boot").types || {})[c.type] || c.type)} · versi ${c.version}</div><b>${esc(c.name)}</b></div></div>
+          ${Object.entries(sections).map(([s, fs]) => `<fieldset><legend>${esc(s)}</legend>${fs.map((f) => `<div class="qr-field">${fieldInput(f, c.data[f.key])}</div>`).join("")}</fieldset>`).join("")}
+          <div class="qr-row qr-wrap">
+            <button class="qr-btn qr-primary" data-act="card-save">${icon("check")}Simpan</button>
+            ${compact ? "" : `<button class="qr-btn" data-act="card-avatar">${icon("upload")}Avatar</button>
+            <button class="qr-btn" data-act="card-export" data-fmt="qcard">${icon("download")}Ekspor</button>
+            ${c.type === "character" ? `<button class="qr-btn" data-act="card-export" data-fmt="st">${icon("download")}Ekspor SillyTavern</button>` : ""}
+            <select class="qr-version-sel"><option value="">Pulihkan versi…</option>${(c.versions || []).map((v) => `<option value="${v.version}">versi ${v.version}</option>`).join("")}</select>
+            <button class="qr-btn qr-danger" data-act="card-delete">${icon("trash")}Hapus</button>`}
+          </div>
+          ${lore && !compact ? `<fieldset><legend>Lore</legend>${(c.lore || []).map((e) => `<details class="qr-lore"><summary>${e.core ? '<span class="qr-badge">inti</span>' : ""}<b>${esc(e.title)}</b> <span class="qr-muted">${esc(e.kind)} · ${esc(e.keys)}</span></summary>
+              <div class="qr-lore-edit" data-entry="${e.id}"><input class="le-title" value="${esc(e.title)}"><input class="le-keys" value="${esc(e.keys)}" placeholder="kata kunci, pisah koma">
+              <input class="le-kind" value="${esc(e.kind)}"><label class="qr-check"><input type="checkbox" class="le-core" ${e.core ? "checked" : ""}> inti (selalu di prompt)</label>
+              <textarea class="le-text" rows="3">${esc(e.text)}</textarea><div class="qr-row"><button class="qr-btn qr-sm" data-act="lore-save">Simpan</button><button class="qr-btn qr-sm qr-danger" data-act="lore-del">Hapus</button></div></div></details>`).join("")}
+            <div class="qr-lore-edit" data-entry=""><input class="le-title" placeholder="Judul lore baru"><input class="le-keys" placeholder="kata kunci, pisah koma"><input class="le-kind" placeholder="jenis: tempat, faksi, benda…">
+              <label class="qr-check"><input type="checkbox" class="le-core"> inti</label><textarea class="le-text" rows="2" placeholder="Isi"></textarea>
+              <button class="qr-btn qr-sm" data-act="lore-save">${icon("plus")}Tambah lore</button></div></fieldset>` : ""}
+          ${c.type === "world" && !compact ? `<fieldset><legend>Garis waktu</legend>${(c.timeline || []).map((e) => `<div class="qr-tl" data-entry="${e.id}"><input class="tl-at" value="${esc(e.at)}"><input class="tl-title" value="${esc(e.title)}">
+              <input class="tl-text" value="${esc(e.text)}"><button class="qr-icon qr-xs" data-act="tl-save">${icon("check")}</button><button class="qr-icon qr-xs" data-act="tl-del">${icon("trash")}</button></div>`).join("")}
+            <div class="qr-tl" data-entry=""><input class="tl-at" placeholder="YYYY-MM-DD HH:MM"><input class="tl-title" placeholder="Peristiwa"><input class="tl-text" placeholder="Keterangan">
+              <button class="qr-icon qr-xs" data-act="tl-save">${icon("plus")}</button></div></fieldset>
+            <fieldset><legend>Buku fakta (${(c.facts || []).length})</legend>${(c.facts || []).slice(0, 60).map((f) => `<div class="qr-factrow">${esc(f.claim)} ${f.source_url ? `<a href="${esc(f.source_url)}" target="_blank" rel="noopener noreferrer">sumber</a>` : ""} <span class="qr-muted">${esc(f.status)}</span></div>`).join("") || '<div class="qr-muted">Kosong. Model mengisinya saat riset.</div>'}</fieldset>` : ""}
+        </div>`;
+      }
+      function collectCard(form) {
+        const data = {};
+        form.querySelectorAll("[data-field]").forEach((n) => {
+          const k = n.dataset.field, t = n.dataset.type;
+          if (t === "table") {
+            data[k] = [...n.querySelectorAll(".qr-trow:not(.qr-thead)")].map((r) => [...r.querySelectorAll("input")].map((i) => i.value.trim())).filter((r) => r.some((x) => x));
+          } else if (t === "list") data[k] = n.value.split("\n").map((x) => x.trim()).filter(Boolean);
+          else if (t === "tags") data[k] = n.value.split(",").map((x) => x.trim()).filter(Boolean);
+          else if (t === "number") data[k] = n.value === "" ? "" : Number(n.value);
+          else data[k] = n.value;
+        });
+        for (const k of Object.keys(data)) if (data[k] === "" || (Array.isArray(data[k]) && !data[k].length)) delete data[k];
+        return data;
+      }
+
+      // ---------- drawer ----------
+      function openDrawer(tab) {
+        state.tab = tab || state.tab;
+        drawer.hidden = false;
+        if (state.tab === "cards" || state.tab === "story") send("library");
+        if (state.tab === "memory") send("memory", { q: "" });
+        if (state.tab === "learn") send("vocab");
+        renderDrawer();
+      }
+      function renderDrawer() {
+        if (drawer.hidden) return;
+        $(".qr-tabs").innerHTML = Object.keys(TAB_NAMES).map((t) => `<button class="qr-tabbtn ${t === state.tab ? "on" : ""}" data-act="tab" data-tab="${t}">${icon(TAB_ICONS[t])}${TAB_NAMES[t]}</button>`).join("");
+        const fn = { chat: tabChat, story: tabStory, cards: tabCards, memory: tabMemory, model: tabModel, learn: tabLearn }[state.tab];
+        const active = document.activeElement;
+        if (active && dbody.contains(active) && (active.tagName === "TEXTAREA" || active.tagName === "INPUT")) return;
+        dbody.innerHTML = fn();
+      }
+      function tabChat() {
+        const c = get("chat"), s = c.settings || {}, boot = get("boot"), srv = get("server");
+        if (!c.id) return `<p class="qr-muted">Buka atau buat chat dulu.</p>`;
+        const preset = (boot.presets || []).find((x) => x.name === srv.preset) || (boot.presets || [])[0] || { thinking: [] };
+        const locked = (model.get("history") || {}).total > 1;
+        const smp = s.sampling || {};
+        const slider = (k, label, min, max, step, def) => `<label class="qr-slider">${label}<input type="range" data-smp="${k}" min="${min}" max="${max}" step="${step}" value="${smp[k] ?? def}"><output>${smp[k] ?? def}</output></label>`;
+        return `<section><h4>Chat ini</h4>
+          <label>Level thinking ${locked ? '<span class="qr-badge">dikunci setelah chat dimulai</span>' : ""}
+            <select data-set="thinking" ${locked ? "disabled" : ""}><option value="">default (${esc(preset.thinking[preset.thinking.length - 1] || "-")})</option>${preset.thinking.map((t) => `<option ${s.thinking === t ? "selected" : ""}>${t}</option>`).join("")}</select></label>
+          <label>Panjang balasan<select data-set="length"><option value="">ikut kartu Gaya</option>${["pendek", "sedang", "panjang"].map((t) => `<option ${s.length === t ? "selected" : ""}>${t}</option>`).join("")}</select></label>
+          <label>Author's note (sementara, di bawah prompt)<textarea data-set="note" rows="2" placeholder="Misalnya: adegan ini tegang, kalimat pendek">${esc(s.note || "")}</textarea></label>
+          <label>Pemeriksa fakta<select data-set="fact_mode">${[["mati", "Mati"], ["latar", "Latar belakang"], ["ketat", "Ketat (sebelum selesai)"]].map(([v, l]) => `<option value="${v}" ${(s.fact_mode || "latar") === v ? "selected" : ""}>${l}</option>`).join("")}</select></label>
+          ${c.kind === "group" ? `<label>Mode grup<select data-set="group_mode"><option value="narrator" ${s.group_mode !== "single" ? "selected" : ""}>Narator GM (beberapa tokoh per balasan)</option><option value="single" ${s.group_mode === "single" ? "selected" : ""}>Satu tokoh per balasan</option></select></label>` : ""}
+          <label class="qr-check"><input type="checkbox" data-set="learn" ${s.learn ? "checked" : ""}> Mode belajar bahasa (terjemahan disembunyikan, klik dialog untuk penjelasan)</label>
+        </section>
+        <section><h4>Sampler <button class="qr-btn qr-sm" data-act="smp-reset">Reset ke card model</button></h4>
+          ${slider("temperature", "Temperature", 0, 2, 0.05, 1)}${slider("top_p", "Top-p", 0, 1, 0.01, 0.95)}${slider("top_k", "Top-k", 0, 200, 1, 20)}
+          ${slider("min_p", "Min-p", 0, 0.5, 0.01, 0)}${slider("presence_penalty", "Presence penalty", -2, 2, 0.05, 0)}${slider("repetition_penalty", "Repetition penalty", 1, 1.5, 0.01, 1)}
+          <div class="qr-row"><label>Seed<input data-smp="seed" type="number" value="${smp.seed ?? ""}" placeholder="acak"></label>
+          <label>Max token<input data-set="max_tokens" type="number" value="${s.max_tokens ?? ""}" placeholder="otomatis"></label></div></section>
+        <section><h4>Alat</h4><div class="qr-grid2">
+          <button class="qr-btn" data-act="apply-now">${icon("refresh")}Terapkan sekarang</button>
+          <button class="qr-btn" data-act="compact">${icon("archive")}Compact</button>
+          <button class="qr-btn" data-act="continue-new">${icon("forward")}Lanjut di chat baru</button>
+          <button class="qr-btn" data-act="branches">${icon("branch")}Pohon cabang</button>
+          <button class="qr-btn" data-act="prompt-view">${icon("eye")}Lihat prompt</button>
+          <button class="qr-btn" data-act="recall-test">${icon("brain")}Uji ingatan</button>
+          <button class="qr-btn" data-act="export" data-fmt="md">${icon("download")}Ekspor MD</button>
+          <button class="qr-btn" data-act="export" data-fmt="html">${icon("download")}Ekspor HTML</button>
+          <button class="qr-btn" data-act="export" data-fmt="epub">${icon("download")}Ekspor EPUB</button></div></section>
+        <details class="qr-adv"><summary>Lanjutan: system prompt manual</summary>
+          <textarea data-system rows="5" placeholder="Biasanya kosong; prompt dirakit dari kartu.">${esc(c.system || "")}</textarea>
+          <button class="qr-btn qr-sm" data-act="save-system">Simpan</button></details>`;
+      }
+      function tabStory() {
+        const st = get("story"), c = get("chat"), lib = get("library");
+        if (!st.id) return c.kind === "studio" ? `<p class="qr-muted">Ini Studio. Kartu yang disusun ada di panel kanan.</p>`
+          : `<p class="qr-muted">Chat ini bukan cerita.</p><button class="qr-btn qr-primary" data-act="story-wizard">${icon("book")}Mulai cerita baru</button>`;
+        const roles = get("boot").roles || [];
+        return `<section><h4>${esc(st.title)}</h4>${st.cards.map((x) => `<div class="qr-linkrow">${x.avatar ? `<img class="qr-avatar sm" src="data:image/png;base64,${x.avatar}" alt="">` : icon("card")}
+            <span class="qr-muted">${esc((get("boot").types || {})[x.role] || x.role)}</span><b>${esc(x.name)}</b>
+            ${x.latest > x.version ? '<span class="qr-badge" title="Berlaku setelah Terapkan sekarang atau compaction">versi baru</span>' : ""}
+            <button class="qr-icon qr-xs" data-act="open-card" data-id="${x.id}" title="Buka">${icon("edit")}</button>
+            <button class="qr-icon qr-xs" data-act="detach" data-id="${x.id}" data-role="${x.role}" title="Lepas">${icon("x")}</button></div>`).join("")}
+          <div class="qr-row"><select class="qr-attach-role">${roles.map((r) => `<option value="${r}">${esc((get("boot").types || {})[r] || r)}</option>`).join("")}</select>
+            <select class="qr-attach-card"><option value="">Pasang kartu…</option>${(lib.cards || []).map((x) => `<option value="${x.id}">${esc(x.type)} · ${esc(x.name)}</option>`).join("")}</select>
+            <button class="qr-btn qr-sm" data-act="attach-card">Pasang</button></div></section>
+          <section><h4>Buku cerita</h4>${Object.entries(st.canon || {}).map(([k, v]) => `<div class="qr-canon" data-sec="${esc(k)}"><b>${esc(k)}</b><textarea rows="3">${esc(v)}</textarea>
+            <button class="qr-btn qr-sm" data-act="canon-save">Simpan</button></div>`).join("")}
+            <div class="qr-canon" data-sec=""><input class="qr-canon-new" placeholder="Bagian baru, misalnya: Alur terbuka"><textarea rows="2"></textarea><button class="qr-btn qr-sm" data-act="canon-save">${icon("plus")}Tambah</button></div></section>
+          <section><h4>Jangan pernah lupa</h4><textarea class="qr-nf" rows="4" placeholder="Satu fakta per baris">${esc((st.never_forget || []).join("\n"))}</textarea>
+            <button class="qr-btn qr-sm" data-act="nf-save">Simpan</button></section>
+          ${(st.pending || []).length ? `<section><h4>Menunggu epoch berikutnya</h4>${st.pending.map((p) => `<div class="qr-muted">• ${esc(p)}</div>`).join("")}
+            <button class="qr-btn qr-sm" data-act="apply-now">${icon("refresh")}Terapkan sekarang</button></section>` : ""}`;
+      }
+      function tabCards() {
+        const lib = get("library"), card = get("card"), types = get("boot").types || {};
+        if (state.cardView && card.id === state.cardView) {
+          return `<button class="qr-btn qr-sm" data-act="cards-back">${icon("left")}Perpustakaan</button>${cardForm(card, false)}`;
+        }
+        const q = state.libFilter.toLowerCase();
+        const by = {};
+        for (const c of lib.cards || []) if (!q || c.name.toLowerCase().includes(q)) (by[c.type] ||= []).push(c);
+        return `<div class="qr-row qr-wrap"><input class="qr-lib-filter" placeholder="Cari kartu" value="${esc(state.libFilter)}">
+            <button class="qr-btn qr-sm" data-act="card-import">${icon("upload")}Impor (qcard / SillyTavern JSON/PNG)</button>
+            <button class="qr-btn qr-sm" data-act="story-wizard">${icon("book")}Mulai cerita</button></div>
+          ${Object.keys(types).map((t) => `<section><h4>${esc(types[t])} <button class="qr-btn qr-sm" data-act="card-new" data-type="${t}">${icon("plus")}Baru</button>
+            <button class="qr-btn qr-sm" data-act="schema" data-type="${t}">Skema</button></h4>
+            ${(by[t] || []).map((c) => `<button class="qr-libitem" data-act="open-card" data-id="${c.id}">${icon("card")}<span>${esc(c.name)}</span><span class="qr-muted">v${c.version}</span></button>`).join("") || '<div class="qr-muted">Belum ada.</div>'}</section>`).join("")}`;
+      }
+      function tabMemory() {
+        const a = state.memory || { rows: [], log: [] };
+        return `<label class="qr-search">${icon("search")}<input class="qr-mem-q" placeholder="Cari memory" value="${esc(a.q || "")}"></label>
+          <section><h4>Memory</h4>${(a.rows || []).map((m) => `<div class="qr-memrow"><span class="qr-badge">${esc(m.scope)}${m.kind === "summary_core" ? " · ringkasan" : ""}</span>
+            <span>#${m.id} ${esc(m.text)}</span><button class="qr-icon qr-xs" data-act="mem-del" data-id="${m.id}" title="Hapus">${icon("trash")}</button></div>`).join("") || '<div class="qr-muted">Kosong.</div>'}</section>
+          <section><h4>Catatan perubahan oleh model</h4>${(a.log || []).map((l) => `<div class="qr-memrow ${l.undone ? "undone" : ""}"><span class="qr-badge">${esc(l.action)}</span>
+            <span>#${l.memory_id} ${esc((l.after || l.before || "").slice(0, 160))}</span>${l.undone ? '<span class="qr-muted">dibatalkan</span>' : `<button class="qr-btn qr-sm" data-act="mem-undo" data-id="${l.id}">Undo</button>`}</div>`).join("") || '<div class="qr-muted">Belum ada.</div>'}</section>`;
+      }
+      function tabModel() {
+        const boot = get("boot"), s = get("server");
+        const sel = state.modelSel || s.preset || (boot.presets[0] || {}).name;
+        const p = boot.presets.find((x) => x.name === sel) || boot.presets[0];
+        const ctxs = Object.entries(boot.ctx_choices || {}).filter(([, v]) => v <= p.yarn_max);
+        return `<section><h4>Server</h4><div class="qr-srv"><i class="qr-dot ${s.phase === "ready" ? "ok" : s.phase === "failed" ? "bad" : s.phase === "idle" ? "off" : "wait"}"></i>
+            <b>${esc(s.preset || "Tidak ada")}</b> <span class="qr-muted">${esc(s.phase || "")}${s.ctx ? ` · ${fmtN(s.ctx)} token` : ""}${s.mtp ? " · MTP" : ""}${s.embed ? ` · embedder ${s.embed_ready ? "siap" : "memuat"}` : ""}</span></div>
+          ${(s.warnings || []).map((w) => `<div class="qr-flag">${icon("warn")}${esc(w)}</div>`).join("")}${s.error ? `<pre class="qr-error">${esc(s.error)}</pre>` : ""}
+          ${s.gpu ? `<div class="qr-muted">GPU ${s.gpu.util.toFixed(0)}% · VRAM ${s.gpu.used_gb.toFixed(1)} / ${s.gpu.total_gb.toFixed(0)} GB</div>` : ""}
+          ${s.installed ? "" : `<div class="qr-flag">${icon("warn")}Belum terpasang. Klik Install di sel Server model.</div>`}</section>
+          <section><h4>Ganti model</h4><label>Model<select class="qr-model-sel">${boot.presets.map((x) => `<option ${x.name === sel ? "selected" : ""}>${esc(x.name)}</option>`).join("")}</select></label>
+          <label>Konteks<select class="qr-ctx-sel">${ctxs.map(([k, v]) => `<option value="${v}" ${v === (s.ctx || 524288) ? "selected" : ""}>${esc(k)}</option>`).join("")}</select></label>
+          ${p.yarn_exp ? '<div class="qr-help">Di atas 262K memakai YaRN tanpa resep resmi untuk model ini (eksperimental).</div>' : ""}
+          <label class="qr-check"><input type="checkbox" class="qr-mtp" checked> MTP</label><label class="qr-check"><input type="checkbox" class="qr-emb" checked> Embedder</label>
+          <div class="qr-help">Ganti model membuat seluruh konteks diproses ulang di giliran berikutnya (bisa beberapa menit untuk chat panjang).</div>
+          <div class="qr-row"><button class="qr-btn qr-primary" data-act="model-start">${icon("cpu")}Start</button><button class="qr-btn qr-danger" data-act="model-stop">Stop</button></div></section>`;
+      }
+      function tabLearn() {
+        const v = state.vocab || { due: [], all: [] };
+        const card = v.due[0];
+        return `<section><h4>Flashcard (${v.due.length} jatuh tempo)</h4>${card ? `<div class="qr-flash"><div class="qr-flash-term">${esc(card.term)}</div>
+            <details><summary>Lihat arti</summary><div>${esc(card.translation)}</div><div class="qr-muted">${esc(card.note)}</div><div class="qr-muted">${esc(card.example)}</div></details>
+            <div class="qr-row">${[["Lupa", 0], ["Sulit", 1], ["Bagus", 2], ["Mudah", 3]].map(([l, g]) => `<button class="qr-btn qr-sm" data-act="review" data-id="${card.id}" data-grade="${g}">${l}</button>`).join("")}</div></div>`
+            : '<div class="qr-muted">Tidak ada yang jatuh tempo.</div>'}</section>
+          <section><h4>Kosakata (${v.all.length})</h4>${v.all.map((x) => `<div class="qr-memrow"><b>${esc(x.term)}</b><span>${esc(x.translation)}</span>
+            <button class="qr-icon qr-xs" data-act="vocab-del" data-id="${x.id}">${icon("trash")}</button></div>`).join("") || '<div class="qr-muted">Klik dialog di chat (mode belajar) lalu tambah kata.</div>'}</section>`;
+      }
+
+      // ---------- story wizard ----------
+      function storyWizard() {
+        send("library");
+        state.wizard = true;
+        renderWizard();
+      }
+      function renderWizard() {
+        if (!state.wizard) return;
+        const lib = get("library"), types = get("boot").types || {};
+        const opt = (t) => (lib.cards || []).filter((c) => c.type === t).map((c) => `<option value="${c.id}">${esc(c.name)}</option>`).join("");
+        openModal("Mulai cerita", `<div class="qr-wizard">
+          <label>Judul<input class="wz-title" placeholder="Kosong = dari skenario"></label>
+          ${["world", "scenario", "persona", "style", "gm"].map((t) => `<label>${esc(types[t] || t)}<select data-role="${t}"><option value="">${t === "style" || t === "gm" ? "default" : "tidak ada"}</option>${opt(t)}</select></label>`).join("")}
+          <div class="qr-flabel">Tokoh</div><div class="qr-wz-chars">${(lib.cards || []).filter((c) => c.type === "character").map((c) => `<label class="qr-check"><input type="checkbox" value="${c.id}"> ${esc(c.name)}</label>`).join("") || '<span class="qr-muted">Belum ada kartu tokoh. Buat di Studio atau impor.</span>'}</div>
+          <label>Pesan pembuka ke-<input class="wz-greet" type="number" min="1" value="1"></label>
+          <div class="qr-row"><button class="qr-btn qr-primary" data-act="wizard-go">${icon("book")}Mulai</button><button class="qr-btn" data-act="studio">${icon("sparkles")}Susun di Studio dulu</button></div></div>`);
+      }
+
+      // ---------- events ----------
+      function addFiles(files) {
+        for (const f of files) {
+          if (f.size > MAX_FILE) { toast(`${f.name} lebih dari 25 MB.`, "warn"); continue; }
+          if ((f.type || "").startsWith("audio/")) { toast(`${f.name}: audio tidak didukung.`, "warn"); continue; }
+          state.pending.push(f);
+        }
+        renderPending();
+      }
+      function renderPending() {
+        const box = $(".qr-pending");
+        box.hidden = !state.pending.length;
+        box.innerHTML = state.pending.map((f, i) => `<span class="qr-att">${icon("clip")}${esc(f.name)} <span class="qr-muted">${kb(f.size)}</span><button class="qr-icon qr-xs" data-act="unpend" data-i="${i}">${icon("x")}</button></span>`).join("");
+      }
+      const LONG_PH = input.placeholder;
+      new ResizeObserver(() => { input.placeholder = el.clientWidth < 640 ? "Kirim pesan" : LONG_PH; }).observe(el);
+      const grow = () => { input.style.height = "auto"; input.style.height = `${Math.min(input.scrollHeight, 240)}px`; };
+      input.addEventListener("input", grow);
+      input.addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); $(".qr-form").requestSubmit(); } });
+      input.addEventListener("paste", (e) => { const fs = [...(e.clipboardData?.files || [])]; if (fs.length) { e.preventDefault(); addFiles(fs); } });
+      $(".qr-form").addEventListener("submit", async (e) => {
+        e.preventDefault();
+        const text = input.value.trim();
+        if (model.get("busy") && !text && !state.pending.length) { send("stop"); return; }
+        if (!text && !state.pending.length) return;
+        try {
+          const files = await Promise.all(state.pending.map(async (f) => ({ name: f.name, mime: f.type || "", b64: await readB64(f) })));
+          send("send", { text, files });
+          input.value = ""; state.pending = []; renderPending(); grow(); fol.jump();
+        } catch (err) { toast(`Gagal membaca lampiran: ${err}`, "error"); }
+      });
+      const main = $(".qr-main");
+      let depth = 0;
+      main.addEventListener("dragenter", (e) => { if (e.dataTransfer?.types?.includes("Files")) { depth++; $(".qr-drop").hidden = false; } });
+      main.addEventListener("dragleave", () => { depth = Math.max(0, depth - 1); if (!depth) $(".qr-drop").hidden = true; });
+      main.addEventListener("dragover", (e) => e.preventDefault());
+      main.addEventListener("drop", (e) => { e.preventDefault(); depth = 0; $(".qr-drop").hidden = true; addFiles([...(e.dataTransfer?.files || [])]); });
+      $(".qr-search-in").addEventListener("input", renderChats);
+      $(".qr-search-in").addEventListener("keydown", (e) => { if (e.key === "Enter" && e.target.value.trim()) send("search", { q: e.target.value.trim() }); });
+      el.addEventListener("toggle", (e) => {
+        const d = e.target;
+        if (!(d instanceof HTMLDetailsElement) || !d.dataset.key) return;
+        d.open ? state.open.add(d.dataset.key) : state.open.delete(d.dataset.key);
+      }, true);
+      $(".qr-file-db").addEventListener("change", async (e) => {
+        const f = e.target.files?.[0]; e.target.value = "";
+        if (f && confirm("Muat file ini? Semua chat, kartu, dan memory sekarang diganti isi file.")) send("load_db", { b64: await readB64(f) });
+      });
+      $(".qr-file-att").addEventListener("change", (e) => { addFiles([...(e.target.files || [])]); e.target.value = ""; });
+      $(".qr-file-card").addEventListener("change", async (e) => { const f = e.target.files?.[0]; e.target.value = ""; if (f) send("card_import", { b64: await readB64(f), name: f.name }); });
+      $(".qr-file-avatar").addEventListener("change", async (e) => {
+        const f = e.target.files?.[0]; e.target.value = "";
+        const form = el.querySelector(".qr-drawer .qr-card-form");
+        if (f && form) send("card_save", { card_id: Number(form.dataset.card), data: collectCard(form), avatar: await readB64(f) });
+      });
+      dbody.addEventListener("input", (e) => {
+        const t = e.target;
+        if (t.dataset.smp && t.type === "range") t.nextElementSibling.textContent = t.value;
+        if (t.classList.contains("qr-lib-filter")) { state.libFilter = t.value; clearTimeout(state.lf); state.lf = setTimeout(() => { const pos = t.selectionStart; dbody.innerHTML = tabCards(); const n = dbody.querySelector(".qr-lib-filter"); n.focus(); n.setSelectionRange(pos, pos); }, 200); }
+      });
+      dbody.addEventListener("change", (e) => {
+        const t = e.target;
+        if (t.dataset.set) {
+          const v = t.type === "checkbox" ? t.checked : t.type === "number" ? (t.value === "" ? null : Number(t.value)) : t.value || null;
+          send("settings", { [t.dataset.set]: v });
+          if (t.dataset.set === "learn") { state.learn = !!v; el.classList.toggle("learn", state.learn); els.clear(); list.innerHTML = ""; renderHistory(); }
+        } else if (t.dataset.smp) {
+          const s = { ...((get("chat").settings || {}).sampling || {}) };
+          if (t.value === "") delete s[t.dataset.smp]; else s[t.dataset.smp] = Number(t.value);
+          send("settings", { sampling: s });
+        } else if (t.classList.contains("qr-model-sel")) { state.modelSel = t.value; dbody.innerHTML = tabModel(); }
+        else if (t.classList.contains("qr-version-sel") && t.value) { const form = t.closest(".qr-card-form"); send("card_version", { card_id: Number(form.dataset.card), version: Number(t.value) }); }
+        else if (t.classList.contains("qr-mem-q")) send("memory", { q: t.value });
+      });
+      modal.addEventListener("click", (e) => { if (e.target === modal) closeModal(); });
+
+      el.addEventListener("click", (e) => {
+        const chatRow = e.target.closest(".qr-chat");
+        const btn = e.target.closest("[data-act]");
+        if (!btn && chatRow) { send("select", { chat_id: Number(chatRow.dataset.chat) }); el.classList.remove("side-open"); return; }
+        const q = e.target.closest(".qq");
+        if (!btn && q && state.learn) { send("learn", { text: q.textContent.replace(/^["“„«]|["”“»]$/g, "") }); return; }
+        if (!btn) return;
+        const act = btn.dataset.act, id = btn.dataset.id ? Number(btn.dataset.id) : null;
+        const row = btn.closest("[data-id]");
+        const mid = id || (row ? Number(row.dataset.id) : null);
+        switch (act) {
+          case "new": send("new", { kind: btn.dataset.kind }); break;
+          case "studio": closeModal(); state.wizard = false; send("studio_start"); break;
+          case "story-wizard": storyWizard(); break;
+          case "toggle-side": el.classList.toggle("side-open"); break;
+          case "rename-chat": { e.stopPropagation(); const t = prompt("Nama chat:", (model.get("chats") || []).find((c) => c.id === id)?.title || ""); if (t) send("rename", { chat_id: id, title: t }); break; }
+          case "delete-chat": e.stopPropagation(); if (confirm("Hapus chat ini beserta semua pesannya? Tidak bisa dibatalkan.")) send("delete_chat", { chat_id: id }); break;
+          case "save-db": send("save_db"); break;
+          case "load-db": $(".qr-file-db").click(); break;
+          case "attach": $(".qr-file-att").click(); break;
+          case "unpend": state.pending.splice(Number(btn.dataset.i), 1); renderPending(); break;
+          case "impersonate": send("impersonate", { hint: input.value.trim() }); break;
+          case "jump": fol.jump(); break;
+          case "load-more": send("load_more"); break;
+          case "compact": if (confirm("Padatkan konteks lama sekarang? Bisa makan waktu beberapa menit untuk chat panjang.")) send("compact"); break;
+          case "open-tab": openDrawer(btn.dataset.tab); break;
+          case "close-drawer": drawer.hidden = true; break;
+          case "tab": openDrawer(btn.dataset.tab); break;
+          case "close-modal": closeModal(); state.wizard = false; break;
+          case "toggle-world": state.open.has("world") ? state.open.delete("world") : state.open.add("world"); renderPanels(); break;
+          case "time-skip": if (confirm(`Lompat waktu ${btn.dataset.label}?`)) send("time_skip", { label: btn.dataset.label }); break;
+          case "copy": { const it = (model.get("history").items || []).find((x) => x.id === mid || (x.ids || []).includes(mid)); navigator.clipboard?.writeText(it ? it.content : ""); toast("Disalin."); break; }
+          case "edit": {
+            const it = (model.get("history").items || []).find((x) => x.id === mid);
+            openModal("Edit pesan", `<textarea class="qr-edit-text" rows="10">${esc(it ? it.content : "")}</textarea>
+              <div class="qr-help">${it && it.kind === "user" ? "Membuat cabang baru dan menjawab ulang dari sini." : "Menyimpan versi baru pesan ini."}</div>
+              <button class="qr-btn qr-primary" data-act="edit-save" data-id="${mid}">Simpan</button>`);
+            break;
+          }
+          case "edit-save": send("edit", { mid: id, text: el.querySelector(".qr-edit-text").value }); closeModal(); break;
+          case "reroll": send("reroll", { mid }); break;
+          case "continue": send("continue", { mid }); break;
+          case "swipe": send("swipe", { mid: id, dir: Number(btn.dataset.dir) }); break;
+          case "delete": if (confirm("Hapus pesan ini dan semua balasan setelahnya di cabang ini?")) send("delete_msg", { mid }); break;
+          case "branch": send("branch", { mid }); break;
+          case "pin": { const it = (model.get("history").items || []).find((x) => x.id === mid); send("pin", { mid, on: !(it && it.pinned) }); break; }
+          case "chapter": { const t = prompt("Judul bab:"); if (t) send("chapter", { mid, title: t }); break; }
+          case "fact-check": send("fact_check", { mid }); toast("Memeriksa fakta…"); break;
+          case "choose": send("choose", { text: btn.dataset.text }); fol.jump(); break;
+          case "choose-edit": input.value = btn.dataset.text; grow(); input.focus(); break;
+          case "think-follow": { const box = btn.parentElement.querySelector(".qr-think-box"); thinkFollow = true; btn.hidden = true; box.scrollTop = box.scrollHeight; break; }
+          case "think-full": { const d = btn.closest(".qr-think"); d.classList.toggle("full"); btn.textContent = d.classList.contains("full") ? "Ringkas" : "Tampilkan penuh"; break; }
+          case "quick": send("send", { text: btn.dataset.text }); break;
+          case "studio-card": state.studioCard = id; send("card_open", { card_id: id }); break;
+          case "studio-finish": { const t = prompt("Judul cerita (kosong = dari skenario):", ""); if (t !== null) send("studio_finish", { title: t }); break; }
+          case "card-save": { const form = btn.closest(".qr-card-form"); send("card_save", { card_id: Number(form.dataset.card), data: collectCard(form) }); break; }
+          case "card-avatar": $(".qr-file-avatar").click(); break;
+          case "card-export": { const form = btn.closest(".qr-card-form"); send("card_export", { card_id: Number(form.dataset.card), fmt: btn.dataset.fmt }); break; }
+          case "card-delete": { const form = btn.closest(".qr-card-form"); if (confirm("Hapus kartu ini beserta lore dan garis waktunya?")) { send("card_delete", { card_id: Number(form.dataset.card) }); state.cardView = null; } break; }
+          case "card-new": send("card_new", { type: btn.dataset.type }); state.cardView = "new"; break;
+          case "card-import": $(".qr-file-card").click(); break;
+          case "open-card": state.tab = "cards"; state.cardView = id; drawer.hidden = false; send("card_open", { card_id: id }); renderDrawer(); break;
+          case "cards-back": state.cardView = null; send("library"); renderDrawer(); break;
+          case "schema": send("schema_get", { type: btn.dataset.type }); break;
+          case "schema-save": send("schema_save", { schema: el.querySelector(".qr-schema-text").value }); break;
+          case "row-add": { const tbl = btn.closest(".qr-table"); const n = Number(tbl.dataset.cols); const r = document.createElement("div"); r.className = "qr-trow"; r.innerHTML = Array(n).fill("<input>").join("") + `<button class="qr-icon qr-xs" data-act="row-del">${icon("x")}</button>`; tbl.insertBefore(r, btn); break; }
+          case "row-del": btn.closest(".qr-trow").remove(); break;
+          case "lore-save": { const box = btn.closest(".qr-lore-edit"), form = btn.closest(".qr-card-form"); const v = (c) => box.querySelector(c).value;
+            if (!v(".le-title").trim()) { toast("Judul lore kosong.", "warn"); break; }
+            send("lore_save", { card_id: Number(form.dataset.card), title: v(".le-title"), text: v(".le-text"), keys: v(".le-keys"), kind: v(".le-kind") || "istilah", core: box.querySelector(".le-core").checked, entry_id: box.dataset.entry ? Number(box.dataset.entry) : null }); break; }
+          case "lore-del": { const box = btn.closest(".qr-lore-edit"), form = btn.closest(".qr-card-form"); send("lore_delete", { card_id: Number(form.dataset.card), entry_id: Number(box.dataset.entry) }); break; }
+          case "tl-save": { const r = btn.closest(".qr-tl"), form = btn.closest(".qr-card-form"); send("timeline_save", { card_id: Number(form.dataset.card), at: r.querySelector(".tl-at").value, title: r.querySelector(".tl-title").value, text: r.querySelector(".tl-text").value, entry_id: r.dataset.entry ? Number(r.dataset.entry) : null }); break; }
+          case "tl-del": { const r = btn.closest(".qr-tl"), form = btn.closest(".qr-card-form"); send("timeline_delete", { card_id: Number(form.dataset.card), entry_id: Number(r.dataset.entry) }); break; }
+          case "attach-card": { const cid = dbody.querySelector(".qr-attach-card").value; if (cid) send("story_attach", { card_id: Number(cid), role: dbody.querySelector(".qr-attach-role").value }); break; }
+          case "detach": send("story_detach", { card_id: id, role: btn.dataset.role }); break;
+          case "canon-save": { const box = btn.closest(".qr-canon"); const sec = box.dataset.sec || box.querySelector(".qr-canon-new").value.trim(); if (sec) send("canon", { section: sec, text: box.querySelector("textarea").value }); break; }
+          case "nf-save": send("never_forget", { items: dbody.querySelector(".qr-nf").value.split("\n") }); break;
+          case "apply-now": send("apply_now"); break;
+          case "continue-new": if (confirm("Lanjutkan cerita ini di chat baru (kronik dan adegan terakhir dibawa)?")) send("continue_new"); break;
+          case "branches": send("branches"); break;
+          case "goto": send("goto", { mid: id }); closeModal(); break;
+          case "prompt-view": send("prompt_view"); break;
+          case "recall-test": send("recall_test"); toast("Uji ingatan berjalan…"); break;
+          case "export": send("export", { fmt: btn.dataset.fmt }); break;
+          case "save-system": send("settings", { system: dbody.querySelector("[data-system]").value }); break;
+          case "smp-reset": send("settings", { sampling: {} }); break;
+          case "mem-del": send("memory_delete", { mid: id }); break;
+          case "mem-undo": send("memory_undo", { log_id: id }); break;
+          case "model-start": send("model_switch", { preset: dbody.querySelector(".qr-model-sel").value, ctx: Number(dbody.querySelector(".qr-ctx-sel").value), mtp: dbody.querySelector(".qr-mtp").checked, embed: dbody.querySelector(".qr-emb").checked }); break;
+          case "model-stop": if (confirm("Hentikan server model?")) send("model_stop"); break;
+          case "review": send("vocab_review", { vid: id, grade: Number(btn.dataset.grade) }); break;
+          case "vocab-del": send("vocab_delete", { vid: id }); break;
+          case "vocab-add": send("vocab_add", { term: btn.dataset.term, translation: btn.dataset.tr, note: btn.dataset.note, example: btn.dataset.ex }); break;
+          case "jump-to": send("jump", { chat_id: Number(btn.dataset.chat), mid: id }); closeModal(); break;
+          case "wizard-go": {
+            const box = el.querySelector(".qr-wizard"), cards = {};
+            box.querySelectorAll("select[data-role]").forEach((s) => { if (s.value) cards[s.dataset.role] = Number(s.value); });
+            cards.character = [...box.querySelectorAll(".qr-wz-chars input:checked")].map((i) => Number(i.value));
+            send("start_story", { cards, title: box.querySelector(".wz-title").value, greeting: Number(box.querySelector(".wz-greet").value || 1) - 1 });
+            state.wizard = false; closeModal(); break;
+          }
+        }
+      });
+      el.querySelector(".qr-title").addEventListener("dblclick", () => {
+        const c = get("chat"); if (!c.id) return;
+        const t = prompt("Nama chat:", c.title); if (t) send("rename", { chat_id: c.id, title: t });
+      });
+
+      // ---------- model events ----------
+      const onAux = () => {
+        const a = model.get("aux") || {};
+        if (!a.kind) return;
+        const d = a.data;
+        if (a.kind === "memory") { state.memory = d; if (state.tab === "memory") { const f = document.activeElement; dbody.innerHTML = tabMemory(); if (f && f.classList.contains("qr-mem-q")) dbody.querySelector(".qr-mem-q").focus(); } }
+        else if (a.kind === "vocab") { state.vocab = d; if (state.tab === "learn") dbody.innerHTML = tabLearn(); }
+        else if (a.kind === "branches") openModal("Pohon cabang", d.map((b) => `<div class="qr-branch ${b.active ? "on" : ""}"><span class="qr-badge">${b.depth} pesan</span>
+            <span>${esc(b.preview)}</span>${b.head ? '<span class="qr-muted">aktif</span>' : `<button class="qr-btn qr-sm" data-act="goto" data-id="${b.id}">Buka</button>`}</div>`).join("") || "Belum ada cabang.");
+        else if (a.kind === "prompt") openModal("Prompt yang dikirim", `<div class="qr-muted">${fmtN(d.tokens)} token (system ${fmtN(d.system_tokens)}) dari ${fmtN(d.max)} · epoch ${d.epoch} · ${d.history_messages} pesan riwayat</div>
+            <div class="qr-muted">kwargs ${esc(JSON.stringify(d.kwargs))} · sampler ${esc(JSON.stringify(d.sampling))}</div>
+            <h4>System (beku)</h4><pre class="qr-pre">${esc(d.system)}</pre><h4>Pesan terakhir + blok sementara</h4><pre class="qr-pre">${esc(d.last_user_text)}</pre>`);
+        else if (a.kind === "search") openModal(`Hasil "${d.q}"`, (d.results || []).map((r) => `<button class="qr-libitem" data-act="jump-to" data-chat="${r.chat_id}" data-id="${r.id}"><b>${esc(r.title)}</b><span>${esc(r.snippet)}</span></button>`).join("") || "Tidak ketemu.");
+        else if (a.kind === "learn") openModal("Penjelasan", `<blockquote>${esc(d.text)}</blockquote><p><b>${esc(d.translation || "")}</b></p>
+            ${(d.grammar || []).length ? `<ul>${d.grammar.map((g) => `<li>${esc(g)}</li>`).join("")}</ul>` : ""}
+            ${(d.vocab || []).map((v) => `<div class="qr-memrow"><b>${esc(v.term)}</b><span>${esc(v.translation)} <span class="qr-muted">${esc(v.note || "")}</span></span>
+              <button class="qr-btn qr-sm" data-act="vocab-add" data-term="${esc(v.term)}" data-tr="${esc(v.translation)}" data-note="${esc(v.note || "")}" data-ex="${esc(d.text)}">${icon("plus")}</button></div>`).join("")}`);
+        else if (a.kind === "recall") openModal("Uji ingatan", d.error ? esc(d.error) : `<p><b>${d.score}/${d.total}</b> benar</p>${d.items.map((x) => `<div class="qr-recall ${x.ok ? "ok" : "bad"}">${icon(x.ok ? "check" : "x")}<div><b>${esc(x.q)}</b><br>
+            <span class="qr-muted">kunci:</span> ${esc(x.expected)}<br><span class="qr-muted">jawaban:</span> ${esc(x.got)}</div></div>`).join("")}`);
+        else if (a.kind === "schema") openModal(`Skema: ${d.label || d.type}`, `<div class="qr-help">Tambah field = tambah objek di "fields" (key, label, section, type, core, visibility, help, options, columns). Tidak perlu ubah kode.</div>
+            <textarea class="qr-schema-text" rows="22">${esc(JSON.stringify(d, null, 2))}</textarea><button class="qr-btn qr-primary" data-act="schema-save">Simpan skema</button>`);
+        else if (a.kind === "scroll_to") setTimeout(() => { const n = list.querySelector(`[data-id="${d}"]`); if (n) { fol.release(); n.scrollIntoView({ block: "center" }); n.classList.add("flash"); } }, 100);
+      };
+      const onExport = () => {
+        const ex = model.get("export") || {};
+        if (!ex.b64) return;
+        const bytes = Uint8Array.from(atob(ex.b64), (c) => c.charCodeAt(0));
+        const url = URL.createObjectURL(new Blob([bytes], { type: "application/octet-stream" }));
+        const a = Object.assign(document.createElement("a"), { href: url, download: ex.name || "export" });
+        document.body.appendChild(a); a.click(); a.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 5000);
+      };
+      const onToast = () => { const t = model.get("toast") || {}; if (t.text) toast(t.text, t.kind || "info", !!t.long); };
+      const onCompose = () => { const c = model.get("compose") || {}; if (c.text) { input.value = c.text; grow(); input.focus(); } };
+      const onChat = () => {
+        const c = get("chat");
+        const learn = !!((c.settings || {}).learn);
+        if (learn !== state.learn) { state.learn = learn; el.classList.toggle("learn", learn); els.clear(); list.innerHTML = ""; }
+        if (state.lastChat !== c.id) { state.lastChat = c.id; state.studioCard = null; els.clear(); list.innerHTML = ""; fol.jump(); }
+        renderTop(); renderChats(); renderStudio(); renderDrawer(); renderHistory();
+      };
+      const onCard = () => {
+        const card = get("card");
+        if (state.cardView === "new" && card.id) state.cardView = card.id;
+        renderStudio();
+        if (state.tab === "cards") renderDrawer();
+      };
+      let raf = 0;
+      const onLive = () => { if (!raf) raf = requestAnimationFrame(() => { raf = 0; renderLive(); }); };
+      const handlers = {
+        "change:chats": renderChats, "change:chat": onChat, "change:history": () => { renderHistory(); if (get("chat").kind === "studio" && state.studioCard) send("card_open", { card_id: state.studioCard }); },
+        "change:live": onLive, "change:busy": renderBusy, "change:status": renderStatusLine, "change:queue": renderStatusLine,
+        "change:toast": onToast, "change:ctx": renderTop, "change:panels": () => { renderPanels(); renderTop(); },
+        "change:server": () => { renderTop(); if (state.tab === "model") renderDrawer(); }, "change:backup": renderBackup,
+        "change:library": () => { if (state.tab === "cards" || state.tab === "story") renderDrawer(); renderWizard(); },
+        "change:card": onCard, "change:story": () => { renderStudio(); if (state.tab === "story") renderDrawer(); },
+        "change:aux": onAux, "change:export": onExport, "change:compose": onCompose, "change:boot": renderDrawer,
+      };
+      for (const [ev, fn] of Object.entries(handlers)) model.on(ev, fn);
+      const timer = setInterval(renderBackup, 30000);
+      onChat(); renderBusy(); renderLive(); renderPanels(); renderBackup(); renderStatusLine();
+      return () => { for (const [ev, fn] of Object.entries(handlers)) model.off(ev, fn); clearInterval(timer); themeObs.disconnect(); };
+    }
+    export default { render };
+    """
+    return (UI_APP_JS,)
+
+
+@app.cell(hide_code=True)
+def _(UI_APP_JS, UI_BASE_JS):
+    UI_CSS = r"""
+    .qr { --bg:#212121; --panel:#171717; --raise:#2a2a2a; --bubble:#303030; --line:#363636; --text:#ececec; --muted:#9b9b9b;
+      --accent:#2fb886; --accent-ink:#06130d; --danger:#ef5350; --warn:#e0a83a; --ok:#2fb886; --code:#0f0f0f;
+      --tr:#a8a8a8; --radius:14px;
+      color-scheme: dark; background:var(--bg); color:var(--text); display:flex; position:relative; overflow:hidden;
+      height:calc(100vh - 140px); min-height:600px; border:1px solid var(--line); border-radius:18px;
+      font: 15px/1.6 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; }
+    .qr[data-theme="light"] { --bg:#ffffff; --panel:#f7f7f8; --raise:#ececf1; --bubble:#f1f1f3; --line:#e3e3e8; --text:#1f1f1f;
+      --muted:#6b6b72; --accent:#13865f; --accent-ink:#ffffff; --code:#f4f4f6; --tr:#6f6f76; color-scheme: light; }
+    .qr *, .qr *::before, .qr *::after { box-sizing:border-box; }
+    .qr .qi { width:18px; height:18px; flex:none; fill:none; stroke:currentColor; stroke-width:2; stroke-linecap:round; stroke-linejoin:round; }
+    :where(.qr) button { font:inherit; color:inherit; cursor:pointer; }
+    .qr button:disabled { opacity:.5; cursor:not-allowed; }
+    .qr :focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+    .qr input, .qr textarea, .qr select { font:inherit; color:var(--text); background:var(--raise); border:1px solid var(--line);
+      border-radius:10px; padding:7px 10px; width:100%; }
+    .qr textarea { resize:vertical; line-height:1.5; }
+    .qr label { display:flex; flex-direction:column; gap:4px; font-size:13px; color:var(--muted); margin:8px 0; }
+    .qr label.qr-check { flex-direction:row; align-items:center; gap:8px; color:var(--text); }
+    .qr label.qr-check input { width:auto; }
+    .qr h4 { margin:18px 0 8px; font-size:13px; text-transform:none; color:var(--text); display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+    .qr-muted { color:var(--muted); font-size:13px; }
+    .qr-pad { padding:10px; }
+    .qr-row { display:flex; gap:8px; align-items:center; }
+    .qr-wrap { flex-wrap:wrap; }
+    .qr-grid2 { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+    .qr-btn { display:inline-flex; align-items:center; justify-content:center; gap:6px; background:var(--raise); border:1px solid var(--line);
+      border-radius:10px; padding:7px 12px; font-size:14px; white-space:nowrap; }
+    .qr-btn:hover { border-color:color-mix(in srgb, var(--text) 25%, var(--line)); }
+    .qr-btn.qr-sm { padding:4px 9px; font-size:13px; border-radius:8px; }
+    .qr-btn.qr-primary { background:var(--accent); color:var(--accent-ink); border-color:transparent; font-weight:600; }
+    .qr-btn.qr-danger { color:var(--danger); }
+    .qr-icon { display:inline-grid; place-items:center; width:34px; height:34px; border-radius:10px; background:transparent; border:0; color:var(--muted); }
+    .qr-icon:hover { background:var(--raise); color:var(--text); }
+    .qr-icon.qr-xs { width:26px; height:26px; border-radius:7px; }
+    .qr-icon.qr-xs .qi { width:15px; height:15px; }
+    .qr-badge { display:inline-flex; align-items:center; gap:3px; font-size:11px; padding:1px 7px; border-radius:999px; background:var(--raise);
+      border:1px solid var(--line); color:var(--muted); font-weight:500; }
+    .qr-badge .qi { width:11px; height:11px; }
+
+    /* sidebar */
+    .qr-side { width:270px; flex:none; background:var(--panel); border-right:1px solid var(--line); display:flex; flex-direction:column; padding:12px; gap:10px; }
+    .qr-brand { display:flex; align-items:center; gap:8px; font-weight:650; padding:4px 6px 2px; letter-spacing:-.01em; }
+    .qr-brand .qi { color:var(--accent); }
+    .qr-new { display:grid; grid-template-columns:1fr 1fr 1fr; gap:6px; }
+    .qr-new .qr-btn { padding:7px 6px; font-size:13px; }
+    .qr-search { flex-direction:row !important; align-items:center; gap:6px !important; background:var(--raise); border:1px solid var(--line);
+      border-radius:10px; padding:0 10px; margin:0 !important; color:var(--muted); }
+    .qr-search input { border:0; background:transparent; padding:8px 0; }
+    .qr-chats { flex:1; overflow-y:auto; overscroll-behavior:contain; margin:0 -4px; padding:0 4px; }
+    .qr-group { font-size:12px; color:var(--muted); padding:12px 8px 4px; font-weight:600; }
+    .qr-chat { display:flex; align-items:center; gap:8px; padding:7px 8px; border-radius:9px; cursor:pointer; color:var(--text); }
+    .qr-chat .qi { color:var(--muted); width:16px; height:16px; }
+    .qr-chat:hover { background:var(--raise); }
+    .qr-chat.on { background:color-mix(in srgb, var(--raise) 70%, var(--text) 8%); }
+    .qr-chat-t { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:14px; }
+    .qr-chat .qr-icon { visibility:hidden; }
+    .qr-chat:hover .qr-icon, .qr-chat.on .qr-icon { visibility:visible; }
+    .qr-side-foot { display:flex; flex-direction:column; gap:8px; border-top:1px solid var(--line); padding-top:10px; }
+    .qr-side-foot .qr-btn { flex:1; }
+    .qr-backup { display:flex; align-items:center; gap:6px; font-size:12px; color:var(--muted); }
+
+    /* main */
+    .qr-main { flex:1; min-width:0; display:flex; flex-direction:column; position:relative; }
+    .qr-top { display:flex; align-items:center; gap:6px; padding:8px 12px; border-bottom:1px solid var(--line); min-height:52px; }
+    .qr-toggle { display:none; }
+    .qr-title { font-weight:600; flex:1; min-width:60px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; cursor:text; }
+    .qr-chips { display:flex; gap:6px; align-items:center; overflow:hidden; }
+    .qr-chip { display:inline-flex; align-items:center; gap:6px; padding:4px 10px; border-radius:999px; background:var(--raise); border:1px solid var(--line);
+      font-size:13px; white-space:nowrap; max-width:260px; overflow:hidden; text-overflow:ellipsis; }
+    .qr-chip.qr-ghost { background:transparent; color:var(--muted); }
+    .qr-chip .qi { width:14px; height:14px; }
+    .qr-dot { width:8px; height:8px; border-radius:50%; display:inline-block; background:var(--muted); flex:none; }
+    .qr-dot.ok { background:var(--ok); } .qr-dot.bad { background:var(--danger); } .qr-dot.wait { background:var(--warn); animation:qr-pulse 1.4s infinite; }
+    @keyframes qr-pulse { 50% { opacity:.35; } }
+    .qr-ctxbar { height:2px; background:transparent; }
+    .qr-ctxfill { height:100%; width:0; background:var(--accent); transition:width .4s ease; opacity:.7; }
+    .qr-ctxfill.warn { background:var(--danger); }
+    .qr-body { flex:1; min-height:0; display:flex; position:relative; }
+    .qr-scroll { flex:1; overflow-y:auto; overscroll-behavior:contain; outline:none; }
+    .qr-col { max-width:800px; margin:0 auto; padding:24px 20px 24px; }
+    .qr-more { display:flex; margin:0 auto 16px; }
+    .qr-empty { text-align:center; color:var(--muted); margin:16vh auto 0; max-width:520px; }
+    .qr-empty h2 { color:var(--text); font-weight:600; font-size:24px; margin:0 0 8px; letter-spacing:-.01em; }
+    .qr-item.flash .qr-msg { animation:qr-flash 1.6s ease; }
+    @keyframes qr-flash { 0% { background:color-mix(in srgb, var(--accent) 18%, transparent); } 100% { background:transparent; } }
+    .qr-msg { margin:0 0 26px; }
+    .qr-user { display:flex; flex-direction:column; align-items:flex-end; gap:6px; }
+    .qr-bubble { background:var(--bubble); border-radius:20px; padding:10px 16px; max-width:80%; overflow-wrap:anywhere; white-space:normal; }
+    .qr-user.ooc .qr-bubble, .qr-bot.ooc .qr-md { opacity:.85; font-size:14px; }
+    .qr-ooc { font-size:11px; font-weight:700; letter-spacing:.04em; color:var(--warn); margin-right:6px; }
+    .qr-user.pinned .qr-bubble, .qr-bot.pinned .qr-md { box-shadow:inset 3px 0 0 var(--accent); padding-left:12px; }
+    .qr-atts { display:flex; flex-wrap:wrap; gap:6px; justify-content:flex-end; }
+    .qr-att { display:inline-flex; align-items:center; gap:5px; font-size:12px; background:var(--raise); border:1px solid var(--line);
+      border-radius:8px; padding:2px 8px; max-width:260px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .qr-att.warn { color:var(--warn); }
+    .qr-att .qi { width:13px; height:13px; }
+    .qr-actions { display:flex; gap:2px; align-items:center; opacity:0; transition:opacity .15s; margin-top:2px; }
+    .qr-msg:hover .qr-actions, .qr-msg:focus-within .qr-actions { opacity:1; }
+    @media (hover:none) { .qr-actions { opacity:1; } }
+    .qr-swipe { display:inline-flex; align-items:center; font-size:12px; color:var(--muted); margin-right:4px; }
+    .qr-skip-row { display:flex; flex-direction:column; align-items:center; gap:4px; }
+    .qr-pill { display:inline-flex; align-items:center; gap:6px; font-size:13px; color:var(--muted); border:1px dashed var(--line); border-radius:999px; padding:3px 12px; }
+    .qr-chapter { display:flex; align-items:center; gap:8px; justify-content:center; color:var(--muted); font-size:13px; margin:8px 0 22px; font-weight:600; }
+    .qr-chapter::before, .qr-chapter::after { content:""; flex:1; height:1px; background:var(--line); }
+
+    /* rendered prose */
+    .qr-md { overflow-wrap:anywhere; font-size:16px; line-height:1.72; max-width:72ch; }
+    .qr-md p { margin:0 0 14px; }
+    .qr-md p:last-child { margin-bottom:0; }
+    .qr-md h3, .qr-md h4, .qr-md h5, .qr-md h6 { margin:18px 0 8px; line-height:1.3; }
+    .qr-md ul, .qr-md ol { margin:0 0 14px; padding-left:22px; }
+    .qr-md blockquote { border-left:3px solid var(--line); margin:10px 0; padding-left:12px; color:var(--muted); }
+    .qr-md pre { background:var(--code); border:1px solid var(--line); border-radius:10px; padding:12px 14px; overflow-x:auto; font-size:13px; line-height:1.5; }
+    .qr-md code { font-family:ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size:.88em; }
+    .qr-md :not(pre) > code { background:var(--raise); padding:1px 6px; border-radius:6px; }
+    .qr-md a { color:var(--accent); }
+    .qr-md table { border-collapse:collapse; margin:10px 0; font-size:14px; }
+    .qr-md th, .qr-md td { border:1px solid var(--line); padding:5px 10px; }
+    .qr-md p.qr-speaker { display:block; }
+    .qr-md p.qr-speaker .qr-avatar { display:inline-grid; vertical-align:-6px; margin-right:6px; }
+    .qr-md .qtr { color:var(--tr); font-style:italic; font-size:.94em; }
+    .qr.learn .qr-md .qtr { filter:blur(5px); transition:filter .15s; }
+    .qr.learn .qr-md .qtr:hover { filter:none; }
+    .qr.learn .qr-md .qq { cursor:help; text-decoration:underline dotted color-mix(in srgb, var(--accent) 60%, transparent); text-underline-offset:4px; }
+
+    /* thinking and tools */
+    .qr-think { margin-bottom:12px; color:var(--muted); font-size:14px; }
+    .qr-think summary, .qr-tool summary, .qr-summary summary, .qr-adv summary, .qr-lore summary { cursor:pointer; list-style:none; display:flex; align-items:center; gap:8px; user-select:none; }
+    .qr-think summary::-webkit-details-marker, .qr-tool summary::-webkit-details-marker { display:none; }
+    .qr-think-box { max-height:340px; overflow-y:auto; overscroll-behavior:contain; border-left:2px solid var(--line); margin:8px 0 6px; padding:2px 0 2px 14px; }
+    .qr-think.full .qr-think-box { max-height:none; }
+    .qr-think-body { white-space:pre-wrap; font-size:13.5px; line-height:1.6; }
+    .qr-think-follow, .qr-think-full { margin:0 6px 0 16px; }
+    .qr-tools { display:flex; flex-direction:column; gap:4px; margin-bottom:10px; }
+    .qr-tool { font-size:13px; color:var(--muted); }
+    .qr-tool summary b { color:var(--text); font-family:ui-monospace, Menlo, Consolas, monospace; font-weight:500; font-size:12.5px; }
+    .qr-tool summary span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:420px; }
+    .qr-tool summary em { color:var(--warn); font-style:normal; }
+    .qr-tool.err summary em { color:var(--danger); }
+    .qr-tool pre { white-space:pre-wrap; background:var(--code); border:1px solid var(--line); border-radius:8px; padding:8px 10px; max-height:260px; overflow:auto; font-size:12px; }
+    .qr-dices, .qr-flags { display:flex; flex-wrap:wrap; gap:6px; margin:6px 0 10px; align-items:center; }
+    .qr-dice { display:inline-flex; align-items:center; gap:6px; font-size:12.5px; border-radius:999px; padding:2px 10px; border:1px solid var(--line); }
+    .qr-dice.ok { color:var(--ok); } .qr-dice.bad { color:var(--danger); }
+    .qr-dice .qi, .qr-flag .qi { width:14px; height:14px; }
+    .qr-flag { display:inline-flex; align-items:center; gap:6px; font-size:12.5px; color:var(--warn); }
+    .qr-fact { display:flex; gap:8px; font-size:13px; border:1px solid color-mix(in srgb, var(--warn) 45%, var(--line)); border-radius:10px; padding:8px 10px; margin:8px 0; }
+    .qr-fact .qi { color:var(--warn); }
+    .qr-partial { display:flex; align-items:center; gap:8px; color:var(--warn); font-size:13px; margin-top:8px; }
+    .qr-error { color:var(--danger); font-size:13.5px; margin-top:8px; white-space:pre-wrap; }
+    .qr-stats-line { color:var(--muted); font-size:12px; margin-top:10px; }
+    .qr-phase { margin-top:6px; font-size:13px; }
+    .qr-typing { display:inline-flex; gap:4px; padding:6px 0; }
+    .qr-typing span { width:6px; height:6px; border-radius:50%; background:var(--muted); animation:qr-blink 1.2s infinite; }
+    .qr-typing span:nth-child(2) { animation-delay:.2s; } .qr-typing span:nth-child(3) { animation-delay:.4s; }
+    @keyframes qr-blink { 0%, 80%, 100% { opacity:.25; } 40% { opacity:1; } }
+    @media (prefers-reduced-motion: reduce) { .qr-typing span, .qr-dot.wait { animation:none; } }
+    .qr-summary { border:1px dashed var(--line); border-radius:12px; padding:8px 12px; color:var(--muted); font-size:13px; }
+    .qr-summary .qr-md { font-size:14px; color:var(--text); margin-top:8px; }
+
+    /* choices */
+    .qr-choices { display:flex; flex-direction:column; gap:14px; margin-top:16px; }
+    .qr-q { font-size:14.5px; color:var(--muted); margin-bottom:8px; line-height:1.55; }
+    .qr-opt { display:flex; align-items:stretch; gap:4px; margin-bottom:6px; }
+    .qr-opt-main { flex:1; text-align:left; background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:10px 14px;
+      line-height:1.55; font-size:14.5px; }
+    .qr-opt-main:hover { border-color:var(--accent); }
+
+    /* game panels */
+    .qr-status-panel { border-bottom:1px solid var(--line); padding:8px 16px; font-size:13px; display:flex; flex-direction:column; gap:6px; }
+    .qr-sp-head { display:flex; align-items:center; gap:6px; flex-wrap:wrap; }
+    .qr-sp-head .qi { width:14px; height:14px; color:var(--muted); }
+    .qr-stats { display:flex; flex-wrap:wrap; gap:4px 18px; }
+    .qr-stat { display:flex; align-items:center; gap:6px; }
+    .qr-stat span { color:var(--muted); }
+    .qr-sbar { width:70px; height:5px; background:var(--raise); border-radius:999px; overflow:hidden; }
+    .qr-sbar i { display:block; height:100%; background:var(--accent); }
+    .qr-stat em { font-style:normal; font-size:11.5px; } .qr-stat em.up { color:var(--ok); } .qr-stat em.dn { color:var(--danger); }
+    .qr-tags { display:flex; flex-wrap:wrap; gap:6px; }
+    .qr-tag { font-size:12px; color:var(--muted); background:var(--raise); border-radius:8px; padding:1px 8px; }
+    .qr-world { border-top:1px solid var(--line); max-height:34vh; overflow-y:auto; }
+    .qr-world-head { display:flex; align-items:center; gap:8px; width:100%; background:transparent; border:0; padding:8px 16px; font-size:13px; text-align:left; }
+    .qr-world-head .qr-muted { flex:1; }
+    .qr-world-body { padding:0 16px 10px; font-size:13.5px; }
+    .qr-event { padding:3px 0; } .qr-event.new { color:var(--text); font-weight:500; }
+    .qr-skips { display:flex; flex-wrap:wrap; gap:6px; align-items:center; margin-top:8px; color:var(--muted); }
+
+    /* composer */
+    .qr-composer { padding:8px 20px 16px; }
+    .qr-pending, .qr-statusline { max-width:800px; margin:0 auto 6px; display:flex; flex-wrap:wrap; gap:6px; font-size:13px; color:var(--muted); }
+    .qr-form { max-width:800px; margin:0 auto; display:flex; align-items:flex-end; gap:4px; background:var(--bubble); border:1px solid var(--line);
+      border-radius:26px; padding:6px 6px 6px 8px; }
+    .qr-form:focus-within { border-color:color-mix(in srgb, var(--text) 30%, var(--line)); }
+    .qr .qr-input:focus-visible { outline:none; }
+    .qr-input { flex:1; border:0 !important; background:transparent !important; resize:none !important; padding:8px 4px !important; max-height:240px; }
+    .qr-note-chip { font-size:12px; border:1px solid var(--line); background:var(--raise); border-radius:999px; padding:4px 10px; color:var(--muted);
+      max-width:180px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; align-self:center; }
+    .qr-send { width:36px; height:36px; border-radius:50%; border:0; background:var(--text); color:var(--bg); display:grid; place-items:center; flex:none; }
+    .qr-send.stop { background:var(--danger); color:#fff; }
+    .qr-jump { position:absolute; left:50%; transform:translateX(-50%); bottom:14px; width:36px; height:36px; border-radius:50%;
+      background:var(--panel); border:1px solid var(--line); display:grid; place-items:center; color:var(--text); z-index:3; box-shadow:0 2px 10px rgba(0,0,0,.25); }
+    .qr-drop { position:absolute; inset:12px; border:2px dashed var(--accent); border-radius:16px; background:color-mix(in srgb, var(--accent) 8%, transparent);
+      display:flex; align-items:center; justify-content:center; font-size:16px; pointer-events:none; z-index:5; }
+    .qr-drop[hidden], .qr [hidden] { display:none !important; }
+
+    /* studio pane */
+    .qr-studio { width:400px; flex:none; border-left:1px solid var(--line); overflow-y:auto; overscroll-behavior:contain; padding:12px 14px; background:var(--panel); }
+    .qr-studio-head { display:flex; align-items:center; justify-content:space-between; margin-bottom:8px; }
+    .qr-studio-quick, .qr-studio-tabs { display:flex; flex-wrap:wrap; gap:6px; margin-bottom:10px; }
+    .qr-tabbtn { display:inline-flex; align-items:center; gap:6px; background:transparent; border:1px solid transparent; border-radius:9px; padding:5px 9px; font-size:13px; color:var(--muted); }
+    .qr-tabbtn.on { background:var(--raise); border-color:var(--line); color:var(--text); }
+    .qr-tabbtn .qi { width:15px; height:15px; }
+
+    /* drawer */
+    .qr-drawer { position:absolute; top:0; right:0; bottom:0; width:min(460px, 100%); background:var(--panel); border-left:1px solid var(--line);
+      display:flex; flex-direction:column; z-index:6; box-shadow:-8px 0 24px rgba(0,0,0,.25); }
+    .qr-drawer-head { display:flex; align-items:center; gap:6px; padding:8px 10px; border-bottom:1px solid var(--line); }
+    .qr-tabs { display:grid; grid-template-columns:repeat(6, 1fr); gap:2px; flex:1; }
+    .qr-tabs .qr-tabbtn { flex-direction:column; gap:2px; font-size:11.5px; padding:5px 2px; }
+    .qr-drawer-body { flex:1; overflow-y:auto; overscroll-behavior:contain; padding:4px 16px 24px; }
+    .qr-drawer-body section { border-bottom:1px solid var(--line); padding-bottom:12px; }
+    .qr-slider { flex-direction:row !important; align-items:center; gap:10px !important; }
+    .qr-slider input { flex:1; padding:0; background:transparent; border:0; accent-color:var(--accent); }
+    .qr-slider output { width:44px; text-align:right; color:var(--text); font-variant-numeric:tabular-nums; }
+    .qr-adv { margin-top:14px; font-size:13px; color:var(--muted); }
+    .qr-linkrow, .qr-memrow, .qr-branch, .qr-factrow { display:flex; align-items:center; gap:8px; padding:6px 0; border-bottom:1px solid color-mix(in srgb, var(--line) 60%, transparent); font-size:13.5px; }
+    .qr-linkrow b, .qr-memrow span:not(.qr-badge):not(.qr-muted), .qr-branch span:not(.qr-badge):not(.qr-muted) { flex:1; min-width:0; overflow-wrap:anywhere; }
+    .qr-memrow.undone { opacity:.5; }
+    .qr-libitem { display:flex; align-items:center; gap:8px; width:100%; text-align:left; background:transparent; border:0; border-radius:9px; padding:7px 8px; font-size:14px; flex-wrap:wrap; }
+    .qr-libitem:hover { background:var(--raise); }
+    .qr-libitem span:nth-of-type(1) { flex:1; }
+    .qr-canon { display:flex; flex-direction:column; gap:6px; margin-bottom:10px; }
+    .qr-srv { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+    .qr-help { font-size:12px; color:var(--muted); margin:2px 0 6px; }
+    .qr-flash { border:1px solid var(--line); border-radius:12px; padding:14px; }
+    .qr-flash-term { font-size:22px; font-weight:600; margin-bottom:8px; }
+    .qr-recall { display:flex; gap:8px; margin:8px 0; font-size:13.5px; }
+    .qr-recall.ok .qi { color:var(--ok); } .qr-recall.bad .qi { color:var(--danger); }
+
+    /* card form */
+    .qr-card-form fieldset { border:1px solid var(--line); border-radius:12px; padding:6px 12px 10px; margin:12px 0; }
+    .qr-card-form legend { font-size:12.5px; color:var(--muted); padding:0 6px; font-weight:600; }
+    .qr-card-top { display:flex; align-items:center; gap:12px; margin:10px 0; }
+    .qr-avatar { width:56px; height:56px; border-radius:12px; object-fit:cover; background:var(--raise); display:grid; place-items:center; color:var(--muted); }
+    .qr-avatar.sm { width:26px; height:26px; border-radius:7px; }
+    .qr .qr-flabel { font-size:13px; color:var(--text); font-weight:500; display:flex; flex-direction:row; gap:6px; align-items:center;
+      flex-wrap:wrap; margin:0 0 4px; }
+    .qr-field { margin:10px 0; }
+    .qr-field label { margin:0 0 4px; }
+    .qr-table { display:flex; flex-direction:column; gap:4px; }
+    .qr-trow { display:flex; gap:4px; align-items:center; }
+    .qr-trow input { padding:5px 8px; font-size:13px; }
+    .qr-thead span { flex:1; font-size:11.5px; color:var(--muted); }
+    .qr-thead span:last-child { flex:none; width:26px; }
+    .qr-lore { border-bottom:1px solid color-mix(in srgb, var(--line) 60%, transparent); padding:6px 0; font-size:13.5px; }
+    .qr-lore-edit { display:flex; flex-direction:column; gap:6px; margin:8px 0; }
+    .qr-tl { display:grid; grid-template-columns:150px 1fr 1fr 26px 26px; gap:4px; margin:4px 0; }
+    .qr-tl input { padding:5px 8px; font-size:13px; }
+    .qr-version-sel { width:auto; }
+
+    /* modal and toasts */
+    .qr-modal { position:absolute; inset:0; background:rgba(0,0,0,.45); display:grid; place-items:center; z-index:8; padding:16px; }
+    .qr-modal-box { background:var(--panel); border:1px solid var(--line); border-radius:16px; width:min(760px, 100%); max-height:88%; display:flex; flex-direction:column; }
+    .qr-modal-head { display:flex; align-items:center; justify-content:space-between; padding:10px 14px; border-bottom:1px solid var(--line); font-weight:600; }
+    .qr-modal-body { overflow-y:auto; padding:12px 16px 18px; font-size:14px; }
+    .qr-pre { white-space:pre-wrap; background:var(--code); border:1px solid var(--line); border-radius:10px; padding:10px; font-size:12px; max-height:40vh; overflow:auto; }
+    .qr-wizard select, .qr-wizard input { margin-top:2px; }
+    .qr-wz-chars { display:flex; flex-wrap:wrap; gap:4px 16px; margin:4px 0 8px; }
+    .qr-toasts { position:absolute; left:50%; transform:translateX(-50%); bottom:96px; display:flex; flex-direction:column; gap:6px; z-index:9; width:min(560px, 92%); }
+    .qr-toast { background:var(--text); color:var(--bg); border-radius:12px; padding:9px 14px; font-size:13.5px; white-space:pre-wrap; box-shadow:0 4px 16px rgba(0,0,0,.3); cursor:pointer; }
+    .qr-toast.qr-error { background:var(--danger); color:#fff; } .qr-toast.qr-warn { background:var(--warn); color:#1a1200; }
+
+    /* narrow screens */
+    @media (max-width: 900px) { .qr.studio-on .qr-studio { position:absolute; inset:52px 0 0 auto; width:min(400px, 92%); z-index:4; box-shadow:-6px 0 18px rgba(0,0,0,.25); } }
+    @media (max-width: 760px) {
+      .qr { height:calc(100vh - 80px); border-radius:12px; }
+      .qr-side { position:absolute; z-index:7; inset:0 auto 0 0; transform:translateX(-102%); transition:transform .2s ease; box-shadow:6px 0 18px rgba(0,0,0,.3); }
+      .qr.side-open .qr-side { transform:none; }
+      .qr-toggle { display:inline-grid; }
+      .qr-chips .qr-ghost { display:none; }
+      .qr-col { padding:16px 12px; }
+      .qr-composer { padding:6px 10px 10px; }
+      .qr-bubble { max-width:92%; }
+      .qr-grid2 { grid-template-columns:1fr; }
+      .qr-tl { grid-template-columns:1fr 1fr; }
+    }
+    """
+
+    UI_ESM = UI_BASE_JS + UI_APP_JS
+    return UI_CSS, UI_ESM
+
+
+@app.cell(hide_code=True)
+def _(
+    BACKUP,
+    CARDS,
+    CFG,
+    CTX_CHOICES,
+    Cards,
+    DEFAULT_CARDS,
+    Engine,
+    EngineView,
+    LLM_CLIENT,
+    MEM,
+    PRESETS,
+    PROMPT,
+    SERVERS,
+    STORE,
+    STORIES,
+    Stories,
+    Sys,
+    TOOLS,
+    TXT,
+    UI_CSS,
+    UI_ESM,
+    World,
+    base64,
+    json,
+    mo,
+    re,
+    threading,
+    time,
+):
+    import anywidget as _aw
+    import traitlets as _tl
+
+
+    class ChatWidget(_aw.AnyWidget):
+        _esm = UI_ESM
+        _css = UI_CSS
+        boot = _tl.Dict({}).tag(sync=True)
+        chats = _tl.List([]).tag(sync=True)
+        chat = _tl.Dict({}).tag(sync=True)
+        history = _tl.Dict({"items": [], "total": 0}).tag(sync=True)
+        live = _tl.Dict({}).tag(sync=True)
+        busy = _tl.Bool(False).tag(sync=True)
+        status = _tl.Unicode("").tag(sync=True)
+        toast = _tl.Dict({}).tag(sync=True)
+        ctx = _tl.Dict({"used": 0, "max": 0}).tag(sync=True)
+        panels = _tl.Dict({}).tag(sync=True)
+        server = _tl.Dict({}).tag(sync=True)
+        backup = _tl.Dict({}).tag(sync=True)
+        library = _tl.Dict({}).tag(sync=True)
+        card = _tl.Dict({}).tag(sync=True)
+        story = _tl.Dict({}).tag(sync=True)
+        aux = _tl.Dict({}).tag(sync=True)
+        command = _tl.Dict({}).tag(sync=True)
+        export = _tl.Dict({}).tag(sync=True)
+        compose = _tl.Dict({}).tag(sync=True)
+        queue = _tl.Int(0).tag(sync=True)
+
+
+    class ChatApp:
+        """Bridges the widget and the Engine: commands from the browser in, state out."""
+
+        def __init__(self):
+            self.w = ChatWidget()
+            self.engine = Engine(emit=self.on_event)
+            self.limit = EngineView.DISPLAY_LIMIT
+            self._live_t = 0.0
+            self.w.boot = self.boot()
+            self.w.observe(self.on_command, names="command")
+            self.refresh_chats()
+            chats = self.w.chats
+            if chats:
+                self.select(chats[0]["id"])
+            threading.Thread(target=self._ticker, daemon=True).start()
+
+        # ---------- state out ----------
+
+        def boot(self):
+            return {"presets": [{"name": n, "backend": p["backend"], "family": p["family"], "thinking": list(p["thinking"]),
+                                 "max_ctx": p["max_ctx"], "yarn_max": p["yarn_max"], "yarn_exp": p.get("yarn_exp", False),
+                                 "size_gb": p.get("size_gb")} for n, p in PRESETS.items()],
+                    "ctx_choices": CTX_CHOICES, "types": {t: CARDS.schema(t).get("label", t) for t in Cards.TYPE_ORDER},
+                    "roles": list(Stories.ROLES)}
+
+        def refresh_chats(self):
+            stories = {s["id"]: s["title"] for s in STORIES.list()}
+            self.w.chats = [{**c, "story_title": stories.get(c["story_id"], "")} for c in STORE.chats()]
+
+        def select(self, chat_id):
+            chat = STORE.chat(chat_id) if chat_id else None
+            self.engine.active_chat = chat_id or 0
+            if not chat:
+                self.w.chat, self.w.history, self.w.panels, self.w.story = {}, {"items": [], "total": 0}, {}, {}
+                return
+            self.limit = EngineView.DISPLAY_LIMIT
+            self.w.chat = self.chat_info(chat)
+            self.w.history = self.engine.display(chat_id, self.limit)
+            self.w.panels = self.engine.panels(chat_id)
+            self.w.story = self.story_info(chat)
+            self.w.ctx = {"used": self.engine.last_used.get(chat_id, 0), "max": LLM_CLIENT.max_context() if SERVERS.ready() else 0}
+
+        def chat_info(self, chat):
+            return {"id": chat["id"], "title": chat["title"], "kind": chat["kind"], "story_id": chat["story_id"],
+                    "settings": {k: v for k, v in chat["settings"].items() if k not in ("studio", "avoid")},
+                    "system": chat["system"], "epoch": chat["epoch"],
+                    "drafts": (chat["settings"].get("studio") or {}).get("drafts") or {}}
+
+        def story_info(self, chat):
+            sid = chat.get("story_id")
+            if chat["kind"] == "studio":
+                drafts = (chat["settings"].get("studio") or {}).get("drafts") or {}
+                cards = []
+                for t, ids in drafts.items():
+                    for cid in ids if isinstance(ids, list) else [ids]:
+                        c = CARDS.get(cid)
+                        if c:
+                            cards.append({"id": cid, "type": c["type"], "name": c["name"]})
+                return {"studio": True, "cards": cards}
+            if not sid:
+                return {}
+            s = STORIES.get(sid)
+            links = []
+            for l in STORIES.card_links(sid):
+                c = CARDS.get(l["card_id"])
+                if c:
+                    links.append({"id": c["id"], "role": l["role"], "name": c["name"], "version": l["version"],
+                                  "latest": c["version"], "avatar": c["avatar"]})
+            return {"id": sid, "title": s["title"], "canon": s["data"]["canon"], "never_forget": s["data"]["never_forget"],
+                    "cards": links, "pending": [p["text"] for p in STORIES.pending_list(sid, chat["id"])]}
+
+        def library_info(self):
+            return {"cards": CARDS.list(), "stories": STORIES.list()}
+
+        def card_info(self, card_id):
+            c = CARDS.get(card_id)
+            if not c:
+                return {}
+            return {**c, "fields": CARDS.visible_fields(c), "versions": CARDS.versions(card_id),
+                    "lore": CARDS.lore(card_id) if c["type"] in ("world", "character") else [],
+                    "timeline": CARDS.timeline(card_id) if c["type"] == "world" else [],
+                    "facts": STORE.q("SELECT id, claim, source_url, status FROM facts WHERE world_card_id = ? ORDER BY id DESC LIMIT 200",
+                                     (card_id,)) if c["type"] == "world" else []}
+
+        def on_event(self, kind, payload=None):
+            w = self.w
+            cur = (w.chat or {}).get("id")
+            if kind == "live":
+                if payload and payload.get("chat_id") not in (None, cur):
+                    return
+                now = time.time()
+                if payload and payload.get("active") and now - self._live_t < 0.08 and not payload.get("phase"):
+                    return
+                self._live_t = now
+                w.live = dict(payload or {}, tools=[dict(t) for t in (payload or {}).get("tools", [])])
+            elif kind == "history":
+                if payload == cur:
+                    w.history = self.engine.display(cur, self.limit)
+                    chat = STORE.chat(cur)
+                    if chat:
+                        w.chat = self.chat_info(chat)
+                        w.story = self.story_info(chat)
+                self.refresh_chats()
+            elif kind == "panels":
+                if payload == cur:
+                    w.panels = self.engine.panels(cur)
+            elif kind == "busy":
+                w.busy = bool(payload)
+            elif kind == "status":
+                w.status = payload or ""
+            elif kind == "toast":
+                w.toast = {"n": time.time(), **payload}
+            elif kind == "ctx":
+                w.ctx = payload
+            elif kind == "chats":
+                self.refresh_chats()
+            elif kind == "select":
+                self.select(payload)
+            elif kind == "compose":
+                w.compose = {"n": time.time(), "text": payload}
+            elif kind == "queue":
+                w.queue = int(payload or 0)
+            elif kind == "settings" and payload == cur:
+                w.chat = self.chat_info(STORE.chat(cur))
+            elif kind in ("learn", "recall"):
+                w.aux = {"n": time.time(), "kind": kind, "data": payload}
+            elif kind == "model":
+                w.server = self.server_info()
+
+        def server_info(self):
+            st = SERVERS.status()
+            gpu = Sys.gpu_line() if not CFG.BASE_URL else None
+            return {"phase": "ready" if SERVERS.ready() else st["phase"],
+                    "preset": st.get("preset") or ("Server eksternal" if CFG.BASE_URL else None), "ctx": st.get("ctx"),
+                    "mtp": st.get("mtp"), "embed": st.get("embed"), "embed_ready": st.get("embed_ready"),
+                    "warnings": st.get("warnings") or [], "error": st.get("error") or "", "gpu": gpu,
+                    "installed": SERVERS.installed() or bool(CFG.BASE_URL)}
+
+        def _ticker(self):
+            while True:
+                try:
+                    self.w.server = self.server_info()
+                    self.w.backup = {**BACKUP.status, "dirty": BACKUP.dirty()}
+                except Exception:
+                    pass
+                time.sleep(3)
+
+        # ---------- commands in ----------
+
+        def on_command(self, change):
+            cmd = dict(change["new"] or {})
+            action = cmd.pop("action", "")
+            try:
+                fn = getattr(self, "c_" + action, None)
+                if fn is None:
+                    raise ValueError(f"perintah tidak dikenal: {action}")
+                fn(**{k: v for k, v in cmd.items() if k != "n"})
+            except Exception as e:
+                self.w.toast = {"n": time.time(), "text": f"{type(e).__name__}: {e}", "kind": "error"}
+
+        def _cur(self):
+            return (self.w.chat or {}).get("id")
+
+        # chat
+        def c_send(self, text="", files=None, kind=None):
+            self.engine.send(self._cur(), text, files or [], kind)
+
+        def c_stop(self):
+            self.engine.stop_now()
+
+        def c_new(self, kind="chat"):
+            cid = self.engine.new_chat(kind)
+            self.select(cid)
+
+        def c_select(self, chat_id):
+            self.select(int(chat_id))
+
+        def c_delete_chat(self, chat_id):
+            STORE.delete_chat(int(chat_id))
+            self.refresh_chats()
+            if int(chat_id) == self._cur():
+                self.select(self.w.chats[0]["id"] if self.w.chats else 0)
+
+        def c_rename(self, chat_id, title):
+            STORE.x("UPDATE chats SET title = ? WHERE id = ?", (title.strip()[:120] or "Tanpa judul", int(chat_id)))
+            self.refresh_chats()
+            if int(chat_id) == self._cur():
+                self.w.chat = self.chat_info(STORE.chat(int(chat_id)))
+
+        def c_load_more(self):
+            self.limit += 150
+            self.w.history = self.engine.display(self._cur(), self.limit)
+
+        def c_settings(self, **updates):
+            cid = self._cur()
+            if not cid:
+                return
+            system = updates.pop("system", None)
+            if system is not None:
+                STORE.x("UPDATE chats SET system = ? WHERE id = ?", (system, cid))
+                self.w.toast = {"n": time.time(), "text": "System prompt manual berlaku di epoch berikutnya (Terapkan sekarang)."}
+            if updates:
+                STORE.chat_settings(cid, **updates)
+            self.w.chat = self.chat_info(STORE.chat(cid))
+
+        def c_reroll(self, mid):
+            self.engine.reroll(self._cur(), int(mid))
+
+        def c_swipe(self, mid, dir):
+            self.engine.swipe(self._cur(), int(mid), int(dir))
+
+        def c_edit(self, mid, text):
+            self.engine.edit(self._cur(), int(mid), text)
+
+        def c_continue(self, mid):
+            self.engine.continue_msg(self._cur(), int(mid))
+
+        def c_delete_msg(self, mid):
+            self.engine.delete_msg(self._cur(), int(mid))
+
+        def c_branch(self, mid):
+            self.engine.branch_here(self._cur(), int(mid))
+
+        def c_goto(self, mid):
+            STORE.set_head(self._cur(), STORE.deepest(self._cur(), int(mid)))
+            self.on_event("history", self._cur())
+            self.on_event("panels", self._cur())
+
+        def c_branches(self):
+            self.w.aux = {"n": time.time(), "kind": "branches", "data": self.engine.branches(self._cur())}
+
+        def c_pin(self, mid, on=True):
+            self.engine.pin(int(mid), on)
+            self.on_event("history", self._cur())
+
+        def c_chapter(self, mid, title):
+            STORE.x("INSERT INTO chapters (chat_id, message_id, title, created) VALUES (?, ?, ?, ?)",
+                    (self._cur(), int(mid), title or "Bab baru", time.time()))
+            self.on_event("history", self._cur())
+
+        def c_choose(self, text):
+            self.engine.choose(self._cur(), text)
+
+        def c_time_skip(self, label):
+            self.engine.time_skip(self._cur(), label)
+
+        def c_compact(self):
+            cid = self._cur()
+
+            def job():
+                c = PROMPT.ctx(cid)
+                used = self.engine.compactor.maybe(cid, TOOLS.specs(c), TOOLS, lambda m: self.on_event("status", m), force=True)
+                self.engine.last_used[cid] = used
+                self.on_event("status", "")
+                self.on_event("history", cid)
+                self.on_event("ctx", {"used": used, "max": LLM_CLIENT.max_context()})
+            self.engine.run(job)
+
+        def c_apply_now(self):
+            PROMPT.new_epoch(self._cur())
+            self.on_event("history", self._cur())
+            self.w.toast = {"n": time.time(), "text": "Prompt beku dibangun ulang dengan kartu dan buku cerita terbaru."}
+
+        def c_continue_new(self):
+            cid = self.engine.continue_in_new_chat(self._cur())
+            self.select(cid)
+
+        def c_search(self, q):
+            q2 = TXT.fts_query(q)
+            rows = STORE.q("SELECT m.id, m.chat_id, c.title, snippet(messages_fts, 0, '[', ']', '…', 14) AS snippet FROM messages_fts "
+                           "JOIN messages m ON m.id = messages_fts.rowid JOIN chats c ON c.id = m.chat_id WHERE messages_fts MATCH ? "
+                           "ORDER BY bm25(messages_fts) LIMIT 40", (q2,)) if q2 else []
+            self.w.aux = {"n": time.time(), "kind": "search", "data": {"q": q, "results": rows}}
+
+        def c_jump(self, chat_id, mid):
+            chat_id, mid = int(chat_id), int(mid)
+            if mid not in STORE.path_ids(chat_id):
+                STORE.set_head(chat_id, STORE.deepest(chat_id, mid))
+            self.select(chat_id)
+            self.limit = 100000
+            self.w.history = self.engine.display(chat_id, self.limit)
+            self.w.aux = {"n": time.time(), "kind": "scroll_to", "data": mid}
+
+        def c_prompt_view(self):
+            self.w.aux = {"n": time.time(), "kind": "prompt", "data": self.engine.prompt_view(self._cur())}
+
+        def c_export(self, fmt="md"):
+            name, data = self.engine.export_story(self._cur(), fmt)
+            self.w.export = {"n": time.time(), "name": name, "b64": base64.b64encode(data).decode()}
+
+        def c_save_db(self):
+            self.w.export = {"n": time.time(), "name": time.strftime("qwen-chat-%Y%m%d-%H%M%S.sqlite"),
+                             "b64": base64.b64encode(STORE.export_bytes()).decode()}
+            BACKUP.saved_rev = STORE.rev
+
+        def c_load_db(self, b64):
+            STORE.import_bytes(base64.b64decode(b64))
+            self.refresh_chats()
+            self.select(self.w.chats[0]["id"] if self.w.chats else 0)
+            self.w.toast = {"n": time.time(), "text": "Database dimuat."}
+
+        def c_impersonate(self, hint=""):
+            self.engine.slash(self._cur(), "impersonate", hint)
+
+        def c_learn(self, text):
+            self.engine.learn(self._cur(), text)
+
+        def c_vocab_add(self, term, translation="", note="", example=""):
+            c = PROMPT.ctx(self._cur()) if self._cur() else None
+            lang = PROMPT.style(c).get("target_lang", "") if c else ""
+            ok = self.engine.vocab_add(term, translation, note, example, lang)
+            self.w.toast = {"n": time.time(), "text": f"'{term}' {'masuk daftar kosakata' if ok else 'sudah ada'}."}
+
+        def c_vocab(self):
+            self.w.aux = {"n": time.time(), "kind": "vocab", "data": {"due": self.engine.vocab_due(),
+                                                                      "all": STORE.q("SELECT * FROM vocab ORDER BY id DESC LIMIT 300")}}
+
+        def c_vocab_review(self, vid, grade):
+            self.engine.vocab_review(int(vid), int(grade))
+            self.c_vocab()
+
+        def c_vocab_delete(self, vid):
+            STORE.x("DELETE FROM vocab WHERE id = ?", (int(vid),))
+            self.c_vocab()
+
+        def c_recall_test(self):
+            self.engine.recall_test(self._cur())
+
+        def c_fact_check(self, mid):
+            self.engine.run(self.engine._fact_check, self._cur(), int(mid), True)
+
+        # memory
+        def c_memory(self, q=""):
+            cid = self._cur()
+            ctx = MEM.ctx_of(cid) if cid else {"chat_id": None, "story_id": None, "card_ids": []}
+            rows = MEM.search(q, ctx, limit=50, kinds=("fact", "summary_core")) if q.strip() else STORE.q(
+                "SELECT * FROM memories ORDER BY id DESC LIMIT 100")
+            self.w.aux = {"n": time.time(), "kind": "memory", "data": {"q": q, "rows": rows, "log": MEM.log(limit=40)}}
+
+        def c_memory_undo(self, log_id):
+            MEM.undo(int(log_id))
+            self.c_memory()
+
+        def c_memory_delete(self, mid):
+            MEM.forget(int(mid), MEM.ctx_of(self._cur()) if self._cur() else {})
+            self.c_memory()
+
+        # story
+        def c_canon(self, section, text):
+            sid = (self.w.story or {}).get("id")
+            if sid:
+                STORIES.canon_set(sid, section, text, self._cur())
+                self.w.story = self.story_info(STORE.chat(self._cur()))
+
+        def c_never_forget(self, items):
+            sid = (self.w.story or {}).get("id")
+            if sid:
+                STORIES.never_forget(sid, items)
+                STORIES.pending(sid, self._cur(), "Daftar 'jangan pernah lupa' diperbarui.")
+                self.w.story = self.story_info(STORE.chat(self._cur()))
+
+        def c_story_attach(self, card_id, role):
+            sid = (self.w.story or {}).get("id")
+            if sid:
+                STORIES.attach(sid, int(card_id), role)
+                STORIES.pending(sid, self._cur(), f"Kartu {role} dipasang: {CARDS.get(int(card_id))['name']}.")
+                self.w.story = self.story_info(STORE.chat(self._cur()))
+
+        def c_story_detach(self, card_id, role):
+            sid = (self.w.story or {}).get("id")
+            if sid:
+                STORIES.detach(sid, int(card_id), role)
+                self.w.story = self.story_info(STORE.chat(self._cur()))
+
+        def c_start_story(self, cards, title="", greeting=0):
+            ids = {k: (int(v) if not isinstance(v, list) else [int(x) for x in v]) for k, v in cards.items() if v}
+            cid = self.engine.start_story(ids, title or None, int(greeting or 0))
+            self.select(cid)
+
+        def c_studio_start(self):
+            cid = self.engine.new_chat("studio", "Studio")
+            self.select(cid)
+
+        def c_studio_finish(self, title=""):
+            chat = STORE.chat(self._cur())
+            drafts = (chat["settings"].get("studio") or {}).get("drafts") or {}
+            ids = {k: v for k, v in drafts.items()}
+            cid = self.engine.start_story(ids, title or None)
+            self.select(cid)
+
+        # cards
+        def c_library(self):
+            self.w.library = self.library_info()
+
+        def c_card_open(self, card_id):
+            self.w.card = self.card_info(int(card_id))
+
+        def c_card_new(self, type):
+            # New Gaya/GM cards start from the defaults, so a fresh card already plays sensibly.
+            base = next((dict(data) for t, _, data in DEFAULT_CARDS if t == type), {})
+            cid = CARDS.save(None, type, {**base, "title" if type == "scenario" else "name": "Baru"})
+            self.w.library = self.library_info()
+            self.w.card = self.card_info(cid)
+
+        def c_card_save(self, card_id, data, avatar=None):
+            c = CARDS.get(int(card_id))
+            CARDS.save(int(card_id), c["type"], data, avatar=base64.b64decode(avatar) if avatar else None)
+            self.w.card = self.card_info(int(card_id))
+            self.w.library = self.library_info()
+            chat = STORE.chat(self._cur()) if self._cur() else None
+            if chat:
+                self.w.story = self.story_info(chat)
+            self.w.toast = {"n": time.time(), "text": "Kartu disimpan (versi baru)."}
+
+        def c_card_delete(self, card_id):
+            CARDS.delete(int(card_id))
+            self.w.card = {}
+            self.w.library = self.library_info()
+
+        def c_card_version(self, card_id, version):
+            c = CARDS.get(int(card_id), int(version))
+            CARDS.save(int(card_id), c["type"], c["data"])
+            self.w.card = self.card_info(int(card_id))
+
+        def c_card_import(self, b64, name=""):
+            cid = CARDS.import_any(base64.b64decode(b64), name)
+            self.w.library = self.library_info()
+            self.w.card = self.card_info(cid)
+            self.w.toast = {"n": time.time(), "text": f"Kartu diimpor: {CARDS.get(cid)['name']}"}
+
+        def c_card_export(self, card_id, fmt="qcard"):
+            c = CARDS.get(int(card_id))
+            data = CARDS.export_st_v2(int(card_id)) if fmt == "st" else CARDS.export_qcard(int(card_id))
+            safe = re.sub(r"[^\w\- ]+", "", c["name"])[:60] or "kartu"
+            self.w.export = {"n": time.time(), "name": f"{safe}.{'st' if fmt == 'st' else 'qcard'}.json",
+                             "b64": base64.b64encode(json.dumps(data, ensure_ascii=False, indent=1).encode()).decode()}
+
+        def c_lore_save(self, card_id, title, text, keys="", kind="istilah", core=False, entry_id=None):
+            CARDS.lore_save(int(card_id), title, text, keys, kind, bool(core), int(entry_id) if entry_id else None)
+            self.w.card = self.card_info(int(card_id))
+
+        def c_lore_delete(self, card_id, entry_id):
+            CARDS.lore_delete(int(entry_id))
+            self.w.card = self.card_info(int(card_id))
+
+        def c_timeline_save(self, card_id, at, title, text="", entry_id=None):
+            if not World.parse_time(at):
+                raise ValueError("Format waktu: YYYY-MM-DD HH:MM")
+            CARDS.timeline_save(int(card_id), at, title, text, int(entry_id) if entry_id else None)
+            self.w.card = self.card_info(int(card_id))
+
+        def c_timeline_delete(self, card_id, entry_id):
+            CARDS.timeline_delete(int(entry_id))
+            self.w.card = self.card_info(int(card_id))
+
+        def c_schema_get(self, type):
+            self.w.aux = {"n": time.time(), "kind": "schema", "data": CARDS.schema(type)}
+
+        def c_schema_save(self, schema):
+            sch = CARDS.save_schema(schema if isinstance(schema, dict) else json.loads(schema))
+            self.w.boot = self.boot()
+            self.w.aux = {"n": time.time(), "kind": "schema", "data": sch}
+            self.w.toast = {"n": time.time(), "text": f"Skema {sch['type']} disimpan (versi {sch['version']})."}
+
+        # model
+        def c_model_switch(self, preset, ctx, mtp=True, embed=True):
+            p = PRESETS[preset]
+            if int(ctx) > p["yarn_max"]:
+                raise ValueError(f"{preset} maksimal {p['yarn_max']:,} token.")
+            self.engine.switch_model(preset, int(ctx), bool(mtp), bool(embed))
+
+        def c_model_stop(self):
+            SERVERS.stop()
+            self.w.server = self.server_info()
+
+
+    CHAT_APP = ChatApp()
+    mo.ui.anywidget(CHAT_APP.w)
 
 
 if __name__ == "__main__":

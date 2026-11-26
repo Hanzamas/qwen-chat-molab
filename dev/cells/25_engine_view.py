@@ -100,7 +100,7 @@ class EngineView:
                 "characters": {k: v for k, v in st["status"].items() if k != "player"},
                 "weather": wthr["text"] if wthr else "", "events": [{"id": e["id"], "time": e["world_time"], "text": e["text"],
                                                                      "new": not e["shown"]} for e in events],
-                "time_skips": gm.get("time_skips") or [], "persona": persona["name"] if persona else "",
+                "time_skips": gm.get("time_skips") or ["2 jam", "1 hari", "1 minggu"], "persona": persona["name"] if persona else "",
                 "story": (c["story"] or {}).get("title", "")}
 
     def branches(self, chat_id):
