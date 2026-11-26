@@ -2929,8 +2929,13 @@ def _(
 
 
 @app.cell(hide_code=True)
-def _(Sys, json, os, random, re, threading, urllib):
+def _(Sys, json, os, random, re, threading, time, urllib):
+    import asyncio as _asyncio
     import queue as _queue
+
+
+    class _FreshThread(Exception):
+        """The browser thread can no longer start Playwright; run the job again on a new thread."""
 
 
     class WebTools:
@@ -2981,6 +2986,7 @@ def _(Sys, json, os, random, re, threading, urllib):
             self.cleanup = None
             self.engine_name = ""
             self.last_used = 0.0
+            self.camoufox_failed = (0.0, "")  # (when, error): Chromium is used for a while after Camoufox fails
 
         # ---------- browser worker ----------
 
@@ -2989,30 +2995,51 @@ def _(Sys, json, os, random, re, threading, urllib):
                 self.thread = threading.Thread(target=self._loop, daemon=True)
                 self.thread.start()
 
+        @staticmethod
+        def _loop_left_running():
+            """Playwright's sync API runs an asyncio loop on this thread while it is started. A start that failed half
+            way (a browser that would not launch) leaves that loop marked as running, and every later
+            sync_playwright() on this thread then fails with "using Playwright Sync API inside the asyncio loop"."""
+            try:
+                _asyncio.get_running_loop()
+                return True
+            except RuntimeError:
+                return False
+
         def _loop(self):
+            me = threading.current_thread()
             while True:
                 try:
                     fn, args, box, done = self.jobs.get(timeout=300)
                 except _queue.Empty:
                     self._close()  # idle for 5 minutes: free the browser's memory
                     continue
+                retire = False
                 try:
                     box["result"] = fn(*args)
                 except BaseException as e:
                     box["error"] = e
                     self._close()
                 finally:
+                    retire = isinstance(box.get("error"), _FreshThread) or (self.page is None and self._loop_left_running())
+                    if retire and self.thread is me:
+                        self.thread = None  # before done.set(), so the next job starts a new thread
                     done.set()
+                if retire:
+                    return
 
         def _run(self, fn, *args, timeout=120):
-            self._ensure_thread()
-            box, done = {}, threading.Event()
-            self.jobs.put((fn, args, box, done))
-            if not done.wait(timeout):
-                raise TimeoutError("browser tidak menjawab")
-            if "error" in box:
-                raise box["error"]
-            return box["result"]
+            for attempt in range(2):
+                self._ensure_thread()
+                box, done = {}, threading.Event()
+                self.jobs.put((fn, args, box, done))
+                if not done.wait(timeout):
+                    raise TimeoutError("browser tidak menjawab")
+                if isinstance(box.get("error"), _FreshThread) and attempt == 0:
+                    continue
+                if "error" in box:
+                    raise box["error"]
+                return box["result"]
 
         def _close(self):
             if self.cleanup:
@@ -3029,37 +3056,50 @@ def _(Sys, json, os, random, re, threading, urllib):
                     return self.page
                 except Exception:
                     self._close()
-            try:
-                from camoufox.sync_api import Camoufox
-                env = dict(os.environ)
-                # Firefox/Camoufox refuses to start when $HOME is not owned by our uid (molab runs as root).
-                if hasattr(os, "getuid") and os.getuid() == 0 and os.path.isdir("/root"):
-                    env["HOME"] = "/root"
-                for k in ("MOZ_DISABLE_CONTENT_SANDBOX", "MOZ_DISABLE_RDD_SANDBOX", "MOZ_DISABLE_GMP_SANDBOX"):
-                    env.setdefault(k, "1")
-                cam = Camoufox(headless=True, humanize=True, geoip=True, block_webrtc=True, canvas_noise=False, env=env)
-                b = cam.__enter__()
-                self.page = b.new_page()
-                self.cleanup = lambda: cam.__exit__(None, None, None)
-                self.engine_name = "camoufox"
-            except Exception:
-                from playwright.sync_api import sync_playwright
-                p = sync_playwright().start()
-                b = p.chromium.launch(headless=True, args=["--disable-blink-features=AutomationControlled", "--no-first-run",
-                                                           "--mute-audio", "--disable-extensions"],
-                                      ignore_default_args=["--enable-automation"])
-                ctx = b.new_context(locale="en-US", user_agent=random.choice(self.UA),
-                                    viewport={"width": 1440, "height": 900}, extra_http_headers={"Accept-Language": "en-US,en;q=0.9"})
-                ctx.add_init_script(self.STEALTH_JS)
-                self.page = ctx.new_page()
+            if time.time() - self.camoufox_failed[0] > 1800:
+                cam = None
+                try:
+                    from camoufox.sync_api import Camoufox
+                    env = dict(os.environ)
+                    # Firefox/Camoufox refuses to start when $HOME is not owned by our uid (molab runs as root).
+                    if hasattr(os, "getuid") and os.getuid() == 0 and os.path.isdir("/root"):
+                        env["HOME"] = "/root"
+                    for k in ("MOZ_DISABLE_CONTENT_SANDBOX", "MOZ_DISABLE_RDD_SANDBOX", "MOZ_DISABLE_GMP_SANDBOX"):
+                        env.setdefault(k, "1")
+                    cam = Camoufox(headless=True, humanize=True, geoip=True, block_webrtc=True, canvas_noise=False, env=env)
+                    b = cam.__enter__()
+                    self.page = b.new_page()
+                    self.cleanup = lambda: cam.__exit__(None, None, None)
+                    self.engine_name = "camoufox"
+                    self.camoufox_failed = (0.0, "")
+                    return self.page
+                except Exception as e:
+                    self.camoufox_failed = (time.time(), f"{type(e).__name__}: {str(e)[:300]}")
+                    self.page = None
+                    if cam is not None:
+                        try:
+                            cam.__exit__(None, None, None)  # stops the Playwright that Camoufox started
+                        except Exception:
+                            pass
+            if self._loop_left_running():
+                raise _FreshThread()
+            from playwright.sync_api import sync_playwright
+            p = sync_playwright().start()
+            b = p.chromium.launch(headless=True, args=["--disable-blink-features=AutomationControlled", "--no-first-run",
+                                                       "--mute-audio", "--disable-extensions"],
+                                  ignore_default_args=["--enable-automation"])
+            ctx = b.new_context(locale="en-US", user_agent=random.choice(self.UA),
+                                viewport={"width": 1440, "height": 900}, extra_http_headers={"Accept-Language": "en-US,en;q=0.9"})
+            ctx.add_init_script(self.STEALTH_JS)
+            self.page = ctx.new_page()
 
-                def cleanup():
-                    try:
-                        b.close()
-                    finally:
-                        p.stop()
-                self.cleanup = cleanup
-                self.engine_name = "chromium"
+            def cleanup():
+                try:
+                    b.close()
+                finally:
+                    p.stop()
+            self.cleanup = cleanup
+            self.engine_name = "chromium"
             return self.page
 
         # ---------- tools ----------
@@ -3069,7 +3109,8 @@ def _(Sys, json, os, random, re, threading, urllib):
 
             def job():
                 page = self._open()
-                notes = []
+                notes = [f"camoufox gagal, pakai chromium: {self.camoufox_failed[1]}"] if self.engine_name == "chromium" and \
+                    self.camoufox_failed[1] else []
                 for eng in order:
                     if eng not in self.SEARCH_URL:
                         notes.append(f"{eng}: mesin tidak dikenal")

@@ -195,3 +195,41 @@ def test_tool_rounds_have_no_cap(engine, nb, fake):
     last = engine.display(chat)["items"][-1]
     assert last["content"].startswith("Selesai") and not last.get("error"), last
     assert len(last["tools"]) >= 15
+
+
+def test_failed_camoufox_start_does_not_break_chromium_fallback(nb, monkeypatch):
+    """A Camoufox launch that fails after Playwright started used to leave Playwright's asyncio loop running on the
+    browser thread: every later search then failed with "using Playwright Sync API inside the asyncio loop"."""
+    import types
+    import pytest
+    sync_api = pytest.importorskip("playwright.sync_api")
+    import asyncio
+    import sys
+    policy = asyncio.get_event_loop_policy()
+    if sys.platform == "win32":  # marimo switches Windows to the selector loop, which cannot start subprocesses
+        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+
+    class BrokenCamoufox:
+        def __init__(self, **kw):
+            self.cm = sync_api.sync_playwright()
+
+        def __enter__(self):
+            self.cm.__enter__()
+            raise RuntimeError("firefox would not start")
+
+        def __exit__(self, *a):
+            raise RuntimeError("cleanup failed too")  # worst case: the loop stays marked as running
+
+    mod = types.ModuleType("camoufox.sync_api")
+    mod.Camoufox = BrokenCamoufox
+    monkeypatch.setitem(__import__("sys").modules, "camoufox", types.ModuleType("camoufox"))
+    monkeypatch.setitem(__import__("sys").modules, "camoufox.sync_api", mod)
+    web = nb["WebTools"]()
+    try:
+        for _ in range(2):
+            res = json.loads(web.web_search("Odeonsplatz", engine="tidak-ada"))
+            assert "asyncio loop" not in json.dumps(res), res
+        assert "firefox would not start" in web.camoufox_failed[1], (web.camoufox_failed, res)
+        web._run(web._close)
+    finally:
+        asyncio.set_event_loop_policy(policy)
