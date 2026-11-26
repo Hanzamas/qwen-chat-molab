@@ -274,6 +274,10 @@ class ChatApp:
 
     def on_command(self, change):
         cmd = dict(change["new"] or {})
+        for one in cmd.get("batch") or [cmd]:
+            self._run_command(dict(one))
+
+    def _run_command(self, cmd):
         action = cmd.pop("action", "")
         try:
             fn = getattr(self, "c_" + action, None)

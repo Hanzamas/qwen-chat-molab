@@ -7473,7 +7473,20 @@ def _():
       const ro1 = new ResizeObserver(() => fol.stick());
       ro1.observe($(".qr-col"));
 
-      const send = (action, extra = {}) => { model.set("command", { n: Date.now() + Math.random(), action, ...extra }); model.save_changes(); };
+      // One message per tick with every command queued in it: the command traitlet is synced as a value, so two sets
+      // in a row would only deliver the last.
+      let outbox = [], flushTimer = 0;
+      const send = (action, extra = {}) => {
+        outbox.push({ action, ...extra });
+        if (flushTimer) return;
+        flushTimer = setTimeout(() => {
+          flushTimer = 0;
+          const batch = outbox;
+          outbox = [];
+          model.set("command", { n: Date.now() + Math.random(), batch });
+          model.save_changes();
+        }, 0);
+      };
       const get = (k) => model.get(k) || {};
       const toast = (text, kind = "info", long = false) => {
         const t = document.createElement("div");
@@ -9090,6 +9103,10 @@ def _(
 
         def on_command(self, change):
             cmd = dict(change["new"] or {})
+            for one in cmd.get("batch") or [cmd]:
+                self._run_command(dict(one))
+
+        def _run_command(self, cmd):
             action = cmd.pop("action", "")
             try:
                 fn = getattr(self, "c_" + action, None)
