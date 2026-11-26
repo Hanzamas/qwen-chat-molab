@@ -1091,7 +1091,22 @@ def _(CFG, Path, json, os, sqlite3, threading, time):
     );
     """
 
-    SCHEMA_VERSION = 1
+    SCHEMA_VERSION = 2
+
+    # Columns added after v1. ALTER TABLE ADD COLUMN for databases made before them.
+    _COLUMNS_V2 = [
+        ("memories", "message_id", "INTEGER"),      # message that made it (NULL: made outside a chat, visible everywhere)
+        ("memories", "forgotten_at", "INTEGER"),    # message that forgot it (hidden only where that message is on the path)
+        ("memories", "importance", "REAL NOT NULL DEFAULT 0.5"),
+        ("memory_log", "message_id", "INTEGER"),
+    ]
+    _SCHEMA_V2 = """
+    CREATE TABLE IF NOT EXISTS canon_log (
+        id INTEGER PRIMARY KEY, story_id INTEGER NOT NULL, chat_id INTEGER, message_id INTEGER, section TEXT NOT NULL,
+        text TEXT NOT NULL DEFAULT '', created REAL NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS canon_log_story ON canon_log (story_id);
+    """
 
 
     class Store:
@@ -1128,6 +1143,10 @@ def _(CFG, Path, json, os, sqlite3, threading, time):
                 self._migrate_legacy()
             # Every statement is IF NOT EXISTS, so this also adds tables introduced after a database was created.
             self.conn.executescript(_SCHEMA_V1)
+            for table, col, decl in _COLUMNS_V2:
+                if col not in self._columns(table):
+                    self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+            self.conn.executescript(_SCHEMA_V2)
             self.conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             self.conn.commit()
 
@@ -1424,6 +1443,18 @@ def _(CFG, Path, json, os, sqlite3, threading, time):
                 out.append(cur)
                 cur = parents[cur]
             return out[::-1]
+
+        def visible_ids(self, chat_id):
+            """Messages whose effects (memories, story book changes) count in this chat: its active path, plus the path of
+            the chat it continues up to the point it was continued (and so on). Other chats of the same story, and
+            branches that were rerolled away, are not included."""
+            out, cur, head, depth = set(), chat_id, None, 0
+            while cur and depth < 20:
+                out.update(self.path_ids(cur, head))
+                chat = self.chat(cur)
+                s = (chat or {}).get("settings") or {}
+                cur, head, depth = s.get("continued_from"), s.get("continued_head"), depth + 1
+            return out
 
         def path(self, chat_id, head=None, ids=None):
             """Full message rows along the active path, in order, with meta decoded."""
@@ -2608,20 +2639,41 @@ def _(CARDS, STORE, json, time):
 
         # ---------- canon and never-forget ----------
 
-        def canon_set(self, story_id, section, text, chat_id=None):
-            s = self.get(story_id)
-            if text.strip():
-                s["data"]["canon"][section] = text.strip()
+        def canon_set(self, story_id, section, text, chat_id=None, message_id=None):
+            """message_id given (the model wrote it during a turn): logged on that branch. Without (edited in the UI):
+            changes the base every chat of the story starts from."""
+            if message_id:
+                self.store.x("INSERT INTO canon_log (story_id, chat_id, message_id, section, text, created) VALUES (?, ?, ?, ?, ?, ?)",
+                             (story_id, chat_id, message_id, section, text.strip(), time.time()))
             else:
-                s["data"]["canon"].pop(section, None)
-            self._save_data(story_id, s["data"])
+                s = self.get(story_id)
+                if text.strip():
+                    s["data"]["canon"][section] = text.strip()
+                else:
+                    s["data"]["canon"].pop(section, None)
+                self._save_data(story_id, s["data"])
             self.pending(story_id, chat_id, f"Buku cerita · {section}: {text.strip() or '(dihapus)'}")
 
-        def canon_text(self, story_id, limit=48000):
+        def canon(self, story_id, visible=None):
+            """Sections as they are on a branch: the base, then the logged changes whose message is visible."""
+            s = self.get(story_id)
+            if not s:
+                return {}
+            out = dict(s["data"]["canon"])
+            if visible:
+                for r in self.store.q("SELECT message_id, section, text FROM canon_log WHERE story_id = ? ORDER BY id", (story_id,)):
+                    if r["message_id"] in visible:
+                        if r["text"]:
+                            out[r["section"]] = r["text"]
+                        else:
+                            out.pop(r["section"], None)
+            return out
+
+        def canon_text(self, story_id, limit=48000, visible=None):
             s = self.get(story_id)
             if not s:
                 return ""
-            parts = [f"### {k}\n{v}" for k, v in s["data"]["canon"].items()]
+            parts = [f"### {k}\n{v}" for k, v in self.canon(story_id, visible).items()]
             nf = s["data"]["never_forget"]
             if nf:
                 parts.append("### Jangan pernah lupa\n" + "\n".join(f"- {x}" for x in nf))
@@ -3109,7 +3161,39 @@ def _(
             chat = self.store.chat(chat_id) or {}
             sid = chat.get("story_id")
             card_ids = [l["card_id"] for l in self.stories.card_links(sid)] if sid else []
-            return {"chat_id": chat_id, "story_id": sid, "card_ids": card_ids}
+            return {"chat_id": chat_id, "story_id": sid, "card_ids": card_ids,
+                    "visible": self.store.visible_ids(chat_id) if chat_id else set()}
+
+        BRANCHED = ("story", "chat")  # user and card memories are about the real user / the character everywhere
+
+        def _visible(self, row, ctx):
+            """A story/chat memory made by a message counts only where that message is on the path (or in the chat
+            it continues); a forget counts the same way. Memories made outside a chat count everywhere."""
+            if row.get("scope") not in self.BRANCHED or "visible" not in ctx:
+                return True
+            vis = ctx["visible"]
+            if row.get("message_id") and row["message_id"] not in vis:
+                return False
+            return not (row.get("forgotten_at") and row["forgotten_at"] in vis)
+
+        def _resolve(self, rows, ctx):
+            """Visible rows, with updates made on other branches undone."""
+            rows = [dict(r) for r in rows if self._visible(r, ctx)]
+            vis = ctx.get("visible")
+            if not rows or vis is None:
+                return rows
+            ids = [r["id"] for r in rows]
+            logs = {}
+            for i in range(0, len(ids), 500):
+                part = ids[i:i + 500]
+                for lg in self.store.q(f"SELECT memory_id, before, after, message_id FROM memory_log WHERE action = 'update' "
+                                       f"AND undone = 0 AND memory_id IN ({','.join('?' * len(part))}) ORDER BY id DESC", part):
+                    logs.setdefault(lg["memory_id"], []).append(lg)
+            for r in rows:
+                for lg in logs.get(r["id"], []):
+                    if lg["message_id"] and lg["message_id"] not in vis and lg["after"] == r["text"]:
+                        r["text"] = lg["before"]
+            return rows
 
         def _scope_sql(self, ctx):
             conds, args = ["m.scope = 'user'"], []
@@ -3126,7 +3210,7 @@ def _(
 
         # ---------- memories ----------
 
-        def save(self, text, scope, ctx, kind="fact", card_id=None):
+        def save(self, text, scope, ctx, kind="fact", card_id=None, message_id=None, importance=0.5):
             text = (text or "").strip()
             if not text:
                 return {"error": "teks kosong"}
@@ -3142,14 +3226,18 @@ def _(
                 if j >= 0.45:
                     similar.append({"id": c["id"], "text": c["text"][:300]})
             now = time.time()
-            mid = self.store.x("INSERT INTO memories (scope, card_id, story_id, chat_id, kind, text, created, updated) "
-                               "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            try:
+                importance = min(max(float(importance), 0.0), 1.0)
+            except (TypeError, ValueError):
+                importance = 0.5
+            mid = self.store.x("INSERT INTO memories (scope, card_id, story_id, chat_id, kind, text, created, updated, message_id, "
+                               "importance) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                                (scope, card_id if scope == "card" else None,
                                 ctx.get("story_id") if scope == "story" else None,
                                 ctx.get("chat_id") if scope in ("chat",) or kind == "summary_core" else None,
-                                kind, text, now, now))
-            self.store.x("INSERT INTO memory_log (memory_id, action, after, chat_id, created) VALUES (?, 'save', ?, ?, ?)",
-                         (mid, text, ctx.get("chat_id"), now))
+                                kind, text, now, now, message_id, importance))
+            self.store.x("INSERT INTO memory_log (memory_id, action, after, chat_id, created, message_id) VALUES (?, 'save', ?, ?, ?, ?)",
+                         (mid, text, ctx.get("chat_id"), now, message_id))
             self.emb.enqueue("mem", mid, text)
             out = {"saved": mid, "scope": scope}
             if similar:
@@ -3157,20 +3245,27 @@ def _(
                 out["note"] = "Ada memory mirip. Kalau yang lama sudah tidak berlaku, pakai memory_update atau memory_forget."
             return out
 
-        def update(self, mid, text, ctx):
-            row = self.store.one("SELECT text FROM memories WHERE id = ?", (mid,))
-            if not row:
+        def update(self, mid, text, ctx, message_id=None):
+            row = self.store.one("SELECT * FROM memories WHERE id = ?", (mid,))
+            if not row or not self._visible(row, ctx):
                 return {"error": f"memory #{mid} tidak ada"}
+            before = self._resolve([row], ctx)[0]["text"]
             self.store.x("UPDATE memories SET text = ?, updated = ? WHERE id = ?", (text.strip(), time.time(), mid))
-            self.store.x("INSERT INTO memory_log (memory_id, action, before, after, chat_id, created) VALUES (?, 'update', ?, ?, ?, ?)",
-                         (mid, row["text"], text.strip(), ctx.get("chat_id"), time.time()))
+            self.store.x("INSERT INTO memory_log (memory_id, action, before, after, chat_id, created, message_id) "
+                         "VALUES (?, 'update', ?, ?, ?, ?, ?)", (mid, before, text.strip(), ctx.get("chat_id"), time.time(), message_id))
             self.emb.enqueue("mem", mid, text)
             return {"updated": mid}
 
-        def forget(self, mid, ctx):
+        def forget(self, mid, ctx, message_id=None):
+            """From a turn (message_id) a story/chat memory is only hidden on that branch; from the UI it is deleted."""
             row = self.store.one("SELECT * FROM memories WHERE id = ?", (mid,))
-            if not row:
+            if not row or (message_id and not self._visible(row, ctx)):
                 return {"error": f"memory #{mid} tidak ada"}
+            if message_id and row["scope"] in self.BRANCHED:
+                self.store.x("UPDATE memories SET forgotten_at = ? WHERE id = ?", (message_id, mid))
+                self.store.x("INSERT INTO memory_log (memory_id, action, before, chat_id, created, message_id) "
+                             "VALUES (?, 'hide', ?, ?, ?, ?)", (mid, json.dumps(row), ctx.get("chat_id"), time.time(), message_id))
+                return {"deleted": mid}
             self.store.x("DELETE FROM memories WHERE id = ?", (mid,))
             self.store.x("DELETE FROM vectors WHERE kind = 'mem' AND ref_id = ?", (mid,))
             self.store.x("INSERT INTO memory_log (memory_id, action, before, chat_id, created) VALUES (?, 'forget', ?, ?, ?)",
@@ -3193,6 +3288,8 @@ def _(
                     return False
                 self.store.x("UPDATE memories SET text = ?, updated = ? WHERE id = ?", (log["before"], time.time(), log["memory_id"]))
                 self.emb.enqueue("mem", log["memory_id"], log["before"])
+            elif log["action"] == "hide":
+                self.store.x("UPDATE memories SET forgotten_at = NULL WHERE id = ?", (log["memory_id"],))
             elif log["action"] == "forget":
                 r = json.loads(log["before"])
                 cols = "scope, card_id, story_id, chat_id, kind, text, created, updated"
@@ -3228,11 +3325,15 @@ def _(
                 vec_ids = [i for i, s in self.emb.search("mem", query, limit=40, allowed=set(pool)) if s > 0.35]
                 allowed_rows.update({i: pool[i] for i in vec_ids})
             ranked = self.rrf([r["id"] for r in fts], vec_ids)
-            return [allowed_rows[i] for i in ranked if i in allowed_rows and i not in exclude][:limit]
+            rows = self._resolve([allowed_rows[i] for i in ranked if i in allowed_rows and i not in exclude], ctx)
+            # more important memories first among similarly relevant ones
+            rows = [r for _, r in sorted(enumerate(rows), key=lambda p: p[0] - 6 * (float(p[1].get("importance") or 0.5) - 0.5))]
+            return rows[:limit]
 
         def recall(self, text, ctx, exclude=(), limit=10, max_chars=500):
             rows = self.search(text, ctx, limit=limit, kinds=("fact",), exclude=exclude, min_overlap=2)
-            return [{"id": r["id"], "scope": r["scope"], "text": r["text"][:max_chars]} for r in rows]
+            return [{"id": r["id"], "scope": r["scope"], "text": r["text"][:max_chars], "importance": r.get("importance", 0.5)}
+                    for r in rows]
 
         def frozen(self, ctx, limit_chars=8000):
             """Memories of scope user + the story's cards, shortened, for the frozen prompt."""
@@ -3873,7 +3974,7 @@ def _(
             if frozen:
                 parts.append("# Memory (dibekukan saat epoch ini dimulai)\n" + frozen)
             if c["story"]:
-                canon = self.stories.canon_text(c["story"]["id"])
+                canon = self.stories.canon_text(c["story"]["id"], visible=self.store.visible_ids(chat_id))
                 if canon:
                     parts.append("# Buku cerita\n" + canon)
             if last_node >= 0:
@@ -4281,7 +4382,7 @@ def _(TXT, re, threading, time):
                 if core:
                     mctx = self.mem.ctx_of(chat_id)
                     self.mem.save(f"[Inti {chat['title']}, pesan {a + 1}–{b + 1}] {core}",
-                                  "story" if mctx.get("story_id") else "chat", mctx, kind="summary_core")
+                                  "story" if mctx.get("story_id") else "chat", mctx, kind="summary_core", message_id=ids[b])
                 done_any = True
             if not self.cancel.is_set():
                 self.condense(chat_id, ids, maxc, tools, phase)
@@ -4351,7 +4452,7 @@ def _(TXT, re, threading, time):
         def entity_check(self, chat_id, msgs, summary):
             """Capitalized names that recur in the chunk but appear neither in the summary nor in the story book."""
             c = self.prompt.ctx(chat_id)
-            canon = self.prompt.stories.canon_text(c["story"]["id"]) if c["story"] else ""
+            canon = self.prompt.stories.canon_text(c["story"]["id"], visible=self.store.visible_ids(chat_id)) if c["story"] else ""
             have = (summary + "\n" + canon).lower()
             counts = {}
             for m in msgs:
@@ -4426,8 +4527,10 @@ def _(
              "status": {"type": "string", "enum": ["terverifikasi", "diperdebatkan", "belum terverifikasi"]}}, ["claim"]),
         _fn("memory_search", "Search stored memories visible in this chat.", {"query": _S, "limit": _I}, ["query"]),
         _fn("memory_save", "Store a durable fact. scope: user (about the user, all chats), card (about a character, every "
-            "story using its card; give card = character name), story (this story), chat (this chat only).",
-            {"text": _S, "scope": {"type": "string", "enum": ["user", "card", "story", "chat"]}, "card": _S}, ["text"]),
+            "story using its card; give card = character name), story (this story), chat (this chat only). "
+            "importance 0..1 (default 0.5): 0.9 for facts that must never be lost, 0.2 for small details.",
+            {"text": _S, "scope": {"type": "string", "enum": ["user", "card", "story", "chat"]}, "card": _S, "importance": _N},
+            ["text"]),
         _fn("memory_update", "Replace the text of a memory that is no longer accurate.", {"id": _I, "text": _S}, ["id", "text"]),
         _fn("memory_forget", "Delete a memory by id.", {"id": _I}, ["id"]),
         _fn("history_search", "Keyword search over the original messages (also the parts already summarized).",
@@ -4572,18 +4675,19 @@ def _(
                 return {"results": [], "note": "Tidak ada yang cocok."}
             return {"results": [{"id": r["id"], "scope": r["scope"], "text": r["text"]} for r in rows]}
 
-        def t_memory_save(self, chat_id, mid, text, scope="", card=""):
+        def t_memory_save(self, chat_id, mid, text, scope="", card="", importance=0.5):
             ctx = self.mem.ctx_of(chat_id)
             card_id = self.cards.find("character", card) if card else None
             if scope == "card" and not card_id:
                 return {"error": "scope card butuh nama tokoh yang ada di kartu (field card)."}
-            return self.mem.save(text, scope or ("story" if ctx.get("story_id") else "user"), ctx, card_id=card_id)
+            return self.mem.save(text, scope or ("story" if ctx.get("story_id") else "user"), ctx, card_id=card_id,
+                                 message_id=mid, importance=importance)
 
         def t_memory_update(self, chat_id, mid, id, text):
-            return self.mem.update(int(id), text, self.mem.ctx_of(chat_id))
+            return self.mem.update(int(id), text, self.mem.ctx_of(chat_id), message_id=mid)
 
         def t_memory_forget(self, chat_id, mid, id):
-            return self.mem.forget(int(id), self.mem.ctx_of(chat_id))
+            return self.mem.forget(int(id), self.mem.ctx_of(chat_id), message_id=mid)
 
         def t_history_search(self, chat_id, mid, query, scope="chat", limit=10):
             """Hybrid: BM25 over the original messages plus vector search when the embedder runs (RRF)."""
@@ -4667,7 +4771,8 @@ def _(
             sid, _ = self._story(chat_id)
             if not sid:
                 return {"error": "chat ini tidak terhubung ke cerita"}
-            self.stories.canon_set(sid, section, text, chat_id)
+            # logged on this branch (mid); a turn always has one, a side task passes the head
+            self.stories.canon_set(sid, section, text, chat_id, message_id=mid or (self.store.chat(chat_id) or {}).get("head_id"))
             return {"ok": True, "note": "Berlaku sekarang lewat catatan sistem; masuk prompt beku di epoch berikutnya."}
 
         def t_card_read(self, chat_id, mid, name):
@@ -5353,7 +5458,8 @@ def _(
             path = self.store.path(chat_id)
             ids = [m["id"] for m in path]
             st = self.world.state(chat_id, ids)
-            new = self.new_chat(old["kind"], f"{old['title']} (lanjutan)", old.get("story_id"), old["settings"])
+            new = self.new_chat(old["kind"], f"{old['title']} (lanjutan)", old.get("story_id"),
+                                {**old["settings"], "continued_from": chat_id, "continued_head": old["head_id"]})
             for s in self.prompt.summaries_on_path(chat_id, ids):
                 self.store.x("INSERT INTO summaries (chat_id, node_id, from_id, level, text, core, created) VALUES (?, 0, 0, ?, ?, ?, ?)",
                              (new, s["level"], s["text"], s["core"], time.time()))
@@ -5860,7 +5966,7 @@ def _(
                     source, text = page.get("url", top["url"]), page.get("text", "")
                 else:
                     source = "lore dan buku cerita"
-                    text = self.stories.canon_text(c["story"]["id"]) if c["story"] else ""
+                    text = self.stories.canon_text(c["story"]["id"], visible=self.store.visible_ids(chat_id)) if c["story"] else ""
                     text += "\n" + "\n".join(f"{e['title']}: {e['text']}" for e in self.mem.lore_triggered(c["mem"]["card_ids"], claim))
                 if not text.strip():
                     continue
@@ -7049,8 +7155,8 @@ def _():
       function tabMemory() {
         const a = state.memory || { rows: [], log: [] };
         return `<label class="qr-search">${icon("search")}<input class="qr-mem-q" placeholder="Cari memory" value="${esc(a.q || "")}"></label>
-          <section><h4>Memory</h4>${(a.rows || []).map((m) => `<div class="qr-memrow"><span class="qr-badge">${esc(m.scope)}${m.kind === "summary_core" ? " · ringkasan" : ""}</span>
-            <span>#${m.id} ${esc(m.text)}</span><button class="qr-icon qr-xs" data-act="mem-del" data-id="${m.id}" title="Hapus">${icon("trash")}</button></div>`).join("") || '<div class="qr-muted">Kosong.</div>'}</section>
+          <section><h4>Memory</h4>${(a.rows || []).map((m) => `<div class="qr-memrow"><span class="qr-badge">${esc(m.scope)}${m.kind === "summary_core" ? " · ringkasan" : ""}</span>${m.other_branch ? '<span class="qr-badge" title="Dibuat atau dilupakan di cabang/chat lain; tidak dipakai di chat ini">cabang lain</span>' : ""}
+            <span class="${m.other_branch ? "qr-muted" : ""}">#${m.id} ${esc(m.text)}</span><button class="qr-icon qr-xs" data-act="mem-del" data-id="${m.id}" title="Hapus">${icon("trash")}</button></div>`).join("") || '<div class="qr-muted">Kosong.</div>'}</section>
           <section><h4>Catatan perubahan oleh model</h4>${(a.log || []).map((l) => `<div class="qr-memrow ${l.undone ? "undone" : ""}"><span class="qr-badge">${esc(l.action)}</span>
             <span>#${l.memory_id} ${esc((l.after || l.before || "").slice(0, 160))}</span>${l.undone ? '<span class="qr-muted">dibatalkan</span>' : `<button class="qr-btn qr-sm" data-act="mem-undo" data-id="${l.id}">Undo</button>`}</div>`).join("") || '<div class="qr-muted">Belum ada.</div>'}</section>`;
       }
@@ -7938,7 +8044,8 @@ def _(
                 if c:
                     links.append({"id": c["id"], "role": l["role"], "name": c["name"], "version": l["version"],
                                   "latest": c["version"], "avatar": c["avatar"]})
-            return {"id": sid, "title": s["title"], "canon": s["data"]["canon"], "never_forget": s["data"]["never_forget"],
+            return {"id": sid, "title": s["title"], "canon": STORIES.canon(sid, STORE.visible_ids(chat["id"])),
+                    "never_forget": s["data"]["never_forget"],
                     "cards": links, "pending": [p["text"] for p in STORIES.pending_list(sid, chat["id"])]}
 
         def _cards_changed(self, card_id):
@@ -8316,6 +8423,7 @@ def _(
             ctx = MEM.ctx_of(cid) if cid else {"chat_id": None, "story_id": None, "card_ids": []}
             rows = MEM.search(q, ctx, limit=50, kinds=("fact", "summary_core")) if q.strip() else STORE.q(
                 "SELECT * FROM memories ORDER BY id DESC LIMIT 100")
+            rows = [{**r, "other_branch": not MEM._visible(r, ctx)} for r in rows]
             self.w.aux = {"n": time.time(), "kind": "memory", "data": {"q": q, "rows": rows, "log": MEM.log(limit=40)}}
 
         def c_memory_undo(self, log_id):

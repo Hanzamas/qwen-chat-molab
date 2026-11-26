@@ -196,7 +196,8 @@ class Engine(EngineView):
         path = self.store.path(chat_id)
         ids = [m["id"] for m in path]
         st = self.world.state(chat_id, ids)
-        new = self.new_chat(old["kind"], f"{old['title']} (lanjutan)", old.get("story_id"), old["settings"])
+        new = self.new_chat(old["kind"], f"{old['title']} (lanjutan)", old.get("story_id"),
+                            {**old["settings"], "continued_from": chat_id, "continued_head": old["head_id"]})
         for s in self.prompt.summaries_on_path(chat_id, ids):
             self.store.x("INSERT INTO summaries (chat_id, node_id, from_id, level, text, core, created) VALUES (?, 0, 0, ?, ?, ?, ?)",
                          (new, s["level"], s["text"], s["core"], time.time()))
@@ -703,7 +704,7 @@ class Engine(EngineView):
                 source, text = page.get("url", top["url"]), page.get("text", "")
             else:
                 source = "lore dan buku cerita"
-                text = self.stories.canon_text(c["story"]["id"]) if c["story"] else ""
+                text = self.stories.canon_text(c["story"]["id"], visible=self.store.visible_ids(chat_id)) if c["story"] else ""
                 text += "\n" + "\n".join(f"{e['title']}: {e['text']}" for e in self.mem.lore_triggered(c["mem"]["card_ids"], claim))
             if not text.strip():
                 continue

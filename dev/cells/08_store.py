@@ -141,7 +141,22 @@ CREATE TABLE IF NOT EXISTS vocab (
 );
 """
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+
+# Columns added after v1. ALTER TABLE ADD COLUMN for databases made before them.
+_COLUMNS_V2 = [
+    ("memories", "message_id", "INTEGER"),      # message that made it (NULL: made outside a chat, visible everywhere)
+    ("memories", "forgotten_at", "INTEGER"),    # message that forgot it (hidden only where that message is on the path)
+    ("memories", "importance", "REAL NOT NULL DEFAULT 0.5"),
+    ("memory_log", "message_id", "INTEGER"),
+]
+_SCHEMA_V2 = """
+CREATE TABLE IF NOT EXISTS canon_log (
+    id INTEGER PRIMARY KEY, story_id INTEGER NOT NULL, chat_id INTEGER, message_id INTEGER, section TEXT NOT NULL,
+    text TEXT NOT NULL DEFAULT '', created REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS canon_log_story ON canon_log (story_id);
+"""
 
 
 class Store:
@@ -178,6 +193,10 @@ class Store:
             self._migrate_legacy()
         # Every statement is IF NOT EXISTS, so this also adds tables introduced after a database was created.
         self.conn.executescript(_SCHEMA_V1)
+        for table, col, decl in _COLUMNS_V2:
+            if col not in self._columns(table):
+                self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+        self.conn.executescript(_SCHEMA_V2)
         self.conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         self.conn.commit()
 
@@ -474,6 +493,18 @@ class Store:
             out.append(cur)
             cur = parents[cur]
         return out[::-1]
+
+    def visible_ids(self, chat_id):
+        """Messages whose effects (memories, story book changes) count in this chat: its active path, plus the path of
+        the chat it continues up to the point it was continued (and so on). Other chats of the same story, and
+        branches that were rerolled away, are not included."""
+        out, cur, head, depth = set(), chat_id, None, 0
+        while cur and depth < 20:
+            out.update(self.path_ids(cur, head))
+            chat = self.chat(cur)
+            s = (chat or {}).get("settings") or {}
+            cur, head, depth = s.get("continued_from"), s.get("continued_head"), depth + 1
+        return out
 
     def path(self, chat_id, head=None, ids=None):
         """Full message rows along the active path, in order, with meta decoded."""

@@ -570,8 +570,8 @@ function render({ model, el }) {
   function tabMemory() {
     const a = state.memory || { rows: [], log: [] };
     return `<label class="qr-search">${icon("search")}<input class="qr-mem-q" placeholder="Cari memory" value="${esc(a.q || "")}"></label>
-      <section><h4>Memory</h4>${(a.rows || []).map((m) => `<div class="qr-memrow"><span class="qr-badge">${esc(m.scope)}${m.kind === "summary_core" ? " · ringkasan" : ""}</span>
-        <span>#${m.id} ${esc(m.text)}</span><button class="qr-icon qr-xs" data-act="mem-del" data-id="${m.id}" title="Hapus">${icon("trash")}</button></div>`).join("") || '<div class="qr-muted">Kosong.</div>'}</section>
+      <section><h4>Memory</h4>${(a.rows || []).map((m) => `<div class="qr-memrow"><span class="qr-badge">${esc(m.scope)}${m.kind === "summary_core" ? " · ringkasan" : ""}</span>${m.other_branch ? '<span class="qr-badge" title="Dibuat atau dilupakan di cabang/chat lain; tidak dipakai di chat ini">cabang lain</span>' : ""}
+        <span class="${m.other_branch ? "qr-muted" : ""}">#${m.id} ${esc(m.text)}</span><button class="qr-icon qr-xs" data-act="mem-del" data-id="${m.id}" title="Hapus">${icon("trash")}</button></div>`).join("") || '<div class="qr-muted">Kosong.</div>'}</section>
       <section><h4>Catatan perubahan oleh model</h4>${(a.log || []).map((l) => `<div class="qr-memrow ${l.undone ? "undone" : ""}"><span class="qr-badge">${esc(l.action)}</span>
         <span>#${l.memory_id} ${esc((l.after || l.before || "").slice(0, 160))}</span>${l.undone ? '<span class="qr-muted">dibatalkan</span>' : `<button class="qr-btn qr-sm" data-act="mem-undo" data-id="${l.id}">Undo</button>`}</div>`).join("") || '<div class="qr-muted">Belum ada.</div>'}</section>`;
   }

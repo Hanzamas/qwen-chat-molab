@@ -19,8 +19,10 @@ TOOL_BASE = [
          "status": {"type": "string", "enum": ["terverifikasi", "diperdebatkan", "belum terverifikasi"]}}, ["claim"]),
     _fn("memory_search", "Search stored memories visible in this chat.", {"query": _S, "limit": _I}, ["query"]),
     _fn("memory_save", "Store a durable fact. scope: user (about the user, all chats), card (about a character, every "
-        "story using its card; give card = character name), story (this story), chat (this chat only).",
-        {"text": _S, "scope": {"type": "string", "enum": ["user", "card", "story", "chat"]}, "card": _S}, ["text"]),
+        "story using its card; give card = character name), story (this story), chat (this chat only). "
+        "importance 0..1 (default 0.5): 0.9 for facts that must never be lost, 0.2 for small details.",
+        {"text": _S, "scope": {"type": "string", "enum": ["user", "card", "story", "chat"]}, "card": _S, "importance": _N},
+        ["text"]),
     _fn("memory_update", "Replace the text of a memory that is no longer accurate.", {"id": _I, "text": _S}, ["id", "text"]),
     _fn("memory_forget", "Delete a memory by id.", {"id": _I}, ["id"]),
     _fn("history_search", "Keyword search over the original messages (also the parts already summarized).",
@@ -165,18 +167,19 @@ class ToolBox:
             return {"results": [], "note": "Tidak ada yang cocok."}
         return {"results": [{"id": r["id"], "scope": r["scope"], "text": r["text"]} for r in rows]}
 
-    def t_memory_save(self, chat_id, mid, text, scope="", card=""):
+    def t_memory_save(self, chat_id, mid, text, scope="", card="", importance=0.5):
         ctx = self.mem.ctx_of(chat_id)
         card_id = self.cards.find("character", card) if card else None
         if scope == "card" and not card_id:
             return {"error": "scope card butuh nama tokoh yang ada di kartu (field card)."}
-        return self.mem.save(text, scope or ("story" if ctx.get("story_id") else "user"), ctx, card_id=card_id)
+        return self.mem.save(text, scope or ("story" if ctx.get("story_id") else "user"), ctx, card_id=card_id,
+                             message_id=mid, importance=importance)
 
     def t_memory_update(self, chat_id, mid, id, text):
-        return self.mem.update(int(id), text, self.mem.ctx_of(chat_id))
+        return self.mem.update(int(id), text, self.mem.ctx_of(chat_id), message_id=mid)
 
     def t_memory_forget(self, chat_id, mid, id):
-        return self.mem.forget(int(id), self.mem.ctx_of(chat_id))
+        return self.mem.forget(int(id), self.mem.ctx_of(chat_id), message_id=mid)
 
     def t_history_search(self, chat_id, mid, query, scope="chat", limit=10):
         """Hybrid: BM25 over the original messages plus vector search when the embedder runs (RRF)."""
@@ -260,7 +263,8 @@ class ToolBox:
         sid, _ = self._story(chat_id)
         if not sid:
             return {"error": "chat ini tidak terhubung ke cerita"}
-        self.stories.canon_set(sid, section, text, chat_id)
+        # logged on this branch (mid); a turn always has one, a side task passes the head
+        self.stories.canon_set(sid, section, text, chat_id, message_id=mid or (self.store.chat(chat_id) or {}).get("head_id"))
         return {"ok": True, "note": "Berlaku sekarang lewat catatan sistem; masuk prompt beku di epoch berikutnya."}
 
     def t_card_read(self, chat_id, mid, name):

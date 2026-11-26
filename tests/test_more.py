@@ -614,3 +614,53 @@ def test_continued_chat_shows_every_summary(engine, nb):
     new = engine.continue_in_new_chat(chat)
     sums = [i for i in engine.display(new)["items"] if i["kind"] == "summary"]
     assert len(sums) == 2
+
+
+def test_memory_and_story_book_follow_the_branch(engine, nb, fake):
+    chat, _ = _story(nb, engine)
+    S, M, ST = nb["STORE"], nb["MEM"], nb["STORIES"]
+    engine.send(chat, "Aku duduk.")
+    wait_idle(engine)
+    first = S.chat(chat)["head_id"]
+    sid = S.chat(chat)["story_id"]
+    fake["script"] += [{"tool_calls": [{"name": "memory_save", "arguments": json.dumps({"text": "Lotte menyembunyikan surat merah", "scope": "story"})},
+                                       {"name": "canon_set", "arguments": json.dumps({"section": "Rahasia", "text": "Surat merah di laci"})}]},
+                       {"content": "Lotte menyimpan sesuatu."}]
+    engine.reroll(chat, first)  # second answer on a sibling branch writes the memory and the story book
+    wait_idle(engine)
+    ctx = M.ctx_of(chat)
+    assert any("surat merah" in r["text"] for r in M.search("surat merah Lotte", ctx, kinds=("fact",)))
+    assert "Surat merah" in ST.canon_text(sid, visible=S.visible_ids(chat))
+    engine.swipe(chat, S.chat(chat)["head_id"], -1)  # back to the first answer: none of it happened here
+    ctx = M.ctx_of(chat)
+    assert not any("surat merah" in r["text"] for r in M.search("surat merah Lotte", ctx, kinds=("fact",)))
+    assert "Surat merah" not in ST.canon_text(sid, visible=S.visible_ids(chat))
+    # a second chat of the same story does not see it either; a continued chat does
+    other = engine.new_chat("rp", "jalan lain", sid)
+    assert "Surat merah" not in ST.canon_text(sid, visible=S.visible_ids(other))
+    engine.swipe(chat, S.chat(chat)["head_id"], 1)
+    cont = engine.continue_in_new_chat(chat)
+    assert "Surat merah" in ST.canon_text(sid, visible=S.visible_ids(cont))
+    assert any("surat merah" in r["text"] for r in M.search("surat merah Lotte", M.ctx_of(cont), kinds=("fact",)))
+
+
+def test_memory_forget_and_update_on_a_branch(engine, nb):
+    chat, _ = _story(nb, engine)
+    S, M = nb["STORE"], nb["MEM"]
+    engine.send(chat, "Satu.")
+    wait_idle(engine)
+    a = S.chat(chat)["head_id"]
+    ctx = M.ctx_of(chat)
+    mid = M.save("Kunci gudang ada di bawah pot", "story", ctx, message_id=a)["saved"]
+    engine.send(chat, "Dua.")
+    wait_idle(engine)
+    b = S.chat(chat)["head_id"]
+    M.update(mid, "Kunci gudang dipindah ke saku Lotte", M.ctx_of(chat), message_id=b)
+    assert M.search("kunci gudang", M.ctx_of(chat))[0]["text"].startswith("Kunci gudang dipindah")
+    S.set_head(chat, a)  # before the update: the old text
+    assert M.search("kunci gudang", M.ctx_of(chat))[0]["text"].startswith("Kunci gudang ada")
+    S.set_head(chat, b)
+    M.forget(mid, M.ctx_of(chat), message_id=b)
+    assert not M.search("kunci gudang", M.ctx_of(chat))
+    S.set_head(chat, a)
+    assert M.search("kunci gudang", M.ctx_of(chat))

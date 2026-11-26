@@ -75,20 +75,41 @@ class Stories:
 
     # ---------- canon and never-forget ----------
 
-    def canon_set(self, story_id, section, text, chat_id=None):
-        s = self.get(story_id)
-        if text.strip():
-            s["data"]["canon"][section] = text.strip()
+    def canon_set(self, story_id, section, text, chat_id=None, message_id=None):
+        """message_id given (the model wrote it during a turn): logged on that branch. Without (edited in the UI):
+        changes the base every chat of the story starts from."""
+        if message_id:
+            self.store.x("INSERT INTO canon_log (story_id, chat_id, message_id, section, text, created) VALUES (?, ?, ?, ?, ?, ?)",
+                         (story_id, chat_id, message_id, section, text.strip(), time.time()))
         else:
-            s["data"]["canon"].pop(section, None)
-        self._save_data(story_id, s["data"])
+            s = self.get(story_id)
+            if text.strip():
+                s["data"]["canon"][section] = text.strip()
+            else:
+                s["data"]["canon"].pop(section, None)
+            self._save_data(story_id, s["data"])
         self.pending(story_id, chat_id, f"Buku cerita · {section}: {text.strip() or '(dihapus)'}")
 
-    def canon_text(self, story_id, limit=48000):
+    def canon(self, story_id, visible=None):
+        """Sections as they are on a branch: the base, then the logged changes whose message is visible."""
+        s = self.get(story_id)
+        if not s:
+            return {}
+        out = dict(s["data"]["canon"])
+        if visible:
+            for r in self.store.q("SELECT message_id, section, text FROM canon_log WHERE story_id = ? ORDER BY id", (story_id,)):
+                if r["message_id"] in visible:
+                    if r["text"]:
+                        out[r["section"]] = r["text"]
+                    else:
+                        out.pop(r["section"], None)
+        return out
+
+    def canon_text(self, story_id, limit=48000, visible=None):
         s = self.get(story_id)
         if not s:
             return ""
-        parts = [f"### {k}\n{v}" for k, v in s["data"]["canon"].items()]
+        parts = [f"### {k}\n{v}" for k, v in self.canon(story_id, visible).items()]
         nf = s["data"]["never_forget"]
         if nf:
             parts.append("### Jangan pernah lupa\n" + "\n".join(f"- {x}" for x in nf))

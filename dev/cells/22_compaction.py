@@ -132,7 +132,7 @@ class Compactor:
             if core:
                 mctx = self.mem.ctx_of(chat_id)
                 self.mem.save(f"[Inti {chat['title']}, pesan {a + 1}–{b + 1}] {core}",
-                              "story" if mctx.get("story_id") else "chat", mctx, kind="summary_core")
+                              "story" if mctx.get("story_id") else "chat", mctx, kind="summary_core", message_id=ids[b])
             done_any = True
         if not self.cancel.is_set():
             self.condense(chat_id, ids, maxc, tools, phase)
@@ -202,7 +202,7 @@ class Compactor:
     def entity_check(self, chat_id, msgs, summary):
         """Capitalized names that recur in the chunk but appear neither in the summary nor in the story book."""
         c = self.prompt.ctx(chat_id)
-        canon = self.prompt.stories.canon_text(c["story"]["id"]) if c["story"] else ""
+        canon = self.prompt.stories.canon_text(c["story"]["id"], visible=self.store.visible_ids(chat_id)) if c["story"] else ""
         have = (summary + "\n" + canon).lower()
         counts = {}
         for m in msgs:

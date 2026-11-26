@@ -153,7 +153,39 @@ class Memory:
         chat = self.store.chat(chat_id) or {}
         sid = chat.get("story_id")
         card_ids = [l["card_id"] for l in self.stories.card_links(sid)] if sid else []
-        return {"chat_id": chat_id, "story_id": sid, "card_ids": card_ids}
+        return {"chat_id": chat_id, "story_id": sid, "card_ids": card_ids,
+                "visible": self.store.visible_ids(chat_id) if chat_id else set()}
+
+    BRANCHED = ("story", "chat")  # user and card memories are about the real user / the character everywhere
+
+    def _visible(self, row, ctx):
+        """A story/chat memory made by a message counts only where that message is on the path (or in the chat
+        it continues); a forget counts the same way. Memories made outside a chat count everywhere."""
+        if row.get("scope") not in self.BRANCHED or "visible" not in ctx:
+            return True
+        vis = ctx["visible"]
+        if row.get("message_id") and row["message_id"] not in vis:
+            return False
+        return not (row.get("forgotten_at") and row["forgotten_at"] in vis)
+
+    def _resolve(self, rows, ctx):
+        """Visible rows, with updates made on other branches undone."""
+        rows = [dict(r) for r in rows if self._visible(r, ctx)]
+        vis = ctx.get("visible")
+        if not rows or vis is None:
+            return rows
+        ids = [r["id"] for r in rows]
+        logs = {}
+        for i in range(0, len(ids), 500):
+            part = ids[i:i + 500]
+            for lg in self.store.q(f"SELECT memory_id, before, after, message_id FROM memory_log WHERE action = 'update' "
+                                   f"AND undone = 0 AND memory_id IN ({','.join('?' * len(part))}) ORDER BY id DESC", part):
+                logs.setdefault(lg["memory_id"], []).append(lg)
+        for r in rows:
+            for lg in logs.get(r["id"], []):
+                if lg["message_id"] and lg["message_id"] not in vis and lg["after"] == r["text"]:
+                    r["text"] = lg["before"]
+        return rows
 
     def _scope_sql(self, ctx):
         conds, args = ["m.scope = 'user'"], []
@@ -170,7 +202,7 @@ class Memory:
 
     # ---------- memories ----------
 
-    def save(self, text, scope, ctx, kind="fact", card_id=None):
+    def save(self, text, scope, ctx, kind="fact", card_id=None, message_id=None, importance=0.5):
         text = (text or "").strip()
         if not text:
             return {"error": "teks kosong"}
@@ -186,14 +218,18 @@ class Memory:
             if j >= 0.45:
                 similar.append({"id": c["id"], "text": c["text"][:300]})
         now = time.time()
-        mid = self.store.x("INSERT INTO memories (scope, card_id, story_id, chat_id, kind, text, created, updated) "
-                           "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        try:
+            importance = min(max(float(importance), 0.0), 1.0)
+        except (TypeError, ValueError):
+            importance = 0.5
+        mid = self.store.x("INSERT INTO memories (scope, card_id, story_id, chat_id, kind, text, created, updated, message_id, "
+                           "importance) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                            (scope, card_id if scope == "card" else None,
                             ctx.get("story_id") if scope == "story" else None,
                             ctx.get("chat_id") if scope in ("chat",) or kind == "summary_core" else None,
-                            kind, text, now, now))
-        self.store.x("INSERT INTO memory_log (memory_id, action, after, chat_id, created) VALUES (?, 'save', ?, ?, ?)",
-                     (mid, text, ctx.get("chat_id"), now))
+                            kind, text, now, now, message_id, importance))
+        self.store.x("INSERT INTO memory_log (memory_id, action, after, chat_id, created, message_id) VALUES (?, 'save', ?, ?, ?, ?)",
+                     (mid, text, ctx.get("chat_id"), now, message_id))
         self.emb.enqueue("mem", mid, text)
         out = {"saved": mid, "scope": scope}
         if similar:
@@ -201,20 +237,27 @@ class Memory:
             out["note"] = "Ada memory mirip. Kalau yang lama sudah tidak berlaku, pakai memory_update atau memory_forget."
         return out
 
-    def update(self, mid, text, ctx):
-        row = self.store.one("SELECT text FROM memories WHERE id = ?", (mid,))
-        if not row:
+    def update(self, mid, text, ctx, message_id=None):
+        row = self.store.one("SELECT * FROM memories WHERE id = ?", (mid,))
+        if not row or not self._visible(row, ctx):
             return {"error": f"memory #{mid} tidak ada"}
+        before = self._resolve([row], ctx)[0]["text"]
         self.store.x("UPDATE memories SET text = ?, updated = ? WHERE id = ?", (text.strip(), time.time(), mid))
-        self.store.x("INSERT INTO memory_log (memory_id, action, before, after, chat_id, created) VALUES (?, 'update', ?, ?, ?, ?)",
-                     (mid, row["text"], text.strip(), ctx.get("chat_id"), time.time()))
+        self.store.x("INSERT INTO memory_log (memory_id, action, before, after, chat_id, created, message_id) "
+                     "VALUES (?, 'update', ?, ?, ?, ?, ?)", (mid, before, text.strip(), ctx.get("chat_id"), time.time(), message_id))
         self.emb.enqueue("mem", mid, text)
         return {"updated": mid}
 
-    def forget(self, mid, ctx):
+    def forget(self, mid, ctx, message_id=None):
+        """From a turn (message_id) a story/chat memory is only hidden on that branch; from the UI it is deleted."""
         row = self.store.one("SELECT * FROM memories WHERE id = ?", (mid,))
-        if not row:
+        if not row or (message_id and not self._visible(row, ctx)):
             return {"error": f"memory #{mid} tidak ada"}
+        if message_id and row["scope"] in self.BRANCHED:
+            self.store.x("UPDATE memories SET forgotten_at = ? WHERE id = ?", (message_id, mid))
+            self.store.x("INSERT INTO memory_log (memory_id, action, before, chat_id, created, message_id) "
+                         "VALUES (?, 'hide', ?, ?, ?, ?)", (mid, json.dumps(row), ctx.get("chat_id"), time.time(), message_id))
+            return {"deleted": mid}
         self.store.x("DELETE FROM memories WHERE id = ?", (mid,))
         self.store.x("DELETE FROM vectors WHERE kind = 'mem' AND ref_id = ?", (mid,))
         self.store.x("INSERT INTO memory_log (memory_id, action, before, chat_id, created) VALUES (?, 'forget', ?, ?, ?)",
@@ -237,6 +280,8 @@ class Memory:
                 return False
             self.store.x("UPDATE memories SET text = ?, updated = ? WHERE id = ?", (log["before"], time.time(), log["memory_id"]))
             self.emb.enqueue("mem", log["memory_id"], log["before"])
+        elif log["action"] == "hide":
+            self.store.x("UPDATE memories SET forgotten_at = NULL WHERE id = ?", (log["memory_id"],))
         elif log["action"] == "forget":
             r = json.loads(log["before"])
             cols = "scope, card_id, story_id, chat_id, kind, text, created, updated"
@@ -272,11 +317,15 @@ class Memory:
             vec_ids = [i for i, s in self.emb.search("mem", query, limit=40, allowed=set(pool)) if s > 0.35]
             allowed_rows.update({i: pool[i] for i in vec_ids})
         ranked = self.rrf([r["id"] for r in fts], vec_ids)
-        return [allowed_rows[i] for i in ranked if i in allowed_rows and i not in exclude][:limit]
+        rows = self._resolve([allowed_rows[i] for i in ranked if i in allowed_rows and i not in exclude], ctx)
+        # more important memories first among similarly relevant ones
+        rows = [r for _, r in sorted(enumerate(rows), key=lambda p: p[0] - 6 * (float(p[1].get("importance") or 0.5) - 0.5))]
+        return rows[:limit]
 
     def recall(self, text, ctx, exclude=(), limit=10, max_chars=500):
         rows = self.search(text, ctx, limit=limit, kinds=("fact",), exclude=exclude, min_overlap=2)
-        return [{"id": r["id"], "scope": r["scope"], "text": r["text"][:max_chars]} for r in rows]
+        return [{"id": r["id"], "scope": r["scope"], "text": r["text"][:max_chars], "importance": r.get("importance", 0.5)}
+                for r in rows]
 
     def frozen(self, ctx, limit_chars=8000):
         """Memories of scope user + the story's cards, shortened, for the frozen prompt."""

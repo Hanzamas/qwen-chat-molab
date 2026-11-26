@@ -116,7 +116,7 @@ class Prompt:
         if frozen:
             parts.append("# Memory (dibekukan saat epoch ini dimulai)\n" + frozen)
         if c["story"]:
-            canon = self.stories.canon_text(c["story"]["id"])
+            canon = self.stories.canon_text(c["story"]["id"], visible=self.store.visible_ids(chat_id))
             if canon:
                 parts.append("# Buku cerita\n" + canon)
         if last_node >= 0:

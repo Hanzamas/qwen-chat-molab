@@ -115,7 +115,8 @@ class ChatApp:
             if c:
                 links.append({"id": c["id"], "role": l["role"], "name": c["name"], "version": l["version"],
                               "latest": c["version"], "avatar": c["avatar"]})
-        return {"id": sid, "title": s["title"], "canon": s["data"]["canon"], "never_forget": s["data"]["never_forget"],
+        return {"id": sid, "title": s["title"], "canon": STORIES.canon(sid, STORE.visible_ids(chat["id"])),
+                "never_forget": s["data"]["never_forget"],
                 "cards": links, "pending": [p["text"] for p in STORIES.pending_list(sid, chat["id"])]}
 
     def _cards_changed(self, card_id):
@@ -493,6 +494,7 @@ class ChatApp:
         ctx = MEM.ctx_of(cid) if cid else {"chat_id": None, "story_id": None, "card_ids": []}
         rows = MEM.search(q, ctx, limit=50, kinds=("fact", "summary_core")) if q.strip() else STORE.q(
             "SELECT * FROM memories ORDER BY id DESC LIMIT 100")
+        rows = [{**r, "other_branch": not MEM._visible(r, ctx)} for r in rows]
         self.w.aux = {"n": time.time(), "kind": "memory", "data": {"q": q, "rows": rows, "log": MEM.log(limit=40)}}
 
     def c_memory_undo(self, log_id):
