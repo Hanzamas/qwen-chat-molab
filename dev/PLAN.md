@@ -513,7 +513,90 @@ akhir tiap tahap (saya tidak bisa mengakses sandbox).
 - [ ] Yang di-embed: memory, buku cerita, lore, buku fakta, kartu, ringkasan, kejadian dunia, potongan pesan
       (~400 token, overlap 80). Embed ulang otomatis setelah Muat.
 - [ ] Tombol uji ingatan: pertanyaan otomatis tentang detail awal cerita, dinilai terhadap arsip mentah.
-- [ ] Compaction otomatis saat diam, mulai di sekitar 80%.
+- [ ] Compaction otomatis saat diam, mulai di 75% (giliran chat sendiri memadatkan di 90%), dengan progres token
+      dan batal bersih saat kamu mengirim pesan.
+
+### Tahap 8 — Kontinuitas tokoh dan cerita
+Celah yang ditemukan setelah v2 jalan, diurutkan dari dampak terbesar. "Dicek di kode" = sudah dipastikan
+dengan membaca kodenya.
+
+**Cabang dan chat**
+- [ ] Memory dan buku cerita ikut cabang (dicek di kode). Tabel `memories` tidak menyimpan `message_id`, dan
+      `canon_set` juga tidak; status dan kejadian dunia sudah ikut cabang. Setelah reroll, swipe, atau edit, fakta
+      dari cabang yang dibuang masih terbaca. Perbaikan: simpan posisi cabang di setiap memory dan perubahan buku
+      cerita, saring menurut jalur aktif seperti kejadian dunia.
+- [ ] Dua chat dari cerita yang sama tidak saling mencemari. Buku cerita dan memory `story` disimpan per cerita;
+      dua jalan alternatif di dua chat membaca fakta satu sama lain.
+
+**Ingatan per tokoh**
+- [ ] Buku cerita tetap satu: kebenaran objektif cerita, hanya narator yang tahu semuanya.
+- [ ] Setiap tokoh punya ingatan sendiri, termasuk tokohmu. Isinya apa yang ia tahu atau yakini. Tiap catatan:
+      - jenis: fakta, rahasia, pendapat, perasaan ke seseorang, janji, salah paham;
+      - sumber: lihat sendiri, diberi tahu oleh siapa, gosip;
+      - benar/keliru dibanding buku cerita (tokoh bisa percaya hal yang salah, dibohongi, gosip melenceng);
+      - jam dunia dan posisi di cabang;
+      - bobot penting.
+- [ ] Cara pengetahuan masuk:
+      - menyaksikan: kejadian di adegan otomatis masuk ke ingatan semua tokoh yang hadir (sekarang model harus
+        ingat menulis `known_to` sendiri);
+      - diberi tahu: model mencatat "A memberi tahu B soal X", termasuk kalau isinya bohong;
+      - gosip: saat dunia berjalan, kabar menyebar antar NPC di tempat yang sama dan `known_to` ikut bertambah;
+      - compaction: saat bagian lama diringkas, siapa-tahu-apa ikut diambil (sekarang ringkasan hanya sudut
+        pandang narator).
+- [ ] Kehadiran tokoh ditentukan dari lokasi yang sama di status (dicek di kode). Sekarang `present_characters`
+      hanya memasukkan tokoh pertama plus tokoh yang namanya disebut di pesanmu atau balasan terakhir; NPC yang
+      hadir tapi tidak disebut kehilangan status dan pengetahuannya di giliran itu.
+- [ ] Tiap giliran, tokoh yang hadir mendapat ingatan yang paling relevan (kemiripan isi + bobot penting), bukan
+      5 kejadian terakhir (dicek di kode). Narator diberi aturan: tokoh hanya bertindak berdasarkan isi kepalanya.
+- [ ] Pengetahuan tokohmu dicatat terpisah dari pengetahuanmu sebagai pemain, supaya tokohmu tidak "tahu"
+      rahasia yang tidak pernah ia pelajari di cerita.
+- [ ] Memory tidak bocor ke NPC: memory punya pemilik dan daftar siapa yang tahu.
+- [ ] Lore rahasia punya daftar siapa yang tahu, supaya tidak terbaca semua NPC begitu kata kuncinya muncul.
+- [ ] Memory `card` (ikut ke semua cerita) tetap ada, hanya untuk hal yang benar lintas cerita.
+- [ ] UI: di kartu tokoh, dalam cerita, tab Ingatan untuk melihat, mengedit, dan menghapus, dengan sumber dan
+      tanda "keliru".
+- [ ] Usulan perubahan kartu: setiap epoch atau compaction, model mengusulkan perubahan kartu (hubungan yang
+      berubah, sifat yang bergeser); kamu yang menyetujui.
+
+**Keadaan dunia dan tokoh**
+- [ ] Pemeriksa keadaan setelah tiap giliran, di latar seperti cek fakta (dicek di kode: waktu hanya maju kalau
+      model memanggil `world_advance`, status hanya berubah kalau model memanggil `status_update`). Ia membaca
+      narasi lalu mengisi yang terlupa: waktu berlalu, makan, luka, barang berpindah tangan; ditambah perkiraan
+      waktu minimum per giliran dari panjang adegan.
+- [ ] Waktu berlaku juga untuk NPC: luka sembuh setelah sekian jam, mood mereda, jadwal rutin tokoh menentukan di
+      mana ia berada menurut jam dunia. Sekarang laju per jam hanya untuk statistik pemain.
+- [ ] Keadaan tokoh yang eksplisit: hidup, mati, pergi, ditahan.
+- [ ] Daftar lokasi dengan waktu tempuh di kartu Dunia; jam dunia maju sesuai perjalanan.
+- [ ] Riwayat hubungan antar tokoh: skor plus alasan setiap perubahan, ditampilkan di panel. Sekarang sikap cuma
+      teks bebas.
+- [ ] Bobot penting untuk memory, supaya di cerita 1 juta token detail remeh tidak menyingkirkan fakta penting
+      saat pemanggilan 10 teratas.
+
+**Cek kontinuitas**
+- [ ] Tugas sampingan seperti cek fakta, dengan mode ketat yang menulis ulang balasan. Menangkap:
+      - NPC yang tahu hal yang tidak ada di ingatannya / `known_to`-nya;
+      - tokoh yang muncul padahal sedang di lokasi lain;
+      - tokoh yang sudah mati tapi bicara;
+      - narasi yang tidak mengikuti hasil dadu.
+- [ ] Pengecekan suara NPC di latar: gaya bicara dibandingkan dengan contoh ucapan di kartunya; ditandai kalau
+      melenceng.
+
+**Panel dan dadu**
+- [ ] Panel "Tokoh lain" hanya menampilkan yang bisa diamati tokohmu (lokasi, raut wajah) (dicek di kode: sekarang
+      menampilkan semua status NPC termasuk rencana, sikap, dan apa yang mereka tahu). Tampilan lengkap di balik
+      tombol mode GM.
+- [ ] Dadu berbasis skill (dicek di kode: peluang sekarang ditentukan model sendiri). Kartu persona dan tokoh diberi
+      skill dan atribut; peluang dihitung kode dari skill, tingkat kesulitan, dan pengubah seperti luka atau lelah.
+
+**Benang cerita**
+- [ ] Daftar benang cerita di buku cerita: janji, misteri, petunjuk, utang, dendam. Tiap benang punya status
+      terbuka/selesai dan tenggat di jam dunia; GM diingatkan kalau ada benang yang lama atau jatuh tempo. Sekarang
+      "Alur yang direncanakan" di skenario cuma teks.
+- [ ] Janji temu ("ketemu jam 7 di Odeonsplatz") dicatat sebagai benang bertenggat; saat dunia berjalan, akibatnya
+      ikut terjadi (NPC menunggu, kesal, pergi).
+
+**Urutan kerja:** cabang untuk memory/buku cerita → ingatan per tokoh + kehadiran dari lokasi → pemeriksa keadaan
+→ panel → cek kontinuitas → benang cerita → dadu berbasis skill → sisanya.
 
 ---
 
