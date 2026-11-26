@@ -230,7 +230,7 @@ def _(PROCS, VLLM_PID, mo, os, re, signal, subprocess, time, urllib):
 def _(mo):
     ctx_len = mo.ui.dropdown(
         options={"1M (YaRN factor 4.0)": 1000000, "512K (YaRN factor 2.0)": 524288, "262K (native, paling akurat)": 262144},
-        value="1M (YaRN factor 4.0)",
+        value="512K (YaRN factor 2.0)",
         label="Konteks",
     )
     use_mtp = mo.ui.switch(value=False, label="MTP speculative decoding (generate lebih cepat, startup pertama compile kernel)")
@@ -423,7 +423,7 @@ def _(PORT, Path, mo):
                       "/resolve/main/Qwen3.8-40B-Ultimate-Heretic-Uncensored-Build2.mmproj-Q8_0.gguf")
     # Sampler Dark-Gemistry dari model card Nimbz (temp 0.75-1.0, top_k 0, top_p 0.95, min_p 0.05,
     # tanpa repetition penalty/DRY karena melawan "suara" StyleTune di lm_head).
-    _DG_SAMPLING = {"temperature": 0.9, "top_p": 0.95, "top_k": 0, "min_p": 0.05,
+    _DG_SAMPLING = {"temperature": 1.0, "top_p": 0.95, "top_k": 0, "min_p": 0.05,
                     "repetition_penalty": 1.0, "frequency_penalty": 0, "presence_penalty": 0}
     # Dark-Gemistry adalah merge Gemma4ForConditionalGeneration dan masih membawa vision tower (356 tensor),
     # tapi repo GGUF-nya tidak menyertakan mmproj. Pakai mmproj Gemma 4 31B resmi dari ggml-org
@@ -431,18 +431,21 @@ def _(PORT, Path, mo):
     _G4_MMPROJ = ("https://huggingface.co/ggml-org/gemma-4-31B-it-GGUF"
                   "/resolve/main/mmproj-gemma-4-31B-it-BF16.gguf")
     # gguf = "repo:quant". mmproj None = teks saja.
-    # mtp = draft MTP (khusus Qwen3.8). max_ctx = konteks native; yarn = boleh diperpanjang dengan YaRN.
+    # mtp = draft MTP (khusus Qwen3.8). max_ctx = konteks native; yarn_max = batas dengan YaRN
+    # (Qwen3.8: resmi sampai 1M). yarn_exp = YaRN tidak resmi untuk model ini (Gemma 4 tidak punya resep YaRN).
     LLAMA_MODELS = {
         "Dark-Gemistry 31B HB16-Q8_0 (36.8GB, kualitas tertinggi)": {
             "gguf": "ReadyArt/Nimbz_Gemma-4-Dark-Gemistry-31B-GGUF:HB16-Q8_0", "mmproj": _G4_MMPROJ, "mtp": False,
-            "max_ctx": 262144, "yarn": False, "sampling": _DG_SAMPLING},
+            "max_ctx": 262144, "yarn_max": 524288, "yarn_exp": True, "sampling": _DG_SAMPLING},
         "Dark-Gemistry 31B HB16-Q6_K (29.7GB, lebih cepat)": {
             "gguf": "ReadyArt/Nimbz_Gemma-4-Dark-Gemistry-31B-GGUF:HB16-Q6_K", "mmproj": _G4_MMPROJ, "mtp": False,
-            "max_ctx": 262144, "yarn": False, "sampling": _DG_SAMPLING},
+            "max_ctx": 262144, "yarn_max": 524288, "yarn_exp": True, "sampling": _DG_SAMPLING},
         "Qwen3.8 40B Heretic Build2 i1-Q6_K (lama)": {
             "gguf": "mradermacher/Qwen3.8-40B-Ultimate-Heretic-Uncensored-Build2-i1-GGUF:Q6_K", "mmproj": _QWEN40_MMPROJ,
-            "mtp": True, "max_ctx": 262144, "yarn": True,
-            "sampling": {"temperature": 0.85, "top_p": 0.95, "top_k": 64, "min_p": 0.05,
+            # sampler dari card DavidAU (temp 1.0, top_k 64, top_p 0.95, min_p 0.05, rep pen 1.0).
+            # Card menyebut maks 256K; YaRN 512K/1M ikut resep Qwen3.8 dasar.
+            "mtp": True, "max_ctx": 262144, "yarn_max": 1000000, "yarn_exp": False,
+            "sampling": {"temperature": 1.0, "top_p": 0.95, "top_k": 64, "min_p": 0.05,
                          "repetition_penalty": 1.0, "frequency_penalty": 0, "presence_penalty": 0}},
     }
     LLAMA_MMPROJ = _QWEN40_MMPROJ  # dipertahankan untuk kompatibilitas
@@ -454,9 +457,9 @@ def _(PORT, Path, mo):
         value="", label="Atau repo:quant sendiri (kosong = pakai pilihan di atas)", full_width=True,
     )
     llama_ctx = mo.ui.dropdown(
-        options={"128K": 131072, "262K (native)": 262144, "512K (YaRN, Qwen saja)": 524288,
-                 "1M (YaRN, Qwen saja, pakai Q5_K_M)": 1000000},
-        value="262K (native)",
+        options={"128K": 131072, "262K (native)": 262144, "512K (YaRN; Gemma eksperimental)": 524288,
+                 "1M (YaRN, Qwen saja)": 1000000},
+        value="512K (YaRN; Gemma eksperimental)",
         label="Konteks llama.cpp",
     )
     llama_install_btn = mo.ui.run_button(label="Install llama.cpp")
@@ -543,10 +546,10 @@ def _(
     _m = LLAMA_MODELS[llama_model.value]
     _spec = llama_gguf.value.strip() or _m["gguf"]
     mo.stop(
-        llama_ctx.value > _m["max_ctx"] and not _m["yarn"],
-        mo.callout(mo.md(f"Model ini maksimal {_m['max_ctx']:,} token (tanpa YaRN). Pilih konteks 262K atau lebih kecil."),
-                   kind="danger"),
+        llama_ctx.value > _m["yarn_max"],
+        mo.callout(mo.md(f"Model ini maksimal {_m['yarn_max']:,} token. Pilih konteks yang lebih kecil."), kind="danger"),
     )
+    _yarn_exp = llama_ctx.value > _m["max_ctx"] and _m["yarn_exp"]
 
     # Download paralel lewat huggingface_hub (hf_xet), jauh lebih cepat dari downloader bawaan llama.cpp.
     _gdir = Path.home() / "gguf"
@@ -665,7 +668,9 @@ def _(
     mo.output.append(mo.md(
         f"llama.cpp dimulai: `{_gguf}` (pid `{_proc.pid}`, port {LLAMA_PORT}), proxy di port {PORT}. "
         f"mmproj: {'`' + _mm_file + '`' if _mm_file else 'tidak (teks saja)'}. "
-        f"Sampler chat: `{json.dumps(SAMPLING)}`. Pantau log di Sel 5."))
+        f"Sampler chat: `{json.dumps(SAMPLING)}`. Pantau log di Sel 5."
+        + ("\n\n**YaRN eksperimental:** Gemma 4 tidak punya resep YaRN resmi. Cek `n_ctx` di log, "
+           "lalu uji needle-in-haystack sebelum percaya jawaban di atas 262K." if _yarn_exp else "")))
     return
 
 
