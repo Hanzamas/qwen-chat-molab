@@ -200,6 +200,9 @@ UI_CSS = r"""
 .qr-speaker-bar { display:flex; flex-wrap:wrap; align-items:center; gap:6px; max-width:800px; margin:0 auto 6px; font-size:13px; }
 .qr-speaker-bar .qr-chip { display:inline-flex; align-items:center; gap:6px; }
 .qr-speaker-bar .qr-chip.on { outline:1px solid var(--text); }
+.qr-spk-list { display:contents; }
+.qr-spk-list.all { display:flex; flex-wrap:wrap; gap:6px; flex-basis:100%; max-height:28vh; overflow:auto; padding:2px 0; }
+.qr-spk-q { width:170px; }
 .qr-stale { display:flex; align-items:center; gap:8px; font-size:13px; color:var(--warn); background:var(--panel);
   border:1px solid var(--line); border-radius:10px; padding:8px 10px; margin-bottom:10px; }
 .qr-stale span { flex:1; }

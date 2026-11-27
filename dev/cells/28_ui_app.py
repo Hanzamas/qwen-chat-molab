@@ -326,16 +326,48 @@ function render({ model, el }) {
       return `<p class="qr-speaker">${img}<strong>${name}</strong>`;
     });
   }
+  // The speaker bar: with a large cast it shows who is in the scene (and the chosen speaker); everyone else is one
+  // click away with a search, and the whole bar folds into one chip. The choice is remembered in this browser.
+  function spkMode() {
+    if (!state.spk) { try { state.spk = localStorage.getItem("qr-spk") || "scene"; } catch (e) { state.spk = "scene"; } }
+    return state.spk;
+  }
+  function setSpk(mode) {
+    state.spk = mode;
+    try { localStorage.setItem("qr-spk", mode); } catch (e) { /* private window: this session only */ }
+    renderSpeakerBar();
+  }
   function renderSpeakerBar() {
     const c = get("chat"), bar = $(".qr-speaker-bar");
     const chars = Object.values(state.avMap || {});
     bar.hidden = c.kind !== "group" || !chars.length;
     if (bar.hidden) return;
+    const f = rootActive();
+    if (f && bar.contains(f) && f.classList.contains("qr-spk-q")) return;  // searching: do not redraw under the cursor
     const cur = ((c.settings || {}).speaker || "").toLowerCase(), single = (c.settings || {}).group_mode === "single";
+    const lead = single ? "Model memilih" : "GM (semua)";
+    const chip = (x) => `<button class="qr-chip ${cur === x.name.toLowerCase() ? "on" : ""}" data-act="speaker" data-name="${esc(x.name)}">${x.cls ? `<span class="qr-avatar sm ${x.cls}"></span>` : ""}${esc(x.name)}</button>`;
+    const mode = spkMode();
+    if (mode === "hidden") {
+      const who = cur ? (chars.find((x) => x.name.toLowerCase() === cur) || { name: cur }).name : lead;
+      bar.innerHTML = `<button class="qr-chip qr-ghost" data-act="spk-mode" data-mode="scene" title="Tampilkan pilihan pembicara">${icon("users")}Berikutnya: ${esc(who)}</button>`;
+      return;
+    }
+    const small = chars.length <= 8, all = small || mode === "all";
+    const here = new Set(Object.keys((get("panels") || {}).characters || {}).map((n) => n.toLowerCase()));
+    const q = (state.spkQ || "").toLowerCase();
+    const shown = all ? chars : chars.filter((x) => here.has(x.name.toLowerCase()) || cur === x.name.toLowerCase());
     bar.innerHTML = `<span class="qr-muted">Berikutnya:</span>
-      <button class="qr-chip ${cur ? "" : "on"}" data-act="speaker" data-name="">${icon("users")}${single ? "Model memilih" : "GM (semua)"}</button>
-      ${chars.map((x) => `<button class="qr-chip ${cur === x.name.toLowerCase() ? "on" : ""}" data-act="speaker" data-name="${esc(x.name)}">${x.cls ? `<span class="qr-avatar sm ${x.cls}"></span>` : ""}${esc(x.name)}</button>`).join("")}
-      <label class="qr-check"><input type="checkbox" class="qr-single" ${single ? "checked" : ""}> satu tokoh per balasan</label>`;
+      <button class="qr-chip ${cur ? "" : "on"}" data-act="speaker" data-name="">${icon("users")}${lead}</button>
+      ${small ? "" : all ? `<input class="qr-spk-q" placeholder="Cari tokoh" value="${esc(state.spkQ || "")}"><button class="qr-chip qr-ghost" data-act="spk-mode" data-mode="scene">Yang di adegan saja</button>`
+        : `<button class="qr-chip qr-ghost" data-act="spk-mode" data-mode="all">Semua tokoh (${chars.length})</button>`}
+      <label class="qr-check"><input type="checkbox" class="qr-single" ${single ? "checked" : ""}> satu tokoh per balasan</label>
+      <button class="qr-icon qr-xs" data-act="spk-mode" data-mode="hidden" title="Sembunyikan" aria-label="Sembunyikan pilihan pembicara">${icon("x")}</button>
+      <div class="qr-spk-list ${all && !small ? "all" : ""}">${shown.map(chip).join("") || (all ? "" : '<span class="qr-muted">Tidak ada tokoh lain di adegan.</span>')}</div>`;
+    if (q && all) filterSpk(q);
+  }
+  function filterSpk(q) {
+    $(".qr-speaker-bar").querySelectorAll(".qr-spk-list .qr-chip").forEach((b) => { b.hidden = !b.dataset.name.toLowerCase().includes(q); });
   }
   function itemHTML(it) {
     const chap = it.chapter ? `<div class="qr-chapter">${icon("bookmark")}${esc(it.chapter)}</div>` : "";
@@ -894,6 +926,9 @@ function render({ model, el }) {
     }
   });
   $(".qr-file-att").addEventListener("cancel", () => { state.imageIntent = false; });
+  $(".qr-speaker-bar").addEventListener("input", (e) => {
+    if (e.target.classList.contains("qr-spk-q")) { state.spkQ = e.target.value; filterSpk(e.target.value.toLowerCase()); }
+  });
   $(".qr-speaker-bar").addEventListener("change", (e) => {
     if (e.target.classList.contains("qr-single")) send("settings", { group_mode: e.target.checked ? "single" : null });
   });
@@ -1052,6 +1087,7 @@ function render({ model, el }) {
       case "speaker": send("settings", { speaker: btn.dataset.name || null }); break;
       case "props-make": send("proposals_make"); break;
       case "fame-suggest": send("fame_suggest"); break;
+      case "spk-mode": setSpk(btn.dataset.mode); break;
       case "fame-table": fameModal((get("story").cards || []).filter((x) => x.role === "character" || x.role === "persona")
         .map((x) => ({ card_id: x.id, name: x.name, fame: x.fame, fame_for: x.fame_for, persona: x.role === "persona" })), false); break;
       case "fame-save": {
@@ -1221,7 +1257,7 @@ function render({ model, el }) {
   const handlers = {
     "change:chats": renderChats, "change:chat": onChat, "change:history": () => { renderHistory(); refreshStory(); if (get("chat").kind === "studio" && state.studioCard) send("card_open", { card_id: state.studioCard }); },
     "change:live": onLive, "change:busy": renderBusy, "change:status": renderStatusLine, "change:queue": renderStatusLine,
-    "change:toast": onToast, "change:ctx": renderTop, "change:panels": () => { renderPanels(); renderTop(); },
+    "change:toast": onToast, "change:ctx": renderTop, "change:panels": () => { renderPanels(); renderTop(); renderSpeakerBar(); },
     "change:server": () => {
       renderTop();
       if (state.tab !== "model" || drawer.hidden) return;
