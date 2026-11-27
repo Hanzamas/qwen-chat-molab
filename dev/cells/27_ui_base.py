@@ -56,11 +56,11 @@ const ICONS = {
 const icon = (n, cls = "") => `<svg class="qi ${cls}" viewBox="0 0 24 24" aria-hidden="true">${ICONS[n] || ""}</svg>`;
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const words = (s) => (String(s || "").trim().match(/\S+/g) || []).length;
-const fmtN = (n) => Number(n || 0).toLocaleString("id-ID");
+const fmtN = (n) => Number(n || 0).toLocaleString("en-GB");
 const ago = (t) => {
-  if (!t) return "belum";
+  if (!t) return "never";
   const m = Math.floor((Date.now() / 1000 - t) / 60);
-  return m < 1 ? "baru saja" : m < 60 ? `${m} mnt lalu` : m < 1440 ? `${Math.floor(m / 60)} jam lalu` : `${Math.floor(m / 1440)} hari lalu`;
+  return m < 1 ? "just now" : m < 60 ? `${m} min ago` : m < 1440 ? `${Math.floor(m / 60)} h ago` : `${Math.floor(m / 1440)} d ago`;
 };
 const kb = (n) => n > 1048576 ? `${(n / 1048576).toFixed(1)} MB` : `${Math.max(1, Math.round(n / 1024))} KB`;
 const readB64 = (f) => new Promise((ok, fail) => {
