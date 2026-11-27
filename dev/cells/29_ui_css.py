@@ -139,6 +139,10 @@ UI_CSS = r"""
 .qr-tool summary em { color:var(--warn); font-style:normal; }
 .qr-tool.err > summary em { color:var(--danger); }
 .qr-toolset > .qr-tools { margin:6px 0 0 20px; }
+.qr-fame-row { display:flex; flex-wrap:wrap; gap:6px 8px; align-items:center; padding:6px 0; border-bottom:1px solid var(--line); }
+.qr-fame-row b { min-width:140px; }
+.qr-fame-row .fm-for { flex:1; min-width:160px; }
+.qr-fame-row .qr-fame-why { flex-basis:100%; font-size:12px; }
 .qr-toolset > summary b { font-family:inherit; }
 .qr-tool pre { white-space:pre-wrap; background:var(--code); border:1px solid var(--line); border-radius:8px; padding:8px 10px; max-height:260px; overflow:auto; font-size:12px; }
 .qr-dices, .qr-flags { display:flex; flex-wrap:wrap; gap:6px; margin:6px 0 10px; align-items:center; }

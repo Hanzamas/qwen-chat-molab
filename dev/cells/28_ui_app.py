@@ -670,7 +670,7 @@ function render({ model, el }) {
     const k = state.know;
     if (!k) { send("knowledge", { holder: "" }); return '<div class="qr-muted">Memuat…</div>'; }
     const label = (h) => h === "player" ? `Tokohmu${k.persona ? ` (${k.persona})` : ""}` : h;
-    const kinds = ["fakta", "rahasia", "pendapat", "perasaan", "janji", "salah paham"];
+    const kinds = ["fakta", "rahasia", "pendapat", "perasaan", "janji", "salah paham", "kenalan"];
     return `<select class="qr-know-holder">${k.holders.map((h) => `<option value="${esc(h)}" ${h === k.holder ? "selected" : ""}>${esc(label(h))}</option>`).join("")}</select>
       ${k.rows.map((r) => `<div class="qr-memrow" data-kid="${r.id}"><span class="qr-badge">${esc(r.kind)}</span>${r.truth !== "benar" ? `<span class="qr-badge warn">${esc(r.truth)}</span>` : ""}
         <span><input class="qr-know-text" value="${esc(r.text)}"><span class="qr-muted">${esc(r.source)}${r.source_who ? ` dari ${esc(r.source_who)}` : ""}${r.world_time ? ` · ${esc(r.world_time)}` : ""}</span></span>
@@ -682,6 +682,36 @@ function render({ model, el }) {
           <button class="qr-btn qr-sm" data-act="know-restore">${icon("refresh")}Pulihkan</button></div>`).join("")}</details>` : ""}
       <div class="qr-row"><input class="qr-know-new" placeholder="Tambah yang ia tahu atau yakini"><select class="qr-know-kind">${kinds.map((x) => `<option>${x}</option>`).join("")}</select>
         <button class="qr-btn qr-sm" data-act="know-add">${icon("plus")}Tambah</button></div>`;
+  }
+  // ---------- pamor ----------
+  const FAME_LEVELS = ["bintang", "terkenal", "dikenal di lingkungannya", "biasa"], TOP_FAME = ["bintang", "terkenal"];
+  function topHTML(st) {
+    const people = (st.cards || []).filter((x) => x.role === "character" || x.role === "persona");
+    if (!people.some((x) => x.role === "character")) return "";
+    const rank = (f) => { const i = FAME_LEVELS.indexOf(f); return i < 0 ? FAME_LEVELS.length : i; };
+    const top = people.filter((x) => TOP_FAME.includes(x.fame)).sort((a, b) => rank(a.fame) - rank(b.fame) || a.name.localeCompare(b.name));
+    const n = (f) => people.filter((x) => x.role === "character" && x.fame === f).length;
+    return `<section><h4>Top tokoh (pamor)</h4><div class="qr-help">Bintang dan terkenal dikenal semua orang walau belum kenalan, lebih aktif di dunia, dan kartunya selalu ada di prompt kalau tokoh lebih dari 12. Perubahan masuk prompt setelah Terapkan sekarang atau compaction.</div>
+      ${top.map((x) => `<div class="qr-linkrow"><span class="qr-badge">${esc(x.fame)}</span><b>${esc(x.name)}</b>${x.role === "persona" ? '<span class="qr-muted">(tokohmu)</span>' : ""}<span class="qr-muted">${esc(x.fame_for || "")}</span></div>`).join("") || '<div class="qr-muted">Belum ada yang berpamor bintang atau terkenal.</div>'}
+      <div class="qr-muted">bintang ${n("bintang")}/5 · terkenal ${n("terkenal")}/10</div>
+      <div class="qr-row"><button class="qr-btn qr-sm" data-act="fame-suggest">${icon("sparkles")}Usulkan pamor</button><button class="qr-btn qr-sm" data-act="fame-table">Atur semua</button></div></section>`;
+  }
+  // The table for every character (and the player's own card): suggestions arrive here too; nothing is saved until Simpan.
+  function fameModal(rows, suggested) {
+    openModal(suggested ? "Usulan pamor" : "Atur pamor", `<div class="qr-help">${suggested ? "Usulan model dari isi kartu. Ubah yang tidak cocok, lalu Simpan semua. " : ""}Batas yang disarankan: bintang 5, terkenal 10.</div>
+      <div class="qr-fame-count qr-muted"></div>
+      ${rows.map((r) => `<div class="qr-fame-row" data-card="${Number(r.card_id)}" ${r.persona ? "data-persona" : ""}><b>${esc(r.name)}</b>${r.persona ? '<span class="qr-muted">(tokohmu)</span>' : ""}${suggested && (r.current || "") !== (r.fame || "") ? `<span class="qr-muted">sekarang: ${esc(r.current || "-")}</span>` : ""}
+        <select class="fm-fame"><option value=""></option>${FAME_LEVELS.map((f) => `<option ${f === r.fame ? "selected" : ""}>${f}</option>`).join("")}</select>
+        <input class="fm-for" value="${esc(r.fame_for || "")}" placeholder="Dikenal karena">${r.reason ? `<span class="qr-muted qr-fame-why">${esc(r.reason)}</span>` : ""}</div>`).join("") || "Belum ada tokoh."}
+      <button class="qr-btn qr-primary" data-act="fame-save">${icon("check")}Simpan semua</button>`);
+    fameCount();
+  }
+  function fameCount() {
+    const box = $(".qr-modal-body .qr-fame-count");
+    if (!box) return;
+    const vals = [...$(".qr-modal-body").querySelectorAll(".qr-fame-row:not([data-persona]) .fm-fame")].map((s) => s.value);
+    const b = vals.filter((v) => v === "bintang").length, t = vals.filter((v) => v === "terkenal").length;
+    box.innerHTML = `bintang ${b}/5 · terkenal ${t}/10${b > 5 || t > 10 ? ' <span class="qr-badge warn">melebihi batas</span>' : ""}`;
   }
   function tabStory() {
     const st = get("story"), c = get("chat"), lib = get("library");
@@ -696,6 +726,7 @@ function render({ model, el }) {
       <div class="qr-row"><select class="qr-attach-role">${roles.map((r) => `<option value="${r}">${esc((get("boot").types || {})[r] || r)}</option>`).join("")}</select>
         <select class="qr-attach-card"><option value="">Pasang kartu…</option>${(lib.cards || []).map((x) => `<option value="${x.id}">${esc(x.type)} · ${esc(x.name)}</option>`).join("")}</select>
         <button class="qr-btn qr-sm" data-act="attach-card">Pasang</button></div></section>
+      ${topHTML(st)}
       <section><h4>Buku cerita</h4>${Object.entries(st.canon || {}).map(([k, v]) => `<div class="qr-canon" data-sec="${esc(k)}"><b>${esc(k)}</b><textarea rows="3">${esc(v)}</textarea>
         <button class="qr-btn qr-sm" data-act="canon-save">Simpan</button></div>`).join("")}
         <div class="qr-canon" data-sec=""><input class="qr-canon-new" placeholder="Bagian baru, misalnya: Alur terbuka"><textarea rows="2"></textarea><button class="qr-btn qr-sm" data-act="canon-save">${icon("plus")}Tambah</button></div></section>
@@ -880,6 +911,7 @@ function render({ model, el }) {
     return true;
   };
   listen("input", markDirty);
+  listen("change", (e) => { if (e.target.classList && e.target.classList.contains("fm-fame")) fameCount(); });
   listen("change", markDirty);
   dbody.addEventListener("change", (e) => {
     const t = e.target;
@@ -1019,6 +1051,13 @@ function render({ model, el }) {
         openModal("Daftar bab", (h.chapters || []).map((c) => `<button class="qr-libitem" data-act="jump-to" data-chat="${cid}" data-id="${c.id}">${icon("bookmark")}<b>${esc(c.title)}</b><span class="qr-muted">pesan ${c.n}</span></button>`).join("") || "Belum ada bab. Tandai dengan /bab atau tombol bab di balasan."); break; }
       case "speaker": send("settings", { speaker: btn.dataset.name || null }); break;
       case "props-make": send("proposals_make"); break;
+      case "fame-suggest": send("fame_suggest"); break;
+      case "fame-table": fameModal((get("story").cards || []).filter((x) => x.role === "character" || x.role === "persona")
+        .map((x) => ({ card_id: x.id, name: x.name, fame: x.fame, fame_for: x.fame_for, persona: x.role === "persona" })), false); break;
+      case "fame-save": {
+        const items = [...$(".qr-modal-body").querySelectorAll(".qr-fame-row")].map((r) => ({ card_id: Number(r.dataset.card),
+          fame: r.querySelector(".fm-fame").value, fame_for: r.querySelector(".fm-for").value.trim() }));
+        send("fame_save", { items }); closeModal(); break; }
       case "prop-yes": case "prop-no": send("proposal", { pid: Number(btn.closest("[data-pid]").dataset.pid), accept: act === "prop-yes" }); break;
       case "thread-add": { const box = btn.closest(".qr-threads"), title = box.querySelector(".qr-thread-title").value.trim();
         if (title) { send("thread_add", { kind: box.querySelector(".qr-thread-kind").value, title, due: box.querySelector(".qr-thread-due").value.trim() });
@@ -1077,7 +1116,8 @@ function render({ model, el }) {
     if (!a.kind) return;
     const d = a.data;
     // answers for another chat (the user switched meanwhile) are dropped
-    if (["proposals", "threads", "knowledge"].includes(a.kind) && d && d.chat_id && d.chat_id !== get("chat").id) return;
+    if (["proposals", "threads", "knowledge", "fame"].includes(a.kind) && d && d.chat_id && d.chat_id !== get("chat").id) return;
+    if (a.kind === "fame") { fameModal(d.rows || [], true); return; }
     if (a.kind === "proposals") {
       state.props = d;
       const box = dbody.querySelector(".qr-props");

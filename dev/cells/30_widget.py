@@ -115,7 +115,8 @@ class ChatApp:
             c = CARDS.get(l["card_id"])
             if c:
                 links.append({"id": c["id"], "role": l["role"], "name": c["name"], "version": l["version"],
-                              "latest": c["version"], "avatar": c["avatar"]})
+                              "latest": c["version"], "avatar": c["avatar"], "fame": str(c["data"].get("fame") or ""),
+                              "fame_for": str(c["data"].get("fame_for") or "")})
         return {"id": sid, "title": s["title"], "canon": STORIES.canon(sid, STORE.visible_ids(chat["id"]), chat["id"]),
                 "never_forget": s["data"]["never_forget"],
                 "cards": links, "pending": [p["text"] for p in STORIES.pending_list(sid, chat["id"])]}
@@ -616,6 +617,34 @@ class ChatApp:
         self.engine.decide_proposal(self._cur(), int(pid), bool(accept))
         self.c_proposals()
         chat = STORE.chat(self._cur())
+        if chat:
+            self.w.story = self.story_info(chat)
+
+    # pamor
+    def c_fame_suggest(self):
+        cid = self._cur()
+        if (STORE.chat(cid) or {}).get("kind") not in ("rp", "group"):
+            return self._toast("Usulan pamor hanya untuk chat cerita.", "warn")
+
+        def job():
+            rows = self.engine.suggest_fame(cid)
+            self.w.aux = {"n": time.time(), "kind": "fame", "data": {"chat_id": cid, "rows": rows}}
+        if self.engine.run(job):
+            self._toast("Menyusun usulan pamor…")
+
+    def c_fame_save(self, items):
+        n = 0
+        for it in items or []:
+            card = CARDS.get(int(it.get("card_id") or 0))
+            if not card or card["type"] not in ("character", "persona"):
+                continue
+            fame = it.get("fame") if it.get("fame") in FAME_LEVELS else ""
+            data = {**card["data"], "fame": fame, "fame_for": str(it.get("fame_for") or "").strip()[:200]}
+            if (card["data"].get("fame") or "", card["data"].get("fame_for") or "") != (data["fame"], data["fame_for"]):
+                CARDS.save(card["id"], card["type"], data)
+                n += 1
+        self._toast(f"Pamor disimpan untuk {n} kartu. Masuk prompt setelah Terapkan sekarang atau compaction berikutnya.")
+        chat = STORE.chat(self._cur()) if self._cur() else None
         if chat:
             self.w.story = self.story_info(chat)
 

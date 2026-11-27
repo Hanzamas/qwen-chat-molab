@@ -41,7 +41,8 @@ putaran sebelum menulis narasi, tanpa teks pengantar):
 
 # Who records what characters learn, feelings and threads: the narrator itself, or the checker after the turn.
 RECORD_MARK = "dicatat pemeriksa setelah giliran"
-RECORD_SELF = """- Catat yang baru diketahui tokoh dengan knowledge_add atau tell.
+RECORD_SELF = """- Catat yang baru diketahui tokoh dengan knowledge_add atau tell. Saat tokoh pertama kali bertemu pemain, catat
+  knowledge_add kind 'kenalan': tahu nama pemain atau belum, kesan pertama, cara bertemu.
 - Hubungan: kalau kejadian mengubah perasaan tokoh terhadap tokoh lain atau pemain, catat dengan relationship.
 - Benang cerita: catat janji, janji temu (dengan tenggat), misteri, petunjuk, utang, dendam, dan rencana dengan thread_open;
   tutup dengan thread_close."""
@@ -148,7 +149,15 @@ class Prompt:
                                         record_rule=RECORD_CHECKER if checker else RECORD_SELF))
             cards = c["cards"]
             card_parts = [self.cards.render(cards[r]) for r in ("style", "gm", "persona", "world", "scenario") if cards.get(r)]
-            card_parts += [self.cards.render(ch) for ch in cards["character"]]
+            full = self.frozen_full(c)
+            card_parts += [self.cards.render(ch) for ch in cards["character"] if ch["name"] in full]
+            rest = [ch for ch in cards["character"] if ch["name"] not in full]
+            if rest:
+                card_parts.append("## Tokoh lain (kartu lengkapnya masuk catatan sistem saat mereka muncul atau disebut; "
+                                  "card_read untuk membacanya)\n" + "\n".join(self.roster_line(ch) for ch in rest))
+            known = self.common_knowledge(cards)
+            if known:
+                card_parts.append(known)
             lore = self.mem.lore_core(c["mem"]["card_ids"])
             if lore:
                 card_parts.append("## Lore inti\n" + "\n".join(f"- {e['title']}: {e['text'][:800]}" for e in lore))
@@ -280,6 +289,42 @@ class Prompt:
             lo, hi = 3, 6
         return {"paragraphs": n, "sent_lo": lo, "sent_hi": hi}
 
+    SLIM_AT = 12  # more characters than this: only the best known keep their whole core card in the system prompt
+
+    @staticmethod
+    def fame(card):
+        return str(((card or {}).get("data") or {}).get("fame") or "").strip().lower()
+
+    def frozen_full(self, c):
+        """Names whose core card is in the system prompt: all of a small cast, the best known of a large one."""
+        chars = c["cards"]["character"]
+        if len(chars) <= self.SLIM_AT:
+            return {ch["name"] for ch in chars}
+        return {ch["name"] for ch in chars if self.fame(ch) in TOP_FAME}
+
+    def roster_line(self, ch):
+        d = ch["data"]
+        aka = ", ".join(str(x) for x in (d.get("aliases") or []))
+        first = (TXT.sentences(str(d.get("description") or "")) or [""])[0][:160]
+        bits = [str(x) for x in (d.get("role"), f"pamor {self.fame(ch) or 'biasa'}", d.get("fame_for") or first) if x]
+        return f"- {ch['name']}{f' ({aka})' if aka else ''}: " + " · ".join(bits)
+
+    def common_knowledge(self, cards):
+        """The best known people: everyone knows their name, role and reputation, met or not."""
+        lines = []
+        for ch in cards["character"]:
+            if self.fame(ch) in TOP_FAME:
+                d = ch["data"]
+                lines.append(f"- {ch['name']} ({self.fame(ch)}): " + " · ".join(str(x) for x in (d.get("role"), d.get("fame_for")) if x))
+        p = cards.get("persona")
+        if p and self.fame(p) in TOP_FAME:
+            lines.append(f"- {p['name']} (tokoh pemain, {self.fame(p)}): "
+                         + " · ".join(str(x) for x in (p["data"].get("role"), p["data"].get("fame_for")) if x))
+        if not lines:
+            return ""
+        return ("## Dikenal umum\nNama, peran, dan reputasi orang-orang ini diketahui semua orang di lingkungan cerita, termasuk "
+                "tokoh pemain, walau belum pernah berkenalan. Detail pribadi dan rahasia mereka tidak.\n" + "\n".join(lines))
+
     VOLATILE = {"mood": 2, "plan_now": 6}  # world hours after which a recorded value may be out of date
 
     def status_json(self, fields, seen, now):
@@ -363,6 +408,11 @@ class Prompt:
                          + " (pakai world_advance sesuai perjalanan)")
         present = self.present_characters(c, recent, where)
         before = self._present_before(path)
+        frozen_full = self.frozen_full(c)
+        pcard = c["cards"].get("persona") or {}
+        pname = pcard.get("name") or ""
+        pnames = [pname, pname.split()[0]] if pname.strip() else []
+        who = pname or "pemain"
         for ch in present:
             bits = []
             cur = dict(where.get(ch["name"]) or {})
@@ -383,6 +433,15 @@ class Prompt:
                 known = self.world.world_events(chat_id, ids, who=ch["name"], limit=3)
                 if known:
                     bits.append("baru tahu: " + "; ".join(e["text"][:200] for e in known))
+            if ch["name"] not in frozen_full:  # a large cast: this one's core card is not in the system prompt
+                core = self.cards.render(ch, limit=3000)
+                if core:
+                    bits.append(core)
+            if not KNOW.acquainted(chat_id, ch["name"], pnames):
+                used.setdefault("unmet", []).append(ch["name"])
+                bits.append(f"belum tercatat kenal {who}: kalau menurut kartu atau cerita mereka memang sudah saling kenal, "
+                            f"abaikan; kalau belum, ia tidak tahu nama {who} kecuali diperkenalkan atau mendengarnya di adegan"
+                            + (f"; ia tahu siapa {who} karena {who} dikenal umum." if self.fame(pcard) in TOP_FAME else "."))
             # the whole card detail when the character enters the scene; while they stay, what steers reactions
             if ch["name"] in before:
                 detail = self.cards.render(ch, mode="detail", keys=["fears", "relations", "knowledge"], limit=900)

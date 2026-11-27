@@ -1,3 +1,12 @@
+FAME_SUGGEST = """Tentukan pamor tiap tokoh di bawah di lingkungan ceritanya (misalnya kampus): seberapa dikenal orang banyak.
+Tingkat: "bintang" (semua orang kenal; paling banyak 5 orang dari {n} tokoh cerita ini), "terkenal" (dikenal luas; paling
+banyak 10), "dikenal di lingkungannya" (dikenal di kelas, jurusan, atau kelompoknya), "biasa".
+Dasarkan pada peran, jabatan, prestasi, penampilan, dan sifat di kartu; jangan mengarang hal yang tidak ada di kartu.
+Jawab HANYA JSON: {{"items": [{{"name": "nama persis seperti di kartu", "fame": "bintang|terkenal|dikenal di lingkungannya|biasa",
+"fame_for": "dikenal karena apa, maksimal 12 kata", "reason": "alasan singkat"}}]}}
+
+{cards}"""
+
 CHOICES_INSTRUCTION = """Buat pilihan aksi untuk pemain berdasarkan situasi di akhir jawaban terakhir. Jawab HANYA JSON:
 {{"problems": [{{"question": "...", "options": ["...", "..."]}}]}}
 Aturan: {np} masalah, tiap masalah {no} pilihan. Setiap pertanyaan {ns} kalimat panjang yang menjelaskan situasi dan
@@ -748,7 +757,7 @@ class Engine(EngineView):
                                "tools": [], "chat_id": chat_id})
             try:
                 m["meta"]["state_check"] = self._state_check(chat_id, mid, c, self.store.path(chat_id, head=mid), full,
-                                                             auto_time=not used.get("no_time"))
+                                                             auto_time=not used.get("no_time"), unmet=used.get("unmet"))
             finally:
                 self.emit("live", {})
         # quality checks over the whole turn
@@ -859,7 +868,7 @@ class Engine(EngineView):
         finally:
             self._rewriting = False
 
-    def _state_check(self, chat_id, mid, c, path, full, auto_time=True):
+    def _state_check(self, chat_id, mid, c, path, full, auto_time=True, unmet=None):
         """Side task after a turn: record what the narration shows but no tool recorded. If time still did not move
         (and the turn is not a time skip), it moves by an estimate from the length of the scene."""
         ids = [x["id"] for x in path]
@@ -884,8 +893,13 @@ class Engine(EngineView):
         threads = THREADS.list(chat_id, now=st["time"])
         if threads:
             now.append("Benang terbuka:\n" + "\n".join(THREADS.line(r) for r in threads[:12]))
-        msgs = self.prompt.side(chat_id, STATE_CHECK.format(done="\n".join(done_lines) or "- (belum ada)", now="\n".join(now)),
-                                path=path)
+        instr = STATE_CHECK.format(done="\n".join(done_lines) or "- (belum ada)", now="\n".join(now))
+        if unmet:
+            instr += (f"\nPertemuan pertama dengan pemain mungkin terjadi di giliran ini: {', '.join(unmet)}. Untuk tiap tokoh yang "
+                      "benar-benar bertemu atau berinteraksi dengan pemain di narasi, catat knowledge_add kind 'kenalan' (who: tokoh "
+                      "itu): apakah ia tahu nama pemain, kesan pertamanya, dan bagaimana mereka bertemu (atau 'sudah kenal "
+                      "sebelumnya' kalau memang begitu). Catat relationship kalau ada perasaan awal.")
+        msgs = self.prompt.side(chat_id, instr, path=path)
         recorded = []
         for _ in range(3):
             acc = self.llm.chat(msgs, tools=tools, kwargs=kw, sampling={"temperature": 0.3},
@@ -1438,6 +1452,43 @@ class Engine(EngineView):
         self._offscreen_done(chat_id, t0 + timedelta(minutes=minutes))
         self._turn(chat_id)  # the time skip note comes from the user message (a reroll gets it too)
 
+    def suggest_fame(self, chat_id, stop=None):
+        """Pamor suggestions for the story's characters (latest card versions), ten cards per request. Rows for the UI
+        table; nothing is saved here."""
+        stop = stop or self.stop
+        c = self.prompt.ctx(chat_id)
+        sid = (c["story"] or {}).get("id")
+        chars = self.prompt.stories.cards_of(sid, latest=True)["character"] if sid else []
+        kw = self.prompt.side_kwargs(c)
+        rows = []
+        try:
+            for i in range(0, len(chars), 10):
+                if stop.is_set():
+                    break
+                part = chars[i:i + 10]
+                self.emit("status", f"Menyusun usulan pamor {min(i + 10, len(chars))}/{len(chars)}…")
+                text = "\n\n".join(self.prompt.cards.render(ch, mode="all", limit=900) for ch in part)
+                msgs = [{"role": "system", "content": "Kamu membantu menyusun cerita. Jawab hanya JSON."},
+                        {"role": "user", "content": FAME_SUGGEST.format(n=len(chars), cards=text)}]
+                try:
+                    acc = self.llm.complete(msgs, kwargs=kw, sampling={"temperature": 0.3},
+                                            max_tokens=3000 + self.prompt.think_budget(c, kw), stop=stop)
+                    items = (self._json(acc["content"]) or {}).get("items") or []
+                except Exception:
+                    items = []
+                got = {str(x.get("name", "")).strip().lower(): x for x in items if isinstance(x, dict)}
+                for ch in part:
+                    x = got.get(ch["name"].strip().lower()) or {}
+                    fame = str(x.get("fame") or "").strip().lower()
+                    now = self.prompt.fame(ch)
+                    rows.append({"card_id": ch["id"], "name": ch["name"], "current": now,
+                                 "fame": fame if fame in FAME_LEVELS else now,
+                                 "fame_for": str(x.get("fame_for") or ch["data"].get("fame_for") or "")[:200],
+                                 "reason": str(x.get("reason") or "")[:300]})
+        finally:
+            self.emit("status", "")
+        return rows
+
     OFFSCREEN_HOURS = 4
 
     def _offscreen_span(self, chat_id, c=None):
@@ -1491,6 +1542,10 @@ class Engine(EngineView):
         t1 = t0 + timedelta(minutes=minutes)
         instr = TICK_INSTRUCTION.format(span=World.fmt_span(minutes), t0=World.fmt_time(t0), t1=World.fmt_time(t1), why=why)
         instr += "\nPakai hanya world_event, status_update, tell, knowledge_add, roll, thread_open, dan thread_close."
+        top = [ch["name"] for ch in c["cards"]["character"] if self.prompt.fame(ch) in TOP_FAME]
+        if top:
+            instr += ("\nTokoh paling dikenal: " + ", ".join(top[:15]) + ". Agenda mereka didahulukan, dan mereka sering jadi "
+                      "bahan obrolan atau gosip tokoh lain (tell).")
         due = [r for r in THREADS.list(chat_id, now=t1) if r["overdue"]]
         if due:
             instr += ("\nBenang cerita yang lewat tenggat selama itu (tentukan akibatnya dengan world_event; thread_close kalau "

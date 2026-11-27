@@ -659,6 +659,22 @@ dicatat di bawah sebagai usulan.
 - [x] Cache: pemeriksa keadaan, world tick, dan flush compaction mengirim daftar tool lengkap chat (yang boleh dipakai
       dibatasi di sisi engine), jadi prefix prompt sama dengan giliran dan riwayat tidak diproses ulang.
 
+### Pamor dan momen kenalan (selesai, belum dites di GPU)
+
+- [x] Field Pamor (bintang / terkenal / dikenal di lingkungannya / biasa) dan "Dikenal karena" di kartu Tokoh dan Persona.
+- [x] Pemeran besar (lebih dari 12 tokoh): hanya bintang dan terkenal yang kartu intinya di system prompt; sisanya satu
+      baris di "Tokoh lain", dan kartu intinya ikut catatan sistem saat tokoh itu muncul atau disebut.
+- [x] "Dikenal umum": nama, peran, dan reputasi tokoh bintang/terkenal (dan tokoh pemain kalau ia terkenal) diketahui
+      semua orang walau belum kenalan; detail pribadi dan rahasia tidak.
+- [x] Momen kenalan: tokoh di adegan yang belum punya ingatan "kenalan" atau ingatan yang menyebut nama pemain diberi
+      tanda "belum tercatat kenal" (tidak tahu nama pemain kecuali diperkenalkan; kartu/cerita yang menyatakan sudah
+      kenal tetap berlaku). Pemeriksa keadaan mencatat pertemuan pertama (kind "kenalan": tahu nama atau belum, kesan
+      pertama, cara bertemu) dan relasi awal. Per chat dan per cabang.
+- [x] Usulkan pamor: model membaca kartu tokoh cerita per 10 kartu dan mengusulkan pamor + "dikenal karena"; tabel bisa
+      diubah lalu Simpan semua (versi kartu baru, bisa dipulihkan). Batas saran bintang 5, terkenal 10 (ditandai kalau lewat).
+- [x] Tab Cerita: "Top tokoh (pamor)" dan "Atur semua". World tick mendahulukan agenda tokoh paling dikenal dan
+      menjadikan mereka bahan gosip.
+
 ---
 
 ## 9. Tes

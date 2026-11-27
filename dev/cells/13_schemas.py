@@ -2,14 +2,22 @@ def _f(key, label, section, type_="text", core=True, visibility="model", **extra
     return {"key": key, "label": label, "section": section, "type": type_, "core": core, "visibility": visibility, **extra}
 
 
+# How well known a character is in the story's surroundings (a campus, a village). The top two are common knowledge.
+FAME_LEVELS = ["bintang", "terkenal", "dikenal di lingkungannya", "biasa"]
+TOP_FAME = ("bintang", "terkenal")
+
 # Default schemas. They are data: stored in card_schemas, editable in the schema editor, exported with cards.
 # Nothing here is tied to a genre; examples in `help` are only hints.
 DEFAULT_SCHEMAS = {
-    "character": {"type": "character", "label": "Tokoh", "version": 2, "fields": [
+    "character": {"type": "character", "label": "Tokoh", "version": 3, "fields": [
         _f("name", "Nama", "Identitas"),
         _f("aliases", "Nama lain / panggilan", "Identitas", "tags"),
         _f("age", "Umur", "Identitas"),
         _f("role", "Peran dalam cerita", "Identitas"),
+        _f("fame", "Pamor", "Identitas", "select", core=False, options=FAME_LEVELS,
+           help="Seberapa dikenal di lingkungan cerita (misalnya kampus). Bintang dan terkenal: dikenal semua orang, lebih aktif "
+                "di dunia, dan kartunya selalu ada di prompt kalau tokoh lebih dari 12"),
+        _f("fame_for", "Dikenal karena", "Identitas", core=False),
         _f("appearance", "Penampilan", "Identitas", "longtext"),
         _f("description", "Deskripsi umum", "Identitas", "longtext"),
         _f("traits", "Sifat", "Kepribadian", "table", columns=["sifat", "kekuatan 1-5"]),
@@ -37,10 +45,13 @@ DEFAULT_SCHEMAS = {
         _f("tags", "Tag", "Lainnya", "tags", visibility="ui"),
         _f("notes", "Catatan untukmu", "Lainnya", "longtext", visibility="ui"),
     ]},
-    "persona": {"type": "persona", "label": "Persona", "version": 2, "fields": [
+    "persona": {"type": "persona", "label": "Persona", "version": 3, "fields": [
         _f("name", "Nama", "Identitas"),
         _f("age", "Umur", "Identitas"),
         _f("role", "Peran", "Identitas"),
+        _f("fame", "Pamor", "Identitas", "select", core=False, options=FAME_LEVELS,
+           help="Bintang atau terkenal: orang lain tahu siapa tokohmu walau belum berkenalan"),
+        _f("fame_for", "Dikenal karena", "Identitas", core=False),
         _f("appearance", "Penampilan", "Identitas", "longtext"),
         _f("background", "Latar belakang", "Identitas", "longtext"),
         _f("personality", "Kepribadian", "Identitas", "longtext"),

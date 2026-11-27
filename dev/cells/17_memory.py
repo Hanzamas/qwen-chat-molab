@@ -530,7 +530,7 @@ class Knowledge:
     """What each character knows or believes in one chat (and the chats it continues), on the active branch.
     The story book is the truth only the narrator sees; this is what is in each head, and it can be wrong."""
 
-    KINDS = ("fakta", "rahasia", "pendapat", "perasaan", "janji", "salah paham")
+    KINDS = ("fakta", "rahasia", "pendapat", "perasaan", "janji", "salah paham", "kenalan")
     SOURCES = ("lihat sendiri", "diberi tahu", "gosip", "menduga")
     TRUTH = ("benar", "keliru", "belum pasti")
 
@@ -597,6 +597,14 @@ class Knowledge:
             EMB.enqueue("know", kid, text)
             out.append(kid)
         return out
+
+    def acquainted(self, chat_id, holder, player_names=()):
+        """The holder has met the player on this branch: a 'kenalan' entry, or anything they know that names the player."""
+        pats = [re.compile(r"(?<!\w)" + re.escape(n.lower()) + r"(?!\w)") for n in player_names if n]
+        for r in self._rows(chat_id, "AND holder = ?", (holder,)):
+            if r["kind"] == "kenalan" or any(p.search((r["text"] or "").lower()) for p in pats):
+                return True
+        return False
 
     def holders(self, chat_id):
         return sorted({r["holder"] for r in self._rows(chat_id)})

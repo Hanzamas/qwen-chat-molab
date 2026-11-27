@@ -2077,14 +2077,22 @@ def _():
         return {"key": key, "label": label, "section": section, "type": type_, "core": core, "visibility": visibility, **extra}
 
 
+    # How well known a character is in the story's surroundings (a campus, a village). The top two are common knowledge.
+    FAME_LEVELS = ["bintang", "terkenal", "dikenal di lingkungannya", "biasa"]
+    TOP_FAME = ("bintang", "terkenal")
+
     # Default schemas. They are data: stored in card_schemas, editable in the schema editor, exported with cards.
     # Nothing here is tied to a genre; examples in `help` are only hints.
     DEFAULT_SCHEMAS = {
-        "character": {"type": "character", "label": "Tokoh", "version": 2, "fields": [
+        "character": {"type": "character", "label": "Tokoh", "version": 3, "fields": [
             _f("name", "Nama", "Identitas"),
             _f("aliases", "Nama lain / panggilan", "Identitas", "tags"),
             _f("age", "Umur", "Identitas"),
             _f("role", "Peran dalam cerita", "Identitas"),
+            _f("fame", "Pamor", "Identitas", "select", core=False, options=FAME_LEVELS,
+               help="Seberapa dikenal di lingkungan cerita (misalnya kampus). Bintang dan terkenal: dikenal semua orang, lebih aktif "
+                    "di dunia, dan kartunya selalu ada di prompt kalau tokoh lebih dari 12"),
+            _f("fame_for", "Dikenal karena", "Identitas", core=False),
             _f("appearance", "Penampilan", "Identitas", "longtext"),
             _f("description", "Deskripsi umum", "Identitas", "longtext"),
             _f("traits", "Sifat", "Kepribadian", "table", columns=["sifat", "kekuatan 1-5"]),
@@ -2112,10 +2120,13 @@ def _():
             _f("tags", "Tag", "Lainnya", "tags", visibility="ui"),
             _f("notes", "Catatan untukmu", "Lainnya", "longtext", visibility="ui"),
         ]},
-        "persona": {"type": "persona", "label": "Persona", "version": 2, "fields": [
+        "persona": {"type": "persona", "label": "Persona", "version": 3, "fields": [
             _f("name", "Nama", "Identitas"),
             _f("age", "Umur", "Identitas"),
             _f("role", "Peran", "Identitas"),
+            _f("fame", "Pamor", "Identitas", "select", core=False, options=FAME_LEVELS,
+               help="Bintang atau terkenal: orang lain tahu siapa tokohmu walau belum berkenalan"),
+            _f("fame_for", "Dikenal karena", "Identitas", core=False),
             _f("appearance", "Penampilan", "Identitas", "longtext"),
             _f("background", "Latar belakang", "Identitas", "longtext"),
             _f("personality", "Kepribadian", "Identitas", "longtext"),
@@ -2254,7 +2265,13 @@ def _():
             "time_skips": ["2 jam", "3 jam", "1 hari", "1 minggu", "1 bulan"], "afk_scale": "0", "tick_minutes": "20", "offscreen_hours": "4",
         }),
     ]
-    return DEFAULTS_CHANGED, DEFAULT_CARDS, DEFAULT_SCHEMAS
+    return (
+        DEFAULTS_CHANGED,
+        DEFAULT_CARDS,
+        DEFAULT_SCHEMAS,
+        FAME_LEVELS,
+        TOP_FAME,
+    )
 
 
 @app.cell(hide_code=True)
@@ -3968,7 +3985,7 @@ def _(
         """What each character knows or believes in one chat (and the chats it continues), on the active branch.
         The story book is the truth only the narrator sees; this is what is in each head, and it can be wrong."""
 
-        KINDS = ("fakta", "rahasia", "pendapat", "perasaan", "janji", "salah paham")
+        KINDS = ("fakta", "rahasia", "pendapat", "perasaan", "janji", "salah paham", "kenalan")
         SOURCES = ("lihat sendiri", "diberi tahu", "gosip", "menduga")
         TRUTH = ("benar", "keliru", "belum pasti")
 
@@ -4035,6 +4052,14 @@ def _(
                 EMB.enqueue("know", kid, text)
                 out.append(kid)
             return out
+
+        def acquainted(self, chat_id, holder, player_names=()):
+            """The holder has met the player on this branch: a 'kenalan' entry, or anything they know that names the player."""
+            pats = [re.compile(r"(?<!\w)" + re.escape(n.lower()) + r"(?!\w)") for n in player_names if n]
+            for r in self._rows(chat_id, "AND holder = ?", (holder,)):
+                if r["kind"] == "kenalan" or any(p.search((r["text"] or "").lower()) for p in pats):
+                    return True
+            return False
 
         def holders(self, chat_id):
             return sorted({r["holder"] for r in self._rows(chat_id)})
@@ -4573,6 +4598,7 @@ def _(
     STUDIO_EPHEMERAL,
     STUDIO_SYSTEM,
     THREADS,
+    TOP_FAME,
     TXT,
     WORLD,
     base64,
@@ -4626,7 +4652,8 @@ def _(
 
     # Who records what characters learn, feelings and threads: the narrator itself, or the checker after the turn.
     RECORD_MARK = "dicatat pemeriksa setelah giliran"
-    RECORD_SELF = """- Catat yang baru diketahui tokoh dengan knowledge_add atau tell.
+    RECORD_SELF = """- Catat yang baru diketahui tokoh dengan knowledge_add atau tell. Saat tokoh pertama kali bertemu pemain, catat
+      knowledge_add kind 'kenalan': tahu nama pemain atau belum, kesan pertama, cara bertemu.
     - Hubungan: kalau kejadian mengubah perasaan tokoh terhadap tokoh lain atau pemain, catat dengan relationship.
     - Benang cerita: catat janji, janji temu (dengan tenggat), misteri, petunjuk, utang, dendam, dan rencana dengan thread_open;
       tutup dengan thread_close."""
@@ -4733,7 +4760,15 @@ def _(
                                             record_rule=RECORD_CHECKER if checker else RECORD_SELF))
                 cards = c["cards"]
                 card_parts = [self.cards.render(cards[r]) for r in ("style", "gm", "persona", "world", "scenario") if cards.get(r)]
-                card_parts += [self.cards.render(ch) for ch in cards["character"]]
+                full = self.frozen_full(c)
+                card_parts += [self.cards.render(ch) for ch in cards["character"] if ch["name"] in full]
+                rest = [ch for ch in cards["character"] if ch["name"] not in full]
+                if rest:
+                    card_parts.append("## Tokoh lain (kartu lengkapnya masuk catatan sistem saat mereka muncul atau disebut; "
+                                      "card_read untuk membacanya)\n" + "\n".join(self.roster_line(ch) for ch in rest))
+                known = self.common_knowledge(cards)
+                if known:
+                    card_parts.append(known)
                 lore = self.mem.lore_core(c["mem"]["card_ids"])
                 if lore:
                     card_parts.append("## Lore inti\n" + "\n".join(f"- {e['title']}: {e['text'][:800]}" for e in lore))
@@ -4865,6 +4900,42 @@ def _(
                 lo, hi = 3, 6
             return {"paragraphs": n, "sent_lo": lo, "sent_hi": hi}
 
+        SLIM_AT = 12  # more characters than this: only the best known keep their whole core card in the system prompt
+
+        @staticmethod
+        def fame(card):
+            return str(((card or {}).get("data") or {}).get("fame") or "").strip().lower()
+
+        def frozen_full(self, c):
+            """Names whose core card is in the system prompt: all of a small cast, the best known of a large one."""
+            chars = c["cards"]["character"]
+            if len(chars) <= self.SLIM_AT:
+                return {ch["name"] for ch in chars}
+            return {ch["name"] for ch in chars if self.fame(ch) in TOP_FAME}
+
+        def roster_line(self, ch):
+            d = ch["data"]
+            aka = ", ".join(str(x) for x in (d.get("aliases") or []))
+            first = (TXT.sentences(str(d.get("description") or "")) or [""])[0][:160]
+            bits = [str(x) for x in (d.get("role"), f"pamor {self.fame(ch) or 'biasa'}", d.get("fame_for") or first) if x]
+            return f"- {ch['name']}{f' ({aka})' if aka else ''}: " + " · ".join(bits)
+
+        def common_knowledge(self, cards):
+            """The best known people: everyone knows their name, role and reputation, met or not."""
+            lines = []
+            for ch in cards["character"]:
+                if self.fame(ch) in TOP_FAME:
+                    d = ch["data"]
+                    lines.append(f"- {ch['name']} ({self.fame(ch)}): " + " · ".join(str(x) for x in (d.get("role"), d.get("fame_for")) if x))
+            p = cards.get("persona")
+            if p and self.fame(p) in TOP_FAME:
+                lines.append(f"- {p['name']} (tokoh pemain, {self.fame(p)}): "
+                             + " · ".join(str(x) for x in (p["data"].get("role"), p["data"].get("fame_for")) if x))
+            if not lines:
+                return ""
+            return ("## Dikenal umum\nNama, peran, dan reputasi orang-orang ini diketahui semua orang di lingkungan cerita, termasuk "
+                    "tokoh pemain, walau belum pernah berkenalan. Detail pribadi dan rahasia mereka tidak.\n" + "\n".join(lines))
+
         VOLATILE = {"mood": 2, "plan_now": 6}  # world hours after which a recorded value may be out of date
 
         def status_json(self, fields, seen, now):
@@ -4948,6 +5019,11 @@ def _(
                              + " (pakai world_advance sesuai perjalanan)")
             present = self.present_characters(c, recent, where)
             before = self._present_before(path)
+            frozen_full = self.frozen_full(c)
+            pcard = c["cards"].get("persona") or {}
+            pname = pcard.get("name") or ""
+            pnames = [pname, pname.split()[0]] if pname.strip() else []
+            who = pname or "pemain"
             for ch in present:
                 bits = []
                 cur = dict(where.get(ch["name"]) or {})
@@ -4968,6 +5044,15 @@ def _(
                     known = self.world.world_events(chat_id, ids, who=ch["name"], limit=3)
                     if known:
                         bits.append("baru tahu: " + "; ".join(e["text"][:200] for e in known))
+                if ch["name"] not in frozen_full:  # a large cast: this one's core card is not in the system prompt
+                    core = self.cards.render(ch, limit=3000)
+                    if core:
+                        bits.append(core)
+                if not KNOW.acquainted(chat_id, ch["name"], pnames):
+                    used.setdefault("unmet", []).append(ch["name"])
+                    bits.append(f"belum tercatat kenal {who}: kalau menurut kartu atau cerita mereka memang sudah saling kenal, "
+                                f"abaikan; kalau belum, ia tidak tahu nama {who} kecuali diperkenalkan atau mendengarnya di adegan"
+                                + (f"; ia tahu siapa {who} karena {who} dikenal umum." if self.fame(pcard) in TOP_FAME else "."))
                 # the whole card detail when the character enters the scene; while they stay, what steers reactions
                 if ch["name"] in before:
                     detail = self.cards.render(ch, mode="detail", keys=["fears", "relations", "knowledge"], limit=900)
@@ -6407,6 +6492,7 @@ def _(
     Compactor,
     EMB,
     EngineView,
+    FAME_LEVELS,
     Files,
     KNOW,
     LLM_CLIENT,
@@ -6420,6 +6506,7 @@ def _(
     THREADS,
     TOOLS,
     TOOL_CARD_EDIT,
+    TOP_FAME,
     TXT,
     WEB,
     WORLD,
@@ -6435,6 +6522,15 @@ def _(
     timedelta,
     urllib,
 ):
+    FAME_SUGGEST = """Tentukan pamor tiap tokoh di bawah di lingkungan ceritanya (misalnya kampus): seberapa dikenal orang banyak.
+    Tingkat: "bintang" (semua orang kenal; paling banyak 5 orang dari {n} tokoh cerita ini), "terkenal" (dikenal luas; paling
+    banyak 10), "dikenal di lingkungannya" (dikenal di kelas, jurusan, atau kelompoknya), "biasa".
+    Dasarkan pada peran, jabatan, prestasi, penampilan, dan sifat di kartu; jangan mengarang hal yang tidak ada di kartu.
+    Jawab HANYA JSON: {{"items": [{{"name": "nama persis seperti di kartu", "fame": "bintang|terkenal|dikenal di lingkungannya|biasa",
+    "fame_for": "dikenal karena apa, maksimal 12 kata", "reason": "alasan singkat"}}]}}
+
+    {cards}"""
+
     CHOICES_INSTRUCTION = """Buat pilihan aksi untuk pemain berdasarkan situasi di akhir jawaban terakhir. Jawab HANYA JSON:
     {{"problems": [{{"question": "...", "options": ["...", "..."]}}]}}
     Aturan: {np} masalah, tiap masalah {no} pilihan. Setiap pertanyaan {ns} kalimat panjang yang menjelaskan situasi dan
@@ -7185,7 +7281,7 @@ def _(
                                    "tools": [], "chat_id": chat_id})
                 try:
                     m["meta"]["state_check"] = self._state_check(chat_id, mid, c, self.store.path(chat_id, head=mid), full,
-                                                                 auto_time=not used.get("no_time"))
+                                                                 auto_time=not used.get("no_time"), unmet=used.get("unmet"))
                 finally:
                     self.emit("live", {})
             # quality checks over the whole turn
@@ -7296,7 +7392,7 @@ def _(
             finally:
                 self._rewriting = False
 
-        def _state_check(self, chat_id, mid, c, path, full, auto_time=True):
+        def _state_check(self, chat_id, mid, c, path, full, auto_time=True, unmet=None):
             """Side task after a turn: record what the narration shows but no tool recorded. If time still did not move
             (and the turn is not a time skip), it moves by an estimate from the length of the scene."""
             ids = [x["id"] for x in path]
@@ -7321,8 +7417,13 @@ def _(
             threads = THREADS.list(chat_id, now=st["time"])
             if threads:
                 now.append("Benang terbuka:\n" + "\n".join(THREADS.line(r) for r in threads[:12]))
-            msgs = self.prompt.side(chat_id, STATE_CHECK.format(done="\n".join(done_lines) or "- (belum ada)", now="\n".join(now)),
-                                    path=path)
+            instr = STATE_CHECK.format(done="\n".join(done_lines) or "- (belum ada)", now="\n".join(now))
+            if unmet:
+                instr += (f"\nPertemuan pertama dengan pemain mungkin terjadi di giliran ini: {', '.join(unmet)}. Untuk tiap tokoh yang "
+                          "benar-benar bertemu atau berinteraksi dengan pemain di narasi, catat knowledge_add kind 'kenalan' (who: tokoh "
+                          "itu): apakah ia tahu nama pemain, kesan pertamanya, dan bagaimana mereka bertemu (atau 'sudah kenal "
+                          "sebelumnya' kalau memang begitu). Catat relationship kalau ada perasaan awal.")
+            msgs = self.prompt.side(chat_id, instr, path=path)
             recorded = []
             for _ in range(3):
                 acc = self.llm.chat(msgs, tools=tools, kwargs=kw, sampling={"temperature": 0.3},
@@ -7875,6 +7976,43 @@ def _(
             self._offscreen_done(chat_id, t0 + timedelta(minutes=minutes))
             self._turn(chat_id)  # the time skip note comes from the user message (a reroll gets it too)
 
+        def suggest_fame(self, chat_id, stop=None):
+            """Pamor suggestions for the story's characters (latest card versions), ten cards per request. Rows for the UI
+            table; nothing is saved here."""
+            stop = stop or self.stop
+            c = self.prompt.ctx(chat_id)
+            sid = (c["story"] or {}).get("id")
+            chars = self.prompt.stories.cards_of(sid, latest=True)["character"] if sid else []
+            kw = self.prompt.side_kwargs(c)
+            rows = []
+            try:
+                for i in range(0, len(chars), 10):
+                    if stop.is_set():
+                        break
+                    part = chars[i:i + 10]
+                    self.emit("status", f"Menyusun usulan pamor {min(i + 10, len(chars))}/{len(chars)}…")
+                    text = "\n\n".join(self.prompt.cards.render(ch, mode="all", limit=900) for ch in part)
+                    msgs = [{"role": "system", "content": "Kamu membantu menyusun cerita. Jawab hanya JSON."},
+                            {"role": "user", "content": FAME_SUGGEST.format(n=len(chars), cards=text)}]
+                    try:
+                        acc = self.llm.complete(msgs, kwargs=kw, sampling={"temperature": 0.3},
+                                                max_tokens=3000 + self.prompt.think_budget(c, kw), stop=stop)
+                        items = (self._json(acc["content"]) or {}).get("items") or []
+                    except Exception:
+                        items = []
+                    got = {str(x.get("name", "")).strip().lower(): x for x in items if isinstance(x, dict)}
+                    for ch in part:
+                        x = got.get(ch["name"].strip().lower()) or {}
+                        fame = str(x.get("fame") or "").strip().lower()
+                        now = self.prompt.fame(ch)
+                        rows.append({"card_id": ch["id"], "name": ch["name"], "current": now,
+                                     "fame": fame if fame in FAME_LEVELS else now,
+                                     "fame_for": str(x.get("fame_for") or ch["data"].get("fame_for") or "")[:200],
+                                     "reason": str(x.get("reason") or "")[:300]})
+            finally:
+                self.emit("status", "")
+            return rows
+
         OFFSCREEN_HOURS = 4
 
         def _offscreen_span(self, chat_id, c=None):
@@ -7928,6 +8066,10 @@ def _(
             t1 = t0 + timedelta(minutes=minutes)
             instr = TICK_INSTRUCTION.format(span=World.fmt_span(minutes), t0=World.fmt_time(t0), t1=World.fmt_time(t1), why=why)
             instr += "\nPakai hanya world_event, status_update, tell, knowledge_add, roll, thread_open, dan thread_close."
+            top = [ch["name"] for ch in c["cards"]["character"] if self.prompt.fame(ch) in TOP_FAME]
+            if top:
+                instr += ("\nTokoh paling dikenal: " + ", ".join(top[:15]) + ". Agenda mereka didahulukan, dan mereka sering jadi "
+                          "bahan obrolan atau gosip tokoh lain (tell).")
             due = [r for r in THREADS.list(chat_id, now=t1) if r["overdue"]]
             if due:
                 instr += ("\nBenang cerita yang lewat tenggat selama itu (tentukan akibatnya dengan world_event; thread_close kalau "
@@ -9092,7 +9234,7 @@ def _():
         const k = state.know;
         if (!k) { send("knowledge", { holder: "" }); return '<div class="qr-muted">Memuat…</div>'; }
         const label = (h) => h === "player" ? `Tokohmu${k.persona ? ` (${k.persona})` : ""}` : h;
-        const kinds = ["fakta", "rahasia", "pendapat", "perasaan", "janji", "salah paham"];
+        const kinds = ["fakta", "rahasia", "pendapat", "perasaan", "janji", "salah paham", "kenalan"];
         return `<select class="qr-know-holder">${k.holders.map((h) => `<option value="${esc(h)}" ${h === k.holder ? "selected" : ""}>${esc(label(h))}</option>`).join("")}</select>
           ${k.rows.map((r) => `<div class="qr-memrow" data-kid="${r.id}"><span class="qr-badge">${esc(r.kind)}</span>${r.truth !== "benar" ? `<span class="qr-badge warn">${esc(r.truth)}</span>` : ""}
             <span><input class="qr-know-text" value="${esc(r.text)}"><span class="qr-muted">${esc(r.source)}${r.source_who ? ` dari ${esc(r.source_who)}` : ""}${r.world_time ? ` · ${esc(r.world_time)}` : ""}</span></span>
@@ -9104,6 +9246,36 @@ def _():
               <button class="qr-btn qr-sm" data-act="know-restore">${icon("refresh")}Pulihkan</button></div>`).join("")}</details>` : ""}
           <div class="qr-row"><input class="qr-know-new" placeholder="Tambah yang ia tahu atau yakini"><select class="qr-know-kind">${kinds.map((x) => `<option>${x}</option>`).join("")}</select>
             <button class="qr-btn qr-sm" data-act="know-add">${icon("plus")}Tambah</button></div>`;
+      }
+      // ---------- pamor ----------
+      const FAME_LEVELS = ["bintang", "terkenal", "dikenal di lingkungannya", "biasa"], TOP_FAME = ["bintang", "terkenal"];
+      function topHTML(st) {
+        const people = (st.cards || []).filter((x) => x.role === "character" || x.role === "persona");
+        if (!people.some((x) => x.role === "character")) return "";
+        const rank = (f) => { const i = FAME_LEVELS.indexOf(f); return i < 0 ? FAME_LEVELS.length : i; };
+        const top = people.filter((x) => TOP_FAME.includes(x.fame)).sort((a, b) => rank(a.fame) - rank(b.fame) || a.name.localeCompare(b.name));
+        const n = (f) => people.filter((x) => x.role === "character" && x.fame === f).length;
+        return `<section><h4>Top tokoh (pamor)</h4><div class="qr-help">Bintang dan terkenal dikenal semua orang walau belum kenalan, lebih aktif di dunia, dan kartunya selalu ada di prompt kalau tokoh lebih dari 12. Perubahan masuk prompt setelah Terapkan sekarang atau compaction.</div>
+          ${top.map((x) => `<div class="qr-linkrow"><span class="qr-badge">${esc(x.fame)}</span><b>${esc(x.name)}</b>${x.role === "persona" ? '<span class="qr-muted">(tokohmu)</span>' : ""}<span class="qr-muted">${esc(x.fame_for || "")}</span></div>`).join("") || '<div class="qr-muted">Belum ada yang berpamor bintang atau terkenal.</div>'}
+          <div class="qr-muted">bintang ${n("bintang")}/5 · terkenal ${n("terkenal")}/10</div>
+          <div class="qr-row"><button class="qr-btn qr-sm" data-act="fame-suggest">${icon("sparkles")}Usulkan pamor</button><button class="qr-btn qr-sm" data-act="fame-table">Atur semua</button></div></section>`;
+      }
+      // The table for every character (and the player's own card): suggestions arrive here too; nothing is saved until Simpan.
+      function fameModal(rows, suggested) {
+        openModal(suggested ? "Usulan pamor" : "Atur pamor", `<div class="qr-help">${suggested ? "Usulan model dari isi kartu. Ubah yang tidak cocok, lalu Simpan semua. " : ""}Batas yang disarankan: bintang 5, terkenal 10.</div>
+          <div class="qr-fame-count qr-muted"></div>
+          ${rows.map((r) => `<div class="qr-fame-row" data-card="${Number(r.card_id)}" ${r.persona ? "data-persona" : ""}><b>${esc(r.name)}</b>${r.persona ? '<span class="qr-muted">(tokohmu)</span>' : ""}${suggested && (r.current || "") !== (r.fame || "") ? `<span class="qr-muted">sekarang: ${esc(r.current || "-")}</span>` : ""}
+            <select class="fm-fame"><option value=""></option>${FAME_LEVELS.map((f) => `<option ${f === r.fame ? "selected" : ""}>${f}</option>`).join("")}</select>
+            <input class="fm-for" value="${esc(r.fame_for || "")}" placeholder="Dikenal karena">${r.reason ? `<span class="qr-muted qr-fame-why">${esc(r.reason)}</span>` : ""}</div>`).join("") || "Belum ada tokoh."}
+          <button class="qr-btn qr-primary" data-act="fame-save">${icon("check")}Simpan semua</button>`);
+        fameCount();
+      }
+      function fameCount() {
+        const box = $(".qr-modal-body .qr-fame-count");
+        if (!box) return;
+        const vals = [...$(".qr-modal-body").querySelectorAll(".qr-fame-row:not([data-persona]) .fm-fame")].map((s) => s.value);
+        const b = vals.filter((v) => v === "bintang").length, t = vals.filter((v) => v === "terkenal").length;
+        box.innerHTML = `bintang ${b}/5 · terkenal ${t}/10${b > 5 || t > 10 ? ' <span class="qr-badge warn">melebihi batas</span>' : ""}`;
       }
       function tabStory() {
         const st = get("story"), c = get("chat"), lib = get("library");
@@ -9118,6 +9290,7 @@ def _():
           <div class="qr-row"><select class="qr-attach-role">${roles.map((r) => `<option value="${r}">${esc((get("boot").types || {})[r] || r)}</option>`).join("")}</select>
             <select class="qr-attach-card"><option value="">Pasang kartu…</option>${(lib.cards || []).map((x) => `<option value="${x.id}">${esc(x.type)} · ${esc(x.name)}</option>`).join("")}</select>
             <button class="qr-btn qr-sm" data-act="attach-card">Pasang</button></div></section>
+          ${topHTML(st)}
           <section><h4>Buku cerita</h4>${Object.entries(st.canon || {}).map(([k, v]) => `<div class="qr-canon" data-sec="${esc(k)}"><b>${esc(k)}</b><textarea rows="3">${esc(v)}</textarea>
             <button class="qr-btn qr-sm" data-act="canon-save">Simpan</button></div>`).join("")}
             <div class="qr-canon" data-sec=""><input class="qr-canon-new" placeholder="Bagian baru, misalnya: Alur terbuka"><textarea rows="2"></textarea><button class="qr-btn qr-sm" data-act="canon-save">${icon("plus")}Tambah</button></div></section>
@@ -9302,6 +9475,7 @@ def _():
         return true;
       };
       listen("input", markDirty);
+      listen("change", (e) => { if (e.target.classList && e.target.classList.contains("fm-fame")) fameCount(); });
       listen("change", markDirty);
       dbody.addEventListener("change", (e) => {
         const t = e.target;
@@ -9441,6 +9615,13 @@ def _():
             openModal("Daftar bab", (h.chapters || []).map((c) => `<button class="qr-libitem" data-act="jump-to" data-chat="${cid}" data-id="${c.id}">${icon("bookmark")}<b>${esc(c.title)}</b><span class="qr-muted">pesan ${c.n}</span></button>`).join("") || "Belum ada bab. Tandai dengan /bab atau tombol bab di balasan."); break; }
           case "speaker": send("settings", { speaker: btn.dataset.name || null }); break;
           case "props-make": send("proposals_make"); break;
+          case "fame-suggest": send("fame_suggest"); break;
+          case "fame-table": fameModal((get("story").cards || []).filter((x) => x.role === "character" || x.role === "persona")
+            .map((x) => ({ card_id: x.id, name: x.name, fame: x.fame, fame_for: x.fame_for, persona: x.role === "persona" })), false); break;
+          case "fame-save": {
+            const items = [...$(".qr-modal-body").querySelectorAll(".qr-fame-row")].map((r) => ({ card_id: Number(r.dataset.card),
+              fame: r.querySelector(".fm-fame").value, fame_for: r.querySelector(".fm-for").value.trim() }));
+            send("fame_save", { items }); closeModal(); break; }
           case "prop-yes": case "prop-no": send("proposal", { pid: Number(btn.closest("[data-pid]").dataset.pid), accept: act === "prop-yes" }); break;
           case "thread-add": { const box = btn.closest(".qr-threads"), title = box.querySelector(".qr-thread-title").value.trim();
             if (title) { send("thread_add", { kind: box.querySelector(".qr-thread-kind").value, title, due: box.querySelector(".qr-thread-due").value.trim() });
@@ -9499,7 +9680,8 @@ def _():
         if (!a.kind) return;
         const d = a.data;
         // answers for another chat (the user switched meanwhile) are dropped
-        if (["proposals", "threads", "knowledge"].includes(a.kind) && d && d.chat_id && d.chat_id !== get("chat").id) return;
+        if (["proposals", "threads", "knowledge", "fame"].includes(a.kind) && d && d.chat_id && d.chat_id !== get("chat").id) return;
+        if (a.kind === "fame") { fameModal(d.rows || [], true); return; }
         if (a.kind === "proposals") {
           state.props = d;
           const box = dbody.querySelector(".qr-props");
@@ -9783,6 +9965,10 @@ def _(UI_APP_JS, UI_BASE_JS, UI_PURIFY_JS):
     .qr-tool summary em { color:var(--warn); font-style:normal; }
     .qr-tool.err > summary em { color:var(--danger); }
     .qr-toolset > .qr-tools { margin:6px 0 0 20px; }
+    .qr-fame-row { display:flex; flex-wrap:wrap; gap:6px 8px; align-items:center; padding:6px 0; border-bottom:1px solid var(--line); }
+    .qr-fame-row b { min-width:140px; }
+    .qr-fame-row .fm-for { flex:1; min-width:160px; }
+    .qr-fame-row .qr-fame-why { flex-basis:100%; font-size:12px; }
     .qr-toolset > summary b { font-family:inherit; }
     .qr-tool pre { white-space:pre-wrap; background:var(--code); border:1px solid var(--line); border-radius:8px; padding:8px 10px; max-height:260px; overflow:auto; font-size:12px; }
     .qr-dices, .qr-flags { display:flex; flex-wrap:wrap; gap:6px; margin:6px 0 10px; align-items:center; }
@@ -9969,6 +10155,7 @@ def _(
     EMBEDDERS,
     Engine,
     EngineView,
+    FAME_LEVELS,
     KNOW,
     LLM_CLIENT,
     MEM,
@@ -10113,7 +10300,8 @@ def _(
                 c = CARDS.get(l["card_id"])
                 if c:
                     links.append({"id": c["id"], "role": l["role"], "name": c["name"], "version": l["version"],
-                                  "latest": c["version"], "avatar": c["avatar"]})
+                                  "latest": c["version"], "avatar": c["avatar"], "fame": str(c["data"].get("fame") or ""),
+                                  "fame_for": str(c["data"].get("fame_for") or "")})
             return {"id": sid, "title": s["title"], "canon": STORIES.canon(sid, STORE.visible_ids(chat["id"]), chat["id"]),
                     "never_forget": s["data"]["never_forget"],
                     "cards": links, "pending": [p["text"] for p in STORIES.pending_list(sid, chat["id"])]}
@@ -10614,6 +10802,34 @@ def _(
             self.engine.decide_proposal(self._cur(), int(pid), bool(accept))
             self.c_proposals()
             chat = STORE.chat(self._cur())
+            if chat:
+                self.w.story = self.story_info(chat)
+
+        # pamor
+        def c_fame_suggest(self):
+            cid = self._cur()
+            if (STORE.chat(cid) or {}).get("kind") not in ("rp", "group"):
+                return self._toast("Usulan pamor hanya untuk chat cerita.", "warn")
+
+            def job():
+                rows = self.engine.suggest_fame(cid)
+                self.w.aux = {"n": time.time(), "kind": "fame", "data": {"chat_id": cid, "rows": rows}}
+            if self.engine.run(job):
+                self._toast("Menyusun usulan pamor…")
+
+        def c_fame_save(self, items):
+            n = 0
+            for it in items or []:
+                card = CARDS.get(int(it.get("card_id") or 0))
+                if not card or card["type"] not in ("character", "persona"):
+                    continue
+                fame = it.get("fame") if it.get("fame") in FAME_LEVELS else ""
+                data = {**card["data"], "fame": fame, "fame_for": str(it.get("fame_for") or "").strip()[:200]}
+                if (card["data"].get("fame") or "", card["data"].get("fame_for") or "") != (data["fame"], data["fame_for"]):
+                    CARDS.save(card["id"], card["type"], data)
+                    n += 1
+            self._toast(f"Pamor disimpan untuk {n} kartu. Masuk prompt setelah Terapkan sekarang atau compaction berikutnya.")
+            chat = STORE.chat(self._cur()) if self._cur() else None
             if chat:
                 self.w.story = self.story_info(chat)
 

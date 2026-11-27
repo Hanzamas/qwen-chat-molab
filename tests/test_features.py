@@ -179,3 +179,80 @@ def test_checker_records_when_it_runs(engine, nb, monkeypatch):
     monkeypatch.setenv("QCHAT_STATE_CHECK", "0")
     other, _ = _story(nb, engine)
     assert "catat dengan relationship" in P.system_text(other)
+
+
+# ---------- pamor and first meetings ----------
+
+def _campus(nb, engine, n=14):
+    C = nb["CARDS"]
+    world = C.save(None, "world", {"name": "Kampus Fiksi", "realworld": "tidak"})
+    sc = C.save(None, "scenario", {"title": "Ospek", "start_time": "2026-08-01 08:00", "start_location": "Aula",
+                                   "opening": "Aula penuh mahasiswa baru."})
+    persona = C.save(None, "persona", {"name": "Hanz Pratama"})
+    ids = []
+    for name in ["Mira Santoso", "Bu Ratna"] + [f"Mahasiswi {i}" for i in range(n - 2)]:
+        fame = {"Mira Santoso": "bintang", "Bu Ratna": "terkenal"}.get(name, "biasa")
+        ids.append(C.save(None, "character", {"name": name, "role": "dosen" if name.startswith("Bu ") else "mahasiswi",
+                                              "personality": f"Kepribadian khas {name}.", "fame": fame,
+                                              "fame_for": "ketua BEM" if name == "Mira Santoso" else ""}))
+    gm = C.save(None, "gm", {"format": "prosa"})
+    return engine.start_story({"world": world, "scenario": sc, "persona": persona, "character": ids, "gm": gm}), ids
+
+
+def test_large_cast_keeps_the_best_known_in_the_prompt(engine, nb):
+    chat, _ = _campus(nb, engine)
+    P, S = nb["PROMPT"], nb["STORE"]
+    text = P.system_text(chat)
+    assert "Kepribadian khas Mira Santoso" in text and "Kepribadian khas Bu Ratna" in text
+    assert "Kepribadian khas Mahasiswi 3" not in text and "- Mahasiswi 3: mahasiswi · pamor biasa" in text
+    assert "## Dikenal umum" in text and "- Mira Santoso (bintang): mahasiswi · ketua BEM" in text
+    S.add_message(chat, S.chat(chat)["head_id"], "user", "Aku menyapa Mahasiswi 3.")
+    msgs, used = P.build(chat)
+    note = msgs[-1]["content"]
+    assert "Kepribadian khas Mahasiswi 3" in note  # its card comes along when it appears
+    assert "belum tercatat kenal Hanz Pratama" in note and used["unmet"] == ["Mahasiswi 3"]
+
+
+def test_first_meeting_is_noted_and_recorded(engine, nb, fake, monkeypatch):
+    chat, _ = _campus(nb, engine, n=4)  # a small cast: every card stays in the system prompt
+    S, K, P = nb["STORE"], nb["KNOW"], nb["PROMPT"]
+    assert "Kepribadian khas Mahasiswi 1" in P.system_text(chat)
+    monkeypatch.setenv("QCHAT_STATE_CHECK", "1")
+    n = len(fake["log"])
+    engine.send(chat, "Aku menyapa Mira Santoso.")
+    wait_idle(engine)
+    assert any("Pertemuan pertama dengan pemain mungkin terjadi di giliran ini: Mira Santoso" in json.dumps(b, ensure_ascii=False)
+               for b in fake["log"][n:])
+    monkeypatch.setenv("QCHAT_STATE_CHECK", "0")
+    K.add(chat, None, ["Mira Santoso"], "Bertemu mahasiswa baru di aula saat ospek; belum tahu namanya", kind="kenalan")
+    K.add(chat, None, ["Bu Ratna"], "Hanz sering telat masuk kelas")  # knowing something about him counts too
+    S.add_message(chat, S.chat(chat)["head_id"], "user", "Aku menyapa Mira Santoso dan Bu Ratna.")
+    msgs, used = P.build(chat)
+    assert "belum tercatat kenal" not in msgs[-1]["content"] and not used.get("unmet")
+
+
+def test_fame_suggestions_and_save(engine, nb, fake):
+    from types import SimpleNamespace
+    chat, _ = _campus(nb, engine, n=4)
+    fake["script"].append({"content": json.dumps({"items": [
+        {"name": "Mahasiswi 0", "fame": "terkenal", "fame_for": "juara debat", "reason": "prestasi"},
+        {"name": "Mahasiswi 1", "fame": "super", "reason": "x"}]})})
+    rows = engine.suggest_fame(chat)
+    by = {r["name"]: r for r in rows}
+    assert len(rows) == 4 and by["Mahasiswi 0"]["fame"] == "terkenal" and by["Mahasiswi 0"]["fame_for"] == "juara debat"
+    assert by["Mahasiswi 1"]["fame"] == "biasa" and by["Mira Santoso"]["current"] == "bintang"
+    toasts = []
+    obj = SimpleNamespace(w=SimpleNamespace(), _toast=lambda t, k="info": toasts.append(t), _cur=lambda: chat,
+                          story_info=lambda ch: {"ok": 1})
+    nb["ChatApp"].c_fame_save(obj, [{"card_id": by["Mahasiswi 0"]["card_id"], "fame": "terkenal", "fame_for": "juara debat"},
+                                    {"card_id": by["Mira Santoso"]["card_id"], "fame": "bintang", "fame_for": "ketua BEM"}])
+    assert nb["CARDS"].get(by["Mahasiswi 0"]["card_id"])["data"]["fame"] == "terkenal"
+    assert "untuk 1 kartu" in toasts[0] and obj.w.story == {"ok": 1}
+
+
+def test_world_tick_puts_the_best_known_first(engine, nb, fake):
+    from datetime import datetime
+    chat, _ = _campus(nb, engine, n=4)
+    n = len(fake["log"])
+    engine._tick(chat, datetime(2026, 8, 1, 8, 0), 300, "uji")
+    assert "Tokoh paling dikenal: Mira Santoso, Bu Ratna" in json.dumps(fake["log"][n], ensure_ascii=False)
