@@ -2027,6 +2027,26 @@ def _(datetime, re):
             dominant = max(shares, key=shares.get) if w else expected
             return dominant, shares
 
+        QUOTE = re.compile(r"[\"“„«]([^\"”“»\n]{1,500})[\"”“»]")
+
+        @staticmethod
+        def lang_of(text):
+            """The language with the most stopwords in the text ('' when none is seen)."""
+            w = TXT.words(text)
+            counts = {lang: sum(1 for x in w if x in stop) for lang, stop in TXT.STOP.items()}
+            best = max(counts, key=counts.get) if w else ""
+            return best if counts.get(best) else ""
+
+        @staticmethod
+        def dialogue_lines(text, lang):
+            """Quoted lines in `lang`: (word count, translated) each; translated = a parenthesis follows right after."""
+            out = []
+            for m in TXT.QUOTE.finditer(text or ""):
+                if TXT.lang_of(m.group(1)) != lang:
+                    continue
+                out.append((len(TXT.words(m.group(1))), bool(re.match(r"\s*\(", (text or "")[m.end():m.end() + 6]))))
+            return out
+
         @staticmethod
         def split_dialogue(text):
             """Count quote fragments followed by a short translation: the "Das..." (Itu) "...ist..." pattern.
@@ -2041,13 +2061,15 @@ def _(datetime, re):
         ACTS_FOR_USER = re.compile(
             r"\b(kamu|Kamu|anda|Anda)\s+(berkata|bilang|menjawab|bertanya|berteriak|berbisik|mengatakan|memutuskan|"
             r"setuju|tersenyum dan berkata)\b|\b(katamu|ucapmu|jawabmu|tanyamu|bisikmu|teriakmu)\b|"
-            r"\byou (say|said|reply|replied|ask|asked|decide|decided)\b", re.I)
+            r"\byou (say|said|reply|replied|ask|asked|decide|decided|answer|answered|shout|shouted|whisper|whispered|"
+            r"agree|agreed|promise|promised|tell|told)\b", re.I)
 
         @staticmethod
         def acts_for_user(text, persona_name=""):
             hits = [m.group(0) for m in TXT.ACTS_FOR_USER.finditer(text or "")]
             if persona_name:
-                hits += re.findall(rf"\b{re.escape(persona_name)}\s+(?:berkata|menjawab|bertanya|says|said)\b", text or "")
+                hits += re.findall(rf"\b{re.escape(persona_name)}\s+(?:berkata|menjawab|bertanya|says|said|replies|replied|asks|"
+                                   rf"asked|answers|answered)\b", text or "")
             return hits
 
         # ---------- user input ----------
@@ -2230,16 +2252,25 @@ def _():
         ]},
     }
 
-    # Default values that changed: a default card still holding the old value moves to the new one, once per database.
-    DEFAULTS_CHANGED = [("style", "Gaya RP default", "paragraphs", "5-10", "4-7"),
+    DIALOGUE_RULE_ID = ("Dialog ditulis dalam bahasa tokohnya. Kalau bukan bahasa Indonesia, tulis kalimatnya UTUH dalam satu "
+                        "tanda kutip, lalu terjemahannya SATU kali dalam kurung tepat setelahnya.")
+    DIALOGUE_RULE_EN = ("Dialogue is written in each character's own language. When it is not English, write the whole sentence "
+                        "inside one pair of quotes, then its English translation ONCE in parentheses right after it. Every such "
+                        "sentence is translated.")
+
+    # Default values that changed: a default card still holding the old value moves to the new one, once per database
+    # (one flag per change set).
+    DEFAULTS_CHANGED = {
+        "defaults_v2": [("style", "Gaya RP default", "paragraphs", "5-10", "4-7"),
                         ("style", "Gaya RP default", "sentences", "5-10", "4-7"),
-                        ("gm", "GM membumi", "afk_scale", "1", "0")]
+                        ("gm", "GM membumi", "afk_scale", "1", "0")],
+        "defaults_v3": [("style", "Gaya RP default", "narration_lang", "Indonesia", "English"),
+                        ("style", "Gaya RP default", "dialogue_rule", DIALOGUE_RULE_ID, DIALOGUE_RULE_EN)],
+    }
 
     DEFAULT_CARDS = [
         ("style", "Gaya RP default", {
-            "pov": "orang kedua (kamu)", "narration_lang": "Indonesia",
-            "dialogue_rule": "Dialog ditulis dalam bahasa tokohnya. Kalau bukan bahasa Indonesia, tulis kalimatnya UTUH dalam satu "
-                             "tanda kutip, lalu terjemahannya SATU kali dalam kurung tepat setelahnya.",
+            "pov": "orang kedua (kamu)", "narration_lang": "English", "dialogue_rule": DIALOGUE_RULE_EN,
             "paragraphs": "4-7", "sentences": "4-7",
             "sentence_style": "Kalimat panjang yang merangkai deskripsi, gerak, dan ucapan tokoh. Detail konkret dan indrawi.",
             "dialogue_ratio": "30-50%", "violence": "sedang", "tone": "Membumi dan wajar, tanpa superlatif.",
@@ -2321,13 +2352,15 @@ def _(
             for t, name, data in DEFAULT_CARDS:
                 if not self.store.one("SELECT id FROM cards WHERE type = ? LIMIT 1", (t,)):
                     self.save(None, t, data, name=name)
-            if self.store.meta_get("defaults_v2") is None:
-                for t, name, key, old, new in DEFAULTS_CHANGED:
+            for flag, changes in DEFAULTS_CHANGED.items():
+                if self.store.meta_get(flag) is not None:
+                    continue
+                for t, name, key, old, new in changes:
                     for r in self.store.q("SELECT id FROM cards WHERE type = ? AND name = ?", (t, name)):
                         c = self.get(r["id"])
                         if c and str(c["data"].get(key, "")).strip() == old:
                             self.save(c["id"], t, {**c["data"], key: new})  # a new version: the old one stays restorable
-                self.store.meta_set("defaults_v2", "1")
+                self.store.meta_set(flag, "1")
 
         def schema(self, type_):
             row = self.store.one("SELECT json FROM card_schemas WHERE type = ?", (type_,))
@@ -3434,9 +3467,72 @@ def _(
             return "sangat dekat"
 
 
+    class Lang:
+        """The player character's level in the story's target language (Style: target_lang): the Persona's skill row for
+        that language, plus what play earned (writing it, rolls in it, weeks lived among it). The level sets how long and
+        how hard the other characters' lines in that language are. Every such line is always translated."""
+
+        NAMES = {"de": ("jerman", "german", "deutsch"), "fr": ("prancis", "french", "français", "francais"),
+                 "es": ("spanyol", "spanish", "español", "espanol"), "nl": ("belanda", "dutch", "nederlands"),
+                 "it": ("italia", "italian", "italiano"), "ja": ("jepang", "japanese"), "en": ("inggris", "english")}
+        LABEL = {"de": "German", "fr": "French", "es": "Spanish", "nl": "Dutch", "it": "Italian", "ja": "Japanese",
+                 "en": "English"}
+        # (up to this value, band, words per line from-to, what the lines may hold)
+        BANDS = [(20, "A1", 3, 6, "kata sehari-hari, kalimat present sederhana"),
+                 (40, "A2", 5, 10, "Perfekt, tanya-jawab sederhana"),
+                 (60, "B1", 8, 15, "kalimat majemuk (weil, dass, wenn), sedikit idiom"),
+                 (80, "B2", 12, 25, "tempo normal, idiom, dialek ringan"),
+                 (100, "C1", 15, 40, "seperti penutur asli, boleh slang")]
+        DEFAULT_BASE = 40
+        XP_FIELD = "_lang_xp"
+        WEEK_XP = 3
+
+        @classmethod
+        def code(cls, cards):
+            raw = str((((cards or {}).get("style") or {}).get("data") or {}).get("target_lang") or "").strip().lower()
+            if not raw:
+                return ""
+            if raw in cls.NAMES:
+                return raw
+            return next((k for k, names in cls.NAMES.items() if any(n in raw for n in names)), raw if len(raw) == 2 else "")
+
+        @classmethod
+        def is_skill(cls, skill, code):
+            s = str(skill or "").lower()
+            return bool(code) and any(n in s for n in cls.NAMES.get(code, ()))
+
+        @classmethod
+        def band(cls, value):
+            return next(b for b in cls.BANDS if value <= b[0] or b is cls.BANDS[-1])
+
+        @classmethod
+        def of(cls, cards, st, start):
+            code = cls.code(cards)
+            if not code:
+                return None
+            rows = (((cards.get("persona") or {}).get("data") or {}).get("skill_levels")) or []
+            row = next((r for r in rows if r and cls.is_skill(r[0], code)), None)
+            try:
+                base = float(str(row[1]).replace(",", ".")) if row and len(row) > 1 else cls.DEFAULT_BASE
+            except ValueError:
+                base = cls.DEFAULT_BASE
+            xp = float(((st["status"].get("player") or {}).get(cls.XP_FIELD)) or 0)
+            weeks = max(0, int((st["time"] - start).total_seconds() // (7 * 86400)))
+            value = max(0.0, min(100.0, base + xp + cls.WEEK_XP * weeks))
+            _, band, lo, hi, desc = cls.band(value)
+            return {"code": code, "label": cls.LABEL.get(code, code), "base": base, "xp": xp, "weeks": weeks,
+                    "value": int(round(value)), "band": band, "lo": lo, "hi": hi, "desc": desc}
+
+        @classmethod
+        def gain(cls, world, chat_id, mid, st, points, reason):
+            """Add points on the branch through mid (a reroll takes them back with the reply)."""
+            cur = float(((st["status"].get("player") or {}).get(cls.XP_FIELD)) or 0)
+            world.add_event(chat_id, mid, "player", cls.XP_FIELD, round(cur + points, 2), "set", reason)
+
+
     RELATIONS = Relations(STORE)
     WORLD = World(STORE, CARDS, STORIES)
-    return RELATIONS, Relations, THREADS, Threads, WORLD, World
+    return Lang, RELATIONS, Relations, THREADS, Threads, WORLD, World
 
 
 @app.cell(hide_code=True)
@@ -4589,6 +4685,7 @@ def _(
     CARDS,
     KNOW,
     LLM_CLIENT,
+    Lang,
     MEM,
     PRESETS,
     RELATIONS,
@@ -4938,12 +5035,31 @@ def _(
 
         VOLATILE = {"mood": 2, "plan_now": 6}  # world hours after which a recorded value may be out of date
 
+        def narration_lang(self, c):
+            return (self.style(c).get("narration_lang") or "").strip()
+
+        def lang_lines(self, c, st):
+            """Narration language and the target-language level for the note. Returns (lines, level or None)."""
+            narr = self.narration_lang(c)
+            lines = []
+            if narr:
+                lines.append(f"Bahasa: narasi wajib bahasa {narr}, apa pun bahasa pesan pemain. Catatan yang kamu simpan "
+                             f"(canon_set, memory) juga dalam bahasa {narr}.")
+            lv = Lang.of(c["cards"], st, self.world.start_time(c["cards"]))
+            if lv:
+                tr = narr or "bahasa narasi"
+                lines.append(f"Setiap kalimat {lv['label']} ditulis utuh dalam tanda kutip lalu SELALU diterjemahkan ke {tr} satu "
+                             f"kali dalam kurung tepat setelahnya, berapa pun tingkatnya. Tingkat {lv['label']} tokoh pemain: "
+                             f"{lv['band']} ({lv['value']}/100). Ucapan {lv['label']} tokoh lain kepadanya: kalimat {lv['lo']}-"
+                             f"{lv['hi']} kata, {lv['desc']}; jangan menyederhanakan di bawah tingkat ini.")
+            return lines, lv
+
         def status_json(self, fields, seen, now):
             """Status as JSON. Mood and plans recorded long ago (world time) carry their age, so an old mood is not played
             as the current one."""
             out = {}
             for k, v in fields.items():
-                if v in (None, "", [], {}):
+                if v in (None, "", [], {}) or str(k).startswith("_"):  # _fields are the system's own bookkeeping
                     continue
                 t, hrs = (seen or {}).get(k), self.VOLATILE.get(k)
                 if hrs and t and (now - t).total_seconds() >= hrs * 3600:
@@ -5094,6 +5210,10 @@ def _(
                 else:
                     lines.append("Pengetahuan tokoh, benang cerita, dan hubungan yang tidak sempat kamu catat akan dilengkapi "
                                  "pemeriksa setelah giliran; utamakan narasi. Waktu, dadu, dan status tetap catat sendiri.")
+            lang_lines, lv = self.lang_lines(c, st)
+            lines += lang_lines
+            if lv:
+                used["lang"] = lv
             tgt = self.length_target(c) if length is None else (length or None)
             if tgt:
                 total = tgt["paragraphs"] * (tgt["sent_lo"] + tgt["sent_hi"]) // 2
@@ -5253,7 +5373,8 @@ def _(TXT, re, threading, time):
 
 
     class Compactor:
-        COMPACT_AT = 0.90
+        COMPACT_AT = 0.80
+        FULL_AT = 0.95  # prompt plus the room the reply needs (thinking + text) must stay under this share of the window
         TARGET = 0.60
         KEEP_USER_TURNS = 3
         KEEP_TAIL = 0.25  # share of the context window kept as verbatim recent turns
@@ -5288,7 +5409,7 @@ def _(TXT, re, threading, time):
             return self.llm.tokenize(msgs, tools, self.prompt.kwargs(c))
 
         def maybe(self, chat_id, tools, toolbox, phase=lambda m: None, force=False, threshold=None, last_used=0,
-                  pending_estimate=0, clear_cancel=True):
+                  pending_estimate=0, clear_cancel=True, reserve=0):
             """Compact when the prompt passes the threshold (or always with force). Returns the token count after.
             clear_cancel: a run started by the player resets the cancel flag once it holds the lock; the idle run
             leaves it alone, so a message sent meanwhile still stops it."""
@@ -5298,10 +5419,12 @@ def _(TXT, re, threading, time):
             threshold = threshold or self.COMPACT_AT
             # Tokenizing a long history costs time: skip only when the last count plus what is about to be added
             # (a big attachment, say) is still well below the threshold.
-            if not force and last_used and last_used + pending_estimate < 0.7 * maxc:
+            self.last_note = ""
+            if not force and last_used and last_used + pending_estimate + reserve < min(0.7, threshold - 0.05) * maxc:
                 return last_used
             used = self.measure(chat_id, tools) + pending_estimate
-            if not force and used < threshold * maxc:
+            # Fire at the threshold, or earlier when the reply (thinking + text) would not fit next to the prompt.
+            if not force and used < threshold * maxc and used + reserve <= self.FULL_AT * maxc:
                 return used
             with self.lock:
                 if clear_cancel:
@@ -5328,18 +5451,23 @@ def _(TXT, re, threading, time):
                     if s["node_id"] in ids]
             done_pos = max((ids.index(s["node_id"]) for s in sums), default=-1)
             users_after = [u for u in users if u > done_pos]
-            if len(users_after) <= self.KEEP_USER_TURNS:
+            # A group chat answers one player message with many replies: keeping one player turn whole is enough there.
+            keep = 1 if (chat or {}).get("kind") == "group" else self.KEEP_USER_TURNS
+            if len(users_after) <= keep:
+                self.last_note = (f"Compaction skipped: only {len(users_after)} player message(s) since the last summary; "
+                                  f"it runs after {keep + 1}.")
                 return used
             # Verbatim tail: at least KEEP_USER_TURNS turns and about KEEP_TAIL of the window, so voices, language and
             # rhythm carry over (only older turns become summaries). Never so much that nothing can be summarized.
             size = lambda i: self.llm.estimate([{"content": path[i]["content"], "reasoning_content": ""}])
-            k = self.KEEP_USER_TURNS
+            k = keep
             tail = sum(size(i) for i in range(users_after[-k], len(path)))
             while k + 1 < len(users_after) and tail < self.KEEP_TAIL * maxc:
                 k += 1
                 tail += sum(size(i) for i in range(users_after[-k], users_after[-k + 1]))
             cutoff = users_after[-k] - 1
             if cutoff <= done_pos:
+                self.last_note = "Compaction skipped: everything older is already summarized; the recent turns stay whole."
                 return used
             label = f"Menyimpan memory sebelum memadatkan pesan {done_pos + 2}–{cutoff + 1}…"
             phase(label)
@@ -5408,7 +5536,9 @@ def _(TXT, re, threading, time):
             return out
 
         def flush(self, chat_id, path, toolbox, a, b, on_delta=None):
-            msgs = self.prompt.side(chat_id, FLUSH_INSTRUCTION.format(a=a, b=b), path=path)
+            narr = self.prompt.narration_lang(self.prompt.ctx(chat_id))
+            msgs = self.prompt.side(chat_id, FLUSH_INSTRUCTION.format(a=a, b=b) + (f"\nTulis isi catatan dalam bahasa {narr}." if narr else ""),
+                                    path=path)
             c = self.prompt.ctx(chat_id)
             head = path[-1]["id"] if path else None
             allowed = {"canon_set", "memory_save", "memory_update", "memory_forget", "status_update", "fact_save", "world_event",
@@ -5438,6 +5568,9 @@ def _(TXT, re, threading, time):
             anchors = "\n".join(f"{i + 1}: {path[i]['content'][:80].replace(chr(10), ' ')}"
                                 for i in range(a, b + 1) if path[i]["role"] == "user")
             instr = SUMMARY_INSTRUCTION.format(a=a + 1, b=b + 1, words=int(budget * 0.55), anchors=anchors[:6000])
+            narr = self.prompt.narration_lang(self.prompt.ctx(chat_id))
+            if narr:
+                instr += f"\nTulis ringkasan dalam bahasa {narr}; kutipan dialog tetap persis dalam bahasa aslinya."
             c = self.prompt.ctx(chat_id)
             maxc = self.llm.max_context() or 0
             # Same prefix as the chat (cache hits). If history + the answer would not fit, only the piece goes in.
@@ -5526,6 +5659,7 @@ def _(
     EMB,
     KNOW,
     Knowledge,
+    Lang,
     MEM,
     Memory,
     RELATIONS,
@@ -5836,6 +5970,10 @@ def _(
                     base = float(str(hit[1]).replace(",", ".")) / 100 if hit and len(hit) > 1 else 0.4
                 except ValueError:
                     base = 0.4
+                lv = Lang.of(cards, self.world.state(chat_id, self.store.path_ids(chat_id)), self.world.start_time(cards)) \
+                    if holder == "player" and cards else None
+                if lv and Lang.is_skill(skill, lv["code"]):  # the language level grows in play: the dice use the grown one
+                    base, hit = lv["value"] / 100, [f"{lv['label']} {lv['band']}"]
                 why.append(f"{hit[0]} {base:.0%}" if hit else f"{skill}: tidak terlatih 40%")
                 mod = self.DIFFICULTY.get(difficulty or "sedang", 0.0)
                 if mod:
@@ -5877,6 +6015,10 @@ def _(
         def t_roll(self, chat_id, mid, event, odds=None, skill="", difficulty="sedang", who="player"):
             p, why = self.roll_odds(chat_id, self._holder(chat_id, who) or "player", skill, difficulty, odds)
             r = self.world.roll(chat_id, mid, event, p)
+            cards = self._story(chat_id)[1] or {}
+            if skill and (self._holder(chat_id, who) or "player") == "player" and Lang.is_skill(skill, Lang.code(cards)):
+                Lang.gain(self.world, chat_id, mid, self.world.state(chat_id, self.store.path_ids(chat_id)),
+                          2 if r["success"] else 0.5, "roll bahasa")
             verdict = "BERHASIL" if r["success"] else "GAGAL"
             return {**r, "why": why, "result": f"{verdict} (peluang {r['odds']:.0%}: {', '.join(why)}). Hasil ini wajib diikuti."}
 
@@ -6252,7 +6394,7 @@ def _(CFG, base64, io, subprocess, sys, zipfile):
 
 
 @app.cell(hide_code=True)
-def _(RELATIONS, Relations, TXT, hashlib, io, json, re, time, zipfile):
+def _(Lang, RELATIONS, Relations, TXT, hashlib, io, json, re, time, zipfile):
     class EngineView:
         """Read-only views for the UI: history items, panels, branches, prompt inspector, story export."""
 
@@ -6357,7 +6499,8 @@ def _(RELATIONS, Relations, TXT, hashlib, io, json, re, time, zipfile):
                     "location": player.get("location") or ((c["cards"].get("scenario") or {}).get("data") or {}).get("start_location", ""),
                     "stats": [{"key": s["key"], "label": s["label"], "value": s["value"], "min": s["min"], "max": s["max"],
                                "change": s["change"]} for s in st["stats"]],
-                    "status": {k: v for k, v in player.items() if k != "location"},
+                    "status": {k: v for k, v in player.items() if k != "location" and not str(k).startswith("_")},
+                    "lang": self._lang_panel(c, st),
                     "characters": self._observable(self.world.with_schedule(st, c["cards"]), player.get("location")),
                     "gm_view": bool(chat["settings"].get("gm_view")),
                     "relations": [{"who": a, "score": v["score"], "word": Relations.word(v["score"]), "last": v["last"]}
@@ -6367,6 +6510,10 @@ def _(RELATIONS, Relations, TXT, hashlib, io, json, re, time, zipfile):
                                                                          "new": not e["shown"]} for e in events],
                     "time_skips": gm.get("time_skips") or ["2 jam", "1 hari", "1 minggu"], "persona": persona["name"] if persona else "",
                     "story": (c["story"] or {}).get("title", "")}
+
+        def _lang_panel(self, c, st):
+            lv = Lang.of(c["cards"], st, self.world.start_time(c["cards"]))
+            return {k: lv[k] for k in ("label", "band", "value")} if lv else None
 
         # What can be seen of someone in the same place. Plans, attitudes, what they know and carry stay hidden.
         OBSERVABLE = ("outfit", "mood", "injuries", "keadaan")
@@ -6496,6 +6643,7 @@ def _(
     Files,
     KNOW,
     LLM_CLIENT,
+    Lang,
     MEM,
     PROMPT,
     RELATIONS,
@@ -6599,9 +6747,10 @@ def _(
     Apakah klaim itu benar menurut sumber? Jawab HANYA JSON:
     {{"verdict": "benar" | "salah" | "tidak pasti", "correction": "koreksi singkat kalau salah", "fact": "fakta yang benar, satu kalimat"}}"""
 
-    LEARN_INSTRUCTION = """Jelaskan kalimat berikut untuk pelajar bahasa {lang}. Jawab HANYA JSON:
-    {{"translation": "...", "grammar": ["poin tata bahasa singkat", "..."], "vocab": [{{"term": "...", "translation": "...", "note": "..."}}]}}
-    Kalimat: {text}"""
+    LEARN_INSTRUCTION = """Explain the sentence below for a learner of {lang}. Write everything in English. Answer ONLY JSON:
+    {{"translation": "English translation", "grammar": ["short grammar point in English", "..."],
+    "vocab": [{{"term": "...", "translation": "English", "note": "short note in English"}}]}}
+    Sentence: {text}"""
 
     RECALL_QUESTIONS = """Dari potongan percakapan berikut, buat {n} pertanyaan tentang detail spesifik (nama, angka, kejadian, ucapan)
     beserta jawabannya. Jawab HANYA JSON: {{"qa": [{{"q": "...", "a": "..."}}]}}
@@ -7014,6 +7163,9 @@ def _(
             avoid = c["settings"].get("avoid") or []
             if avoid and not turn["ooc"]:
                 extra.append("Hindari frasa yang sudah berulang ini: " + "; ".join(f'"{p}"' for p in avoid[:8]))
+            fix = c["settings"].get("lang_fix") or {}
+            if fix.get("text") and not turn["ooc"]:
+                extra.append(fix["text"])
             openers = c["settings"].get("openers") or []
             if openers and not turn["ooc"]:
                 extra.append("Variasikan pembuka balasan. Balasan terakhir dimulai dengan pola yang sama seperti sebelumnya ("
@@ -7021,18 +7173,20 @@ def _(
             error, state = None, None
             seen_calls, fails_in_row = {}, 0
             try:
+                reserve = self._default_max_tokens(c)
                 used = self.compactor.maybe(chat_id, tools, self.tools, phase, last_used=self.last_used.get(chat_id, 0),
-                                            pending_estimate=pending_estimate, clear_cancel=not self.stop.is_set())
+                                            pending_estimate=pending_estimate, clear_cancel=not self.stop.is_set(), reserve=reserve)
                 if used:
                     self.last_used[chat_id] = used
+                self._compaction_note(chat_id)
                 phase("")
                 _round = -1
                 while True:
                     _round += 1
                     if _round:
                         # Many rounds of tool results can fill the context: compact older history between rounds too.
-                        used = self.compactor.maybe(chat_id, tools, self.tools, phase,
-                                                    last_used=self.last_used.get(chat_id, 0), clear_cancel=not self.stop.is_set())
+                        used = self.compactor.maybe(chat_id, tools, self.tools, phase, last_used=self.last_used.get(chat_id, 0),
+                                                    clear_cancel=not self.stop.is_set(), reserve=reserve)
                         if used:
                             self.last_used[chat_id] = used
                         phase("")
@@ -7155,10 +7309,47 @@ def _(
                     self._queue_offscreen(chat_id, c)
                 except Exception:
                     pass
+            # What the next request will hold: the server's total also counted the thinking just written, which the next
+            # prompt drops; the screen and the compaction trigger use the same number.
+            try:
+                self.last_used[chat_id] = self.compactor.measure(chat_id, tools)
+            except Exception:
+                pass
             self.emit("history", chat_id)
             self.emit("panels", chat_id)
-            self.emit("ctx", {"used": self.last_used.get(chat_id, 0), "max": self.llm.max_context()})
+            self.emit("ctx", {"used": self.last_used.get(chat_id, 0), "max": self.llm.max_context(),
+                              "reserve": self._default_max_tokens(c), "at": self.compactor.COMPACT_AT})
             return error
+
+        def _lang_points(self, chat_id, mid, c, lv):
+            """Points for the target language: the player wrote in it this turn (+1, once per player message). A level-up
+            (from points, rolls or weeks of world time) is announced once."""
+            m = self.store.msg(mid) or {}
+            if not (m.get("meta") or {}).get("seg_after"):  # a group round: only the first reply to the message counts
+                u = self._turn_user(chat_id, mid) or {}
+                text = u.get("content") or ""
+                mine = TXT.dialogue_lines(text, lv["code"])
+                if any(n >= 3 for n, _ in mine) or (TXT.lang_of(text) == lv["code"] and len(TXT.words(text)) >= 4):
+                    Lang.gain(self.world, chat_id, mid, self.world.state(chat_id, self.store.path_ids(chat_id)), 1,
+                              "menulis bahasa target")
+            st = self.world.state(chat_id, self.store.path_ids(chat_id))
+            now = Lang.of(c["cards"], st, self.world.start_time(c["cards"]))
+            before = (self.store.chat(chat_id) or {}).get("settings", {}).get("lang_band") or lv["band"]  # lv: this turn's start
+            if now and before != now["band"]:
+                self.store.chat_settings(chat_id, lang_band=now["band"])
+                order = [b[1] for b in Lang.BANDS]
+                if before in order and order.index(now["band"]) > order.index(before):
+                    self.emit("notice", {"chat_id": chat_id, "text": f"Your {now['label']} improved to {now['band']} "
+                                                                     f"({now['value']}/100)."})
+
+        def _compaction_note(self, chat_id):
+            """Say once why compaction could not run (instead of a full context with no word)."""
+            note = getattr(self.compactor, "last_note", "")
+            seen = getattr(self, "_compact_notes", {})
+            self._compact_notes = seen
+            if note and seen.get(chat_id) != note:
+                self.emit("toast", {"text": note, "kind": "warn", "long": True})
+            seen[chat_id] = note
 
         def _default_max_tokens(self, c):
             """Room for the answer plus the thinking budget of the chat's level (max_tokens covers both)."""
@@ -7306,11 +7497,40 @@ def _(
             banned = TXT.banned_hits(full, self.prompt.style(c).get("banned") or [])
             if banned:
                 flags.append({"kind": "banned", "text": "Frasa terlarang: " + ", ".join(banned)})
-            lang = (self.prompt.style(c).get("narration_lang") or "Indonesia").lower()
+            narr = self.prompt.narration_lang(c) or "Indonesia"
+            lang = narr.lower()
             expected = "id" if lang.startswith(("indo", "id")) else "de" if lang.startswith(("jer", "deu", "ger", "de")) else "en"
             dom, shares = TXT.narration_language(full, expected)
+            rewrite_lang = None
+            fixes = []
             if dom != expected and shares.get(dom, 0) > 0.5:
                 flags.append({"kind": "language", "text": f"Narasi tampaknya berbahasa {dom}, bukan {expected}."})
+                fixes.append(f"Narasi giliran sebelumnya tidak dalam bahasa {narr}. Tulis narasi dalam bahasa {narr}.")
+                counted = sum(1 for x in TXT.words(full) if any(x in s for s in TXT.STOP.values()))
+                if counted >= 15:
+                    rewrite_lang = (f"Jawaban sebelumnya tidak ditulis dalam bahasa {narr}. Tulis ulang giliran ini: narasi dalam "
+                                    f"bahasa {narr}; ucapan tokoh dalam bahasa asing tetap dalam bahasanya, dengan terjemahan {narr}.")
+            lv = used.get("lang")
+            if lv:
+                lines_ = TXT.dialogue_lines(full, lv["code"])
+                if len(lines_) >= 2 and sum(n for n, _ in lines_) / len(lines_) < lv["lo"] * 0.8:
+                    avg = sum(n for n, _ in lines_) / len(lines_)
+                    flags.append({"kind": "lang_short", "text": f"Dialog {lv['label']} terlalu pendek untuk {lv['band']} "
+                                                                f"(rata-rata {avg:.0f} kata, target {lv['lo']}-{lv['hi']})."})
+                    fixes.append(f"Ucapan {lv['label']} giliran sebelumnya terlalu pendek untuk tingkat {lv['band']}: kalimatnya "
+                                 f"harus {lv['lo']}-{lv['hi']} kata.")
+                missing = sum(1 for _, tr in lines_ if not tr)
+                if missing:
+                    flags.append({"kind": "lang_untranslated", "text": f"{missing} kalimat {lv['label']} tanpa terjemahan."})
+                    fixes.append(f"Ada kalimat {lv['label']} tanpa terjemahan di giliran sebelumnya: terjemahkan SETIAP kalimat.")
+                self._lang_points(chat_id, mid, c, lv)
+            prev_fix = (self.store.chat(chat_id) or {}).get("settings", {}).get("lang_fix") or {}
+            if fixes:
+                self.store.chat_settings(chat_id, lang_fix={"text": " ".join(fixes), "left": 3})
+            elif prev_fix.get("left", 0) > 1:
+                self.store.chat_settings(chat_id, lang_fix={**prev_fix, "left": prev_fix["left"] - 1})
+            elif prev_fix:
+                self.store.chat_settings(chat_id, lang_fix=None)
             if TXT.split_dialogue(full) >= 3:
                 flags.append({"kind": "split", "text": "Dialog tampak terpecah per kata dengan terjemahan pendek."})
             persona = (c["cards"].get("persona") or {}).get("name", "")
@@ -7320,6 +7540,12 @@ def _(
                                                                + "; ".join(acts[:3])})
             m["meta"]["flags"] = flags
             self.store.update_message(mid, meta=m["meta"])
+            if rewrite_lang and not getattr(self, "_rewriting", False) and not self.stop.is_set() \
+                    and os.environ.get("QCHAT_LANG_REWRITE", "1") != "0":
+                self.emit("toast", {"text": f"Narasi bukan bahasa {narr}; giliran ditulis ulang. Versi lama bisa digeser.",
+                                    "kind": "warn"})
+                self._rewrite(chat_id, mid, rewrite_lang)
+                return
             # choices (game format)
             gm = self.prompt.gm(c)
             if gm.get("format") == "game" and gm.get("choices", "kadang") != "tidak" and not self.stop.is_set():
@@ -7418,6 +7644,8 @@ def _(
             if threads:
                 now.append("Benang terbuka:\n" + "\n".join(THREADS.line(r) for r in threads[:12]))
             instr = STATE_CHECK.format(done="\n".join(done_lines) or "- (belum ada)", now="\n".join(now))
+            if self.prompt.narration_lang(c):
+                instr += f"\nTulis isi catatan dalam bahasa {self.prompt.narration_lang(c)}."
             if unmet:
                 instr += (f"\nPertemuan pertama dengan pemain mungkin terjadi di giliran ini: {', '.join(unmet)}. Untuk tiap tokoh yang "
                           "benar-benar bertemu atau berinteraksi dengan pemain di narasi, catat knowledge_add kind 'kenalan' (who: tokoh "
@@ -8066,6 +8294,8 @@ def _(
             t1 = t0 + timedelta(minutes=minutes)
             instr = TICK_INSTRUCTION.format(span=World.fmt_span(minutes), t0=World.fmt_time(t0), t1=World.fmt_time(t1), why=why)
             instr += "\nPakai hanya world_event, status_update, tell, knowledge_add, roll, thread_open, dan thread_close."
+            if self.prompt.narration_lang(c):
+                instr += f" Tulis teks kejadian dan catatan dalam bahasa {self.prompt.narration_lang(c)}."
             top = [ch["name"] for ch in c["cards"]["character"] if self.prompt.fame(ch) in TOP_FAME]
             if top:
                 instr += ("\nTokoh paling dikenal: " + ", ".join(top[:15]) + ". Agenda mereka didahulukan, dan mereka sering jadi "
@@ -8148,7 +8378,9 @@ def _(
                     try:
                         self.last_used[chat_id] = self.compactor.maybe(chat_id, self.tools.specs(c), self.tools,
                                                                        lambda m: self.emit("status", m + note), force=False,
-                                                                       threshold=self.IDLE_COMPACT_AT, clear_cancel=False)
+                                                                       threshold=self.IDLE_COMPACT_AT, clear_cancel=False,
+                                                                       reserve=self._default_max_tokens(c))
+                        self._compaction_note(chat_id)
                     except Exception as e:
                         self.compact_backoff[chat_id] = time.time() + 15 * 60
                         self.store.side_log("compaction_error", {"error": f"{type(e).__name__}: {e}"}, chat_id)
@@ -8289,7 +8521,8 @@ def _(
 
         def _learn(self, chat_id, text):
             c = self.prompt.ctx(chat_id)
-            lang = self.prompt.style(c).get("target_lang") or "asing"
+            code = Lang.code(c["cards"])
+            lang = Lang.LABEL.get(code) or self.prompt.style(c).get("target_lang") or "a foreign language"
             acc = self.llm.complete(self.prompt.side(chat_id, LEARN_INSTRUCTION.format(lang=lang, text=text)),
                                     kwargs=self.prompt.kwargs(c), sampling={"temperature": 0.3}, max_tokens=6000,
                                     tools=self.tools.specs(c), stop=self.stop)
@@ -8764,11 +8997,13 @@ def _():
         const preset = (get("boot").presets || []).find((x) => x.name === s.preset);
         const lvl = (c.settings || {}).thinking || (preset ? preset.thinking[preset.thinking.length - 1] : "");
         const pct = ctx.max ? Math.min(100, (ctx.used / ctx.max) * 100) : 0;
+        const ctxTitle = ctx.max ? `prompt ${fmtN(ctx.used)} / ${fmtN(ctx.max)} token${ctx.reserve ? ` · ruang jawaban ${fmtN(ctx.reserve)}` : ""} · compaction otomatis di ${Math.round((ctx.at || 0.8) * 100)}%` : "";
         $(".qr-chips").innerHTML = `
           <button class="qr-chip" data-act="open-tab" data-tab="model" title="${esc(s.preset || "")}"><i class="qr-dot ${phaseCls}"></i>${esc(short)}${s.ctx ? ` · ${Math.round(s.ctx / 1024)}K` : ""}</button>
           ${lvl ? `<span class="qr-chip qr-ghost" title="Level thinking">${icon("brain")}${esc(lvl)}</span>` : ""}
-          ${ctx.max ? `<span class="qr-chip qr-ghost" title="${fmtN(ctx.used)} / ${fmtN(ctx.max)} token · compaction otomatis di 90%">${pct.toFixed(0)}%</span>` : ""}
-          ${p.time ? `<span class="qr-chip qr-ghost" title="Jam dunia">${icon("clock")}${esc(p.time)}</span>` : ""}`;
+          ${ctx.max ? `<span class="qr-chip qr-ghost" title="${esc(ctxTitle)}">${pct.toFixed(0)}%</span>` : ""}
+          ${p.time ? `<span class="qr-chip qr-ghost" title="Jam dunia">${icon("clock")}${esc(p.time)}</span>` : ""}
+          ${p.lang ? `<span class="qr-chip qr-ghost" title="Level ${esc(p.lang.label)} tokohmu; naik saat kamu bermain">${icon("book")}${esc(p.lang.label)} ${esc(p.lang.band)} · ${p.lang.value}</span>` : ""}`;
         $(".qr-ctxfill").style.width = `${pct}%`;
         $(".qr-ctxfill").classList.toggle("warn", pct > 85);
         const note = (c.settings || {}).note;

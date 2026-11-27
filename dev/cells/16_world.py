@@ -445,5 +445,68 @@ class Relations:
         return "sangat dekat"
 
 
+class Lang:
+    """The player character's level in the story's target language (Style: target_lang): the Persona's skill row for
+    that language, plus what play earned (writing it, rolls in it, weeks lived among it). The level sets how long and
+    how hard the other characters' lines in that language are. Every such line is always translated."""
+
+    NAMES = {"de": ("jerman", "german", "deutsch"), "fr": ("prancis", "french", "français", "francais"),
+             "es": ("spanyol", "spanish", "español", "espanol"), "nl": ("belanda", "dutch", "nederlands"),
+             "it": ("italia", "italian", "italiano"), "ja": ("jepang", "japanese"), "en": ("inggris", "english")}
+    LABEL = {"de": "German", "fr": "French", "es": "Spanish", "nl": "Dutch", "it": "Italian", "ja": "Japanese",
+             "en": "English"}
+    # (up to this value, band, words per line from-to, what the lines may hold)
+    BANDS = [(20, "A1", 3, 6, "kata sehari-hari, kalimat present sederhana"),
+             (40, "A2", 5, 10, "Perfekt, tanya-jawab sederhana"),
+             (60, "B1", 8, 15, "kalimat majemuk (weil, dass, wenn), sedikit idiom"),
+             (80, "B2", 12, 25, "tempo normal, idiom, dialek ringan"),
+             (100, "C1", 15, 40, "seperti penutur asli, boleh slang")]
+    DEFAULT_BASE = 40
+    XP_FIELD = "_lang_xp"
+    WEEK_XP = 3
+
+    @classmethod
+    def code(cls, cards):
+        raw = str((((cards or {}).get("style") or {}).get("data") or {}).get("target_lang") or "").strip().lower()
+        if not raw:
+            return ""
+        if raw in cls.NAMES:
+            return raw
+        return next((k for k, names in cls.NAMES.items() if any(n in raw for n in names)), raw if len(raw) == 2 else "")
+
+    @classmethod
+    def is_skill(cls, skill, code):
+        s = str(skill or "").lower()
+        return bool(code) and any(n in s for n in cls.NAMES.get(code, ()))
+
+    @classmethod
+    def band(cls, value):
+        return next(b for b in cls.BANDS if value <= b[0] or b is cls.BANDS[-1])
+
+    @classmethod
+    def of(cls, cards, st, start):
+        code = cls.code(cards)
+        if not code:
+            return None
+        rows = (((cards.get("persona") or {}).get("data") or {}).get("skill_levels")) or []
+        row = next((r for r in rows if r and cls.is_skill(r[0], code)), None)
+        try:
+            base = float(str(row[1]).replace(",", ".")) if row and len(row) > 1 else cls.DEFAULT_BASE
+        except ValueError:
+            base = cls.DEFAULT_BASE
+        xp = float(((st["status"].get("player") or {}).get(cls.XP_FIELD)) or 0)
+        weeks = max(0, int((st["time"] - start).total_seconds() // (7 * 86400)))
+        value = max(0.0, min(100.0, base + xp + cls.WEEK_XP * weeks))
+        _, band, lo, hi, desc = cls.band(value)
+        return {"code": code, "label": cls.LABEL.get(code, code), "base": base, "xp": xp, "weeks": weeks,
+                "value": int(round(value)), "band": band, "lo": lo, "hi": hi, "desc": desc}
+
+    @classmethod
+    def gain(cls, world, chat_id, mid, st, points, reason):
+        """Add points on the branch through mid (a reroll takes them back with the reply)."""
+        cur = float(((st["status"].get("player") or {}).get(cls.XP_FIELD)) or 0)
+        world.add_event(chat_id, mid, "player", cls.XP_FIELD, round(cur + points, 2), "set", reason)
+
+
 RELATIONS = Relations(STORE)
 WORLD = World(STORE, CARDS, STORIES)

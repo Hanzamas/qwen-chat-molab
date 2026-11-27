@@ -75,9 +75,10 @@ Sumber ({source}):
 Apakah klaim itu benar menurut sumber? Jawab HANYA JSON:
 {{"verdict": "benar" | "salah" | "tidak pasti", "correction": "koreksi singkat kalau salah", "fact": "fakta yang benar, satu kalimat"}}"""
 
-LEARN_INSTRUCTION = """Jelaskan kalimat berikut untuk pelajar bahasa {lang}. Jawab HANYA JSON:
-{{"translation": "...", "grammar": ["poin tata bahasa singkat", "..."], "vocab": [{{"term": "...", "translation": "...", "note": "..."}}]}}
-Kalimat: {text}"""
+LEARN_INSTRUCTION = """Explain the sentence below for a learner of {lang}. Write everything in English. Answer ONLY JSON:
+{{"translation": "English translation", "grammar": ["short grammar point in English", "..."],
+"vocab": [{{"term": "...", "translation": "English", "note": "short note in English"}}]}}
+Sentence: {text}"""
 
 RECALL_QUESTIONS = """Dari potongan percakapan berikut, buat {n} pertanyaan tentang detail spesifik (nama, angka, kejadian, ucapan)
 beserta jawabannya. Jawab HANYA JSON: {{"qa": [{{"q": "...", "a": "..."}}]}}
@@ -490,6 +491,9 @@ class Engine(EngineView):
         avoid = c["settings"].get("avoid") or []
         if avoid and not turn["ooc"]:
             extra.append("Hindari frasa yang sudah berulang ini: " + "; ".join(f'"{p}"' for p in avoid[:8]))
+        fix = c["settings"].get("lang_fix") or {}
+        if fix.get("text") and not turn["ooc"]:
+            extra.append(fix["text"])
         openers = c["settings"].get("openers") or []
         if openers and not turn["ooc"]:
             extra.append("Variasikan pembuka balasan. Balasan terakhir dimulai dengan pola yang sama seperti sebelumnya ("
@@ -497,18 +501,20 @@ class Engine(EngineView):
         error, state = None, None
         seen_calls, fails_in_row = {}, 0
         try:
+            reserve = self._default_max_tokens(c)
             used = self.compactor.maybe(chat_id, tools, self.tools, phase, last_used=self.last_used.get(chat_id, 0),
-                                        pending_estimate=pending_estimate, clear_cancel=not self.stop.is_set())
+                                        pending_estimate=pending_estimate, clear_cancel=not self.stop.is_set(), reserve=reserve)
             if used:
                 self.last_used[chat_id] = used
+            self._compaction_note(chat_id)
             phase("")
             _round = -1
             while True:
                 _round += 1
                 if _round:
                     # Many rounds of tool results can fill the context: compact older history between rounds too.
-                    used = self.compactor.maybe(chat_id, tools, self.tools, phase,
-                                                last_used=self.last_used.get(chat_id, 0), clear_cancel=not self.stop.is_set())
+                    used = self.compactor.maybe(chat_id, tools, self.tools, phase, last_used=self.last_used.get(chat_id, 0),
+                                                clear_cancel=not self.stop.is_set(), reserve=reserve)
                     if used:
                         self.last_used[chat_id] = used
                     phase("")
@@ -631,10 +637,47 @@ class Engine(EngineView):
                 self._queue_offscreen(chat_id, c)
             except Exception:
                 pass
+        # What the next request will hold: the server's total also counted the thinking just written, which the next
+        # prompt drops; the screen and the compaction trigger use the same number.
+        try:
+            self.last_used[chat_id] = self.compactor.measure(chat_id, tools)
+        except Exception:
+            pass
         self.emit("history", chat_id)
         self.emit("panels", chat_id)
-        self.emit("ctx", {"used": self.last_used.get(chat_id, 0), "max": self.llm.max_context()})
+        self.emit("ctx", {"used": self.last_used.get(chat_id, 0), "max": self.llm.max_context(),
+                          "reserve": self._default_max_tokens(c), "at": self.compactor.COMPACT_AT})
         return error
+
+    def _lang_points(self, chat_id, mid, c, lv):
+        """Points for the target language: the player wrote in it this turn (+1, once per player message). A level-up
+        (from points, rolls or weeks of world time) is announced once."""
+        m = self.store.msg(mid) or {}
+        if not (m.get("meta") or {}).get("seg_after"):  # a group round: only the first reply to the message counts
+            u = self._turn_user(chat_id, mid) or {}
+            text = u.get("content") or ""
+            mine = TXT.dialogue_lines(text, lv["code"])
+            if any(n >= 3 for n, _ in mine) or (TXT.lang_of(text) == lv["code"] and len(TXT.words(text)) >= 4):
+                Lang.gain(self.world, chat_id, mid, self.world.state(chat_id, self.store.path_ids(chat_id)), 1,
+                          "menulis bahasa target")
+        st = self.world.state(chat_id, self.store.path_ids(chat_id))
+        now = Lang.of(c["cards"], st, self.world.start_time(c["cards"]))
+        before = (self.store.chat(chat_id) or {}).get("settings", {}).get("lang_band") or lv["band"]  # lv: this turn's start
+        if now and before != now["band"]:
+            self.store.chat_settings(chat_id, lang_band=now["band"])
+            order = [b[1] for b in Lang.BANDS]
+            if before in order and order.index(now["band"]) > order.index(before):
+                self.emit("notice", {"chat_id": chat_id, "text": f"Your {now['label']} improved to {now['band']} "
+                                                                 f"({now['value']}/100)."})
+
+    def _compaction_note(self, chat_id):
+        """Say once why compaction could not run (instead of a full context with no word)."""
+        note = getattr(self.compactor, "last_note", "")
+        seen = getattr(self, "_compact_notes", {})
+        self._compact_notes = seen
+        if note and seen.get(chat_id) != note:
+            self.emit("toast", {"text": note, "kind": "warn", "long": True})
+        seen[chat_id] = note
 
     def _default_max_tokens(self, c):
         """Room for the answer plus the thinking budget of the chat's level (max_tokens covers both)."""
@@ -782,11 +825,40 @@ class Engine(EngineView):
         banned = TXT.banned_hits(full, self.prompt.style(c).get("banned") or [])
         if banned:
             flags.append({"kind": "banned", "text": "Frasa terlarang: " + ", ".join(banned)})
-        lang = (self.prompt.style(c).get("narration_lang") or "Indonesia").lower()
+        narr = self.prompt.narration_lang(c) or "Indonesia"
+        lang = narr.lower()
         expected = "id" if lang.startswith(("indo", "id")) else "de" if lang.startswith(("jer", "deu", "ger", "de")) else "en"
         dom, shares = TXT.narration_language(full, expected)
+        rewrite_lang = None
+        fixes = []
         if dom != expected and shares.get(dom, 0) > 0.5:
             flags.append({"kind": "language", "text": f"Narasi tampaknya berbahasa {dom}, bukan {expected}."})
+            fixes.append(f"Narasi giliran sebelumnya tidak dalam bahasa {narr}. Tulis narasi dalam bahasa {narr}.")
+            counted = sum(1 for x in TXT.words(full) if any(x in s for s in TXT.STOP.values()))
+            if counted >= 15:
+                rewrite_lang = (f"Jawaban sebelumnya tidak ditulis dalam bahasa {narr}. Tulis ulang giliran ini: narasi dalam "
+                                f"bahasa {narr}; ucapan tokoh dalam bahasa asing tetap dalam bahasanya, dengan terjemahan {narr}.")
+        lv = used.get("lang")
+        if lv:
+            lines_ = TXT.dialogue_lines(full, lv["code"])
+            if len(lines_) >= 2 and sum(n for n, _ in lines_) / len(lines_) < lv["lo"] * 0.8:
+                avg = sum(n for n, _ in lines_) / len(lines_)
+                flags.append({"kind": "lang_short", "text": f"Dialog {lv['label']} terlalu pendek untuk {lv['band']} "
+                                                            f"(rata-rata {avg:.0f} kata, target {lv['lo']}-{lv['hi']})."})
+                fixes.append(f"Ucapan {lv['label']} giliran sebelumnya terlalu pendek untuk tingkat {lv['band']}: kalimatnya "
+                             f"harus {lv['lo']}-{lv['hi']} kata.")
+            missing = sum(1 for _, tr in lines_ if not tr)
+            if missing:
+                flags.append({"kind": "lang_untranslated", "text": f"{missing} kalimat {lv['label']} tanpa terjemahan."})
+                fixes.append(f"Ada kalimat {lv['label']} tanpa terjemahan di giliran sebelumnya: terjemahkan SETIAP kalimat.")
+            self._lang_points(chat_id, mid, c, lv)
+        prev_fix = (self.store.chat(chat_id) or {}).get("settings", {}).get("lang_fix") or {}
+        if fixes:
+            self.store.chat_settings(chat_id, lang_fix={"text": " ".join(fixes), "left": 3})
+        elif prev_fix.get("left", 0) > 1:
+            self.store.chat_settings(chat_id, lang_fix={**prev_fix, "left": prev_fix["left"] - 1})
+        elif prev_fix:
+            self.store.chat_settings(chat_id, lang_fix=None)
         if TXT.split_dialogue(full) >= 3:
             flags.append({"kind": "split", "text": "Dialog tampak terpecah per kata dengan terjemahan pendek."})
         persona = (c["cards"].get("persona") or {}).get("name", "")
@@ -796,6 +868,12 @@ class Engine(EngineView):
                                                            + "; ".join(acts[:3])})
         m["meta"]["flags"] = flags
         self.store.update_message(mid, meta=m["meta"])
+        if rewrite_lang and not getattr(self, "_rewriting", False) and not self.stop.is_set() \
+                and os.environ.get("QCHAT_LANG_REWRITE", "1") != "0":
+            self.emit("toast", {"text": f"Narasi bukan bahasa {narr}; giliran ditulis ulang. Versi lama bisa digeser.",
+                                "kind": "warn"})
+            self._rewrite(chat_id, mid, rewrite_lang)
+            return
         # choices (game format)
         gm = self.prompt.gm(c)
         if gm.get("format") == "game" and gm.get("choices", "kadang") != "tidak" and not self.stop.is_set():
@@ -894,6 +972,8 @@ class Engine(EngineView):
         if threads:
             now.append("Benang terbuka:\n" + "\n".join(THREADS.line(r) for r in threads[:12]))
         instr = STATE_CHECK.format(done="\n".join(done_lines) or "- (belum ada)", now="\n".join(now))
+        if self.prompt.narration_lang(c):
+            instr += f"\nTulis isi catatan dalam bahasa {self.prompt.narration_lang(c)}."
         if unmet:
             instr += (f"\nPertemuan pertama dengan pemain mungkin terjadi di giliran ini: {', '.join(unmet)}. Untuk tiap tokoh yang "
                       "benar-benar bertemu atau berinteraksi dengan pemain di narasi, catat knowledge_add kind 'kenalan' (who: tokoh "
@@ -1542,6 +1622,8 @@ class Engine(EngineView):
         t1 = t0 + timedelta(minutes=minutes)
         instr = TICK_INSTRUCTION.format(span=World.fmt_span(minutes), t0=World.fmt_time(t0), t1=World.fmt_time(t1), why=why)
         instr += "\nPakai hanya world_event, status_update, tell, knowledge_add, roll, thread_open, dan thread_close."
+        if self.prompt.narration_lang(c):
+            instr += f" Tulis teks kejadian dan catatan dalam bahasa {self.prompt.narration_lang(c)}."
         top = [ch["name"] for ch in c["cards"]["character"] if self.prompt.fame(ch) in TOP_FAME]
         if top:
             instr += ("\nTokoh paling dikenal: " + ", ".join(top[:15]) + ". Agenda mereka didahulukan, dan mereka sering jadi "
@@ -1624,7 +1706,9 @@ class Engine(EngineView):
                 try:
                     self.last_used[chat_id] = self.compactor.maybe(chat_id, self.tools.specs(c), self.tools,
                                                                    lambda m: self.emit("status", m + note), force=False,
-                                                                   threshold=self.IDLE_COMPACT_AT, clear_cancel=False)
+                                                                   threshold=self.IDLE_COMPACT_AT, clear_cancel=False,
+                                                                   reserve=self._default_max_tokens(c))
+                    self._compaction_note(chat_id)
                 except Exception as e:
                     self.compact_backoff[chat_id] = time.time() + 15 * 60
                     self.store.side_log("compaction_error", {"error": f"{type(e).__name__}: {e}"}, chat_id)
@@ -1765,7 +1849,8 @@ class Engine(EngineView):
 
     def _learn(self, chat_id, text):
         c = self.prompt.ctx(chat_id)
-        lang = self.prompt.style(c).get("target_lang") or "asing"
+        code = Lang.code(c["cards"])
+        lang = Lang.LABEL.get(code) or self.prompt.style(c).get("target_lang") or "a foreign language"
         acc = self.llm.complete(self.prompt.side(chat_id, LEARN_INSTRUCTION.format(lang=lang, text=text)),
                                 kwargs=self.prompt.kwargs(c), sampling={"temperature": 0.3}, max_tokens=6000,
                                 tools=self.tools.specs(c), stop=self.stop)

@@ -293,6 +293,10 @@ class ToolBox:
                 base = float(str(hit[1]).replace(",", ".")) / 100 if hit and len(hit) > 1 else 0.4
             except ValueError:
                 base = 0.4
+            lv = Lang.of(cards, self.world.state(chat_id, self.store.path_ids(chat_id)), self.world.start_time(cards)) \
+                if holder == "player" and cards else None
+            if lv and Lang.is_skill(skill, lv["code"]):  # the language level grows in play: the dice use the grown one
+                base, hit = lv["value"] / 100, [f"{lv['label']} {lv['band']}"]
             why.append(f"{hit[0]} {base:.0%}" if hit else f"{skill}: tidak terlatih 40%")
             mod = self.DIFFICULTY.get(difficulty or "sedang", 0.0)
             if mod:
@@ -334,6 +338,10 @@ class ToolBox:
     def t_roll(self, chat_id, mid, event, odds=None, skill="", difficulty="sedang", who="player"):
         p, why = self.roll_odds(chat_id, self._holder(chat_id, who) or "player", skill, difficulty, odds)
         r = self.world.roll(chat_id, mid, event, p)
+        cards = self._story(chat_id)[1] or {}
+        if skill and (self._holder(chat_id, who) or "player") == "player" and Lang.is_skill(skill, Lang.code(cards)):
+            Lang.gain(self.world, chat_id, mid, self.world.state(chat_id, self.store.path_ids(chat_id)),
+                      2 if r["success"] else 0.5, "roll bahasa")
         verdict = "BERHASIL" if r["success"] else "GAGAL"
         return {**r, "why": why, "result": f"{verdict} (peluang {r['odds']:.0%}: {', '.join(why)}). Hasil ini wajib diikuti."}
 

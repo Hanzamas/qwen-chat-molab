@@ -30,7 +30,8 @@ Pertahankan format (## Inti, ## Tujuan dan preferensi, ## Tokoh dan status, ## K
 
 
 class Compactor:
-    COMPACT_AT = 0.90
+    COMPACT_AT = 0.80
+    FULL_AT = 0.95  # prompt plus the room the reply needs (thinking + text) must stay under this share of the window
     TARGET = 0.60
     KEEP_USER_TURNS = 3
     KEEP_TAIL = 0.25  # share of the context window kept as verbatim recent turns
@@ -65,7 +66,7 @@ class Compactor:
         return self.llm.tokenize(msgs, tools, self.prompt.kwargs(c))
 
     def maybe(self, chat_id, tools, toolbox, phase=lambda m: None, force=False, threshold=None, last_used=0,
-              pending_estimate=0, clear_cancel=True):
+              pending_estimate=0, clear_cancel=True, reserve=0):
         """Compact when the prompt passes the threshold (or always with force). Returns the token count after.
         clear_cancel: a run started by the player resets the cancel flag once it holds the lock; the idle run
         leaves it alone, so a message sent meanwhile still stops it."""
@@ -75,10 +76,12 @@ class Compactor:
         threshold = threshold or self.COMPACT_AT
         # Tokenizing a long history costs time: skip only when the last count plus what is about to be added
         # (a big attachment, say) is still well below the threshold.
-        if not force and last_used and last_used + pending_estimate < 0.7 * maxc:
+        self.last_note = ""
+        if not force and last_used and last_used + pending_estimate + reserve < min(0.7, threshold - 0.05) * maxc:
             return last_used
         used = self.measure(chat_id, tools) + pending_estimate
-        if not force and used < threshold * maxc:
+        # Fire at the threshold, or earlier when the reply (thinking + text) would not fit next to the prompt.
+        if not force and used < threshold * maxc and used + reserve <= self.FULL_AT * maxc:
             return used
         with self.lock:
             if clear_cancel:
@@ -105,18 +108,23 @@ class Compactor:
                 if s["node_id"] in ids]
         done_pos = max((ids.index(s["node_id"]) for s in sums), default=-1)
         users_after = [u for u in users if u > done_pos]
-        if len(users_after) <= self.KEEP_USER_TURNS:
+        # A group chat answers one player message with many replies: keeping one player turn whole is enough there.
+        keep = 1 if (chat or {}).get("kind") == "group" else self.KEEP_USER_TURNS
+        if len(users_after) <= keep:
+            self.last_note = (f"Compaction skipped: only {len(users_after)} player message(s) since the last summary; "
+                              f"it runs after {keep + 1}.")
             return used
         # Verbatim tail: at least KEEP_USER_TURNS turns and about KEEP_TAIL of the window, so voices, language and
         # rhythm carry over (only older turns become summaries). Never so much that nothing can be summarized.
         size = lambda i: self.llm.estimate([{"content": path[i]["content"], "reasoning_content": ""}])
-        k = self.KEEP_USER_TURNS
+        k = keep
         tail = sum(size(i) for i in range(users_after[-k], len(path)))
         while k + 1 < len(users_after) and tail < self.KEEP_TAIL * maxc:
             k += 1
             tail += sum(size(i) for i in range(users_after[-k], users_after[-k + 1]))
         cutoff = users_after[-k] - 1
         if cutoff <= done_pos:
+            self.last_note = "Compaction skipped: everything older is already summarized; the recent turns stay whole."
             return used
         label = f"Menyimpan memory sebelum memadatkan pesan {done_pos + 2}–{cutoff + 1}…"
         phase(label)
@@ -185,7 +193,9 @@ class Compactor:
         return out
 
     def flush(self, chat_id, path, toolbox, a, b, on_delta=None):
-        msgs = self.prompt.side(chat_id, FLUSH_INSTRUCTION.format(a=a, b=b), path=path)
+        narr = self.prompt.narration_lang(self.prompt.ctx(chat_id))
+        msgs = self.prompt.side(chat_id, FLUSH_INSTRUCTION.format(a=a, b=b) + (f"\nTulis isi catatan dalam bahasa {narr}." if narr else ""),
+                                path=path)
         c = self.prompt.ctx(chat_id)
         head = path[-1]["id"] if path else None
         allowed = {"canon_set", "memory_save", "memory_update", "memory_forget", "status_update", "fact_save", "world_event",
@@ -215,6 +225,9 @@ class Compactor:
         anchors = "\n".join(f"{i + 1}: {path[i]['content'][:80].replace(chr(10), ' ')}"
                             for i in range(a, b + 1) if path[i]["role"] == "user")
         instr = SUMMARY_INSTRUCTION.format(a=a + 1, b=b + 1, words=int(budget * 0.55), anchors=anchors[:6000])
+        narr = self.prompt.narration_lang(self.prompt.ctx(chat_id))
+        if narr:
+            instr += f"\nTulis ringkasan dalam bahasa {narr}; kutipan dialog tetap persis dalam bahasa aslinya."
         c = self.prompt.ctx(chat_id)
         maxc = self.llm.max_context() or 0
         # Same prefix as the chat (cache hits). If history + the answer would not fit, only the piece goes in.

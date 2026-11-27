@@ -327,12 +327,31 @@ class Prompt:
 
     VOLATILE = {"mood": 2, "plan_now": 6}  # world hours after which a recorded value may be out of date
 
+    def narration_lang(self, c):
+        return (self.style(c).get("narration_lang") or "").strip()
+
+    def lang_lines(self, c, st):
+        """Narration language and the target-language level for the note. Returns (lines, level or None)."""
+        narr = self.narration_lang(c)
+        lines = []
+        if narr:
+            lines.append(f"Bahasa: narasi wajib bahasa {narr}, apa pun bahasa pesan pemain. Catatan yang kamu simpan "
+                         f"(canon_set, memory) juga dalam bahasa {narr}.")
+        lv = Lang.of(c["cards"], st, self.world.start_time(c["cards"]))
+        if lv:
+            tr = narr or "bahasa narasi"
+            lines.append(f"Setiap kalimat {lv['label']} ditulis utuh dalam tanda kutip lalu SELALU diterjemahkan ke {tr} satu "
+                         f"kali dalam kurung tepat setelahnya, berapa pun tingkatnya. Tingkat {lv['label']} tokoh pemain: "
+                         f"{lv['band']} ({lv['value']}/100). Ucapan {lv['label']} tokoh lain kepadanya: kalimat {lv['lo']}-"
+                         f"{lv['hi']} kata, {lv['desc']}; jangan menyederhanakan di bawah tingkat ini.")
+        return lines, lv
+
     def status_json(self, fields, seen, now):
         """Status as JSON. Mood and plans recorded long ago (world time) carry their age, so an old mood is not played
         as the current one."""
         out = {}
         for k, v in fields.items():
-            if v in (None, "", [], {}):
+            if v in (None, "", [], {}) or str(k).startswith("_"):  # _fields are the system's own bookkeeping
                 continue
             t, hrs = (seen or {}).get(k), self.VOLATILE.get(k)
             if hrs and t and (now - t).total_seconds() >= hrs * 3600:
@@ -483,6 +502,10 @@ class Prompt:
             else:
                 lines.append("Pengetahuan tokoh, benang cerita, dan hubungan yang tidak sempat kamu catat akan dilengkapi "
                              "pemeriksa setelah giliran; utamakan narasi. Waktu, dadu, dan status tetap catat sendiri.")
+        lang_lines, lv = self.lang_lines(c, st)
+        lines += lang_lines
+        if lv:
+            used["lang"] = lv
         tgt = self.length_target(c) if length is None else (length or None)
         if tgt:
             total = tgt["paragraphs"] * (tgt["sent_lo"] + tgt["sent_hi"]) // 2

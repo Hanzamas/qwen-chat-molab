@@ -227,6 +227,26 @@ class TXT:
         dominant = max(shares, key=shares.get) if w else expected
         return dominant, shares
 
+    QUOTE = re.compile(r"[\"“„«]([^\"”“»\n]{1,500})[\"”“»]")
+
+    @staticmethod
+    def lang_of(text):
+        """The language with the most stopwords in the text ('' when none is seen)."""
+        w = TXT.words(text)
+        counts = {lang: sum(1 for x in w if x in stop) for lang, stop in TXT.STOP.items()}
+        best = max(counts, key=counts.get) if w else ""
+        return best if counts.get(best) else ""
+
+    @staticmethod
+    def dialogue_lines(text, lang):
+        """Quoted lines in `lang`: (word count, translated) each; translated = a parenthesis follows right after."""
+        out = []
+        for m in TXT.QUOTE.finditer(text or ""):
+            if TXT.lang_of(m.group(1)) != lang:
+                continue
+            out.append((len(TXT.words(m.group(1))), bool(re.match(r"\s*\(", (text or "")[m.end():m.end() + 6]))))
+        return out
+
     @staticmethod
     def split_dialogue(text):
         """Count quote fragments followed by a short translation: the "Das..." (Itu) "...ist..." pattern.
@@ -241,13 +261,15 @@ class TXT:
     ACTS_FOR_USER = re.compile(
         r"\b(kamu|Kamu|anda|Anda)\s+(berkata|bilang|menjawab|bertanya|berteriak|berbisik|mengatakan|memutuskan|"
         r"setuju|tersenyum dan berkata)\b|\b(katamu|ucapmu|jawabmu|tanyamu|bisikmu|teriakmu)\b|"
-        r"\byou (say|said|reply|replied|ask|asked|decide|decided)\b", re.I)
+        r"\byou (say|said|reply|replied|ask|asked|decide|decided|answer|answered|shout|shouted|whisper|whispered|"
+        r"agree|agreed|promise|promised|tell|told)\b", re.I)
 
     @staticmethod
     def acts_for_user(text, persona_name=""):
         hits = [m.group(0) for m in TXT.ACTS_FOR_USER.finditer(text or "")]
         if persona_name:
-            hits += re.findall(rf"\b{re.escape(persona_name)}\s+(?:berkata|menjawab|bertanya|says|said)\b", text or "")
+            hits += re.findall(rf"\b{re.escape(persona_name)}\s+(?:berkata|menjawab|bertanya|says|said|replies|replied|asks|"
+                               rf"asked|answers|answered)\b", text or "")
         return hits
 
     # ---------- user input ----------

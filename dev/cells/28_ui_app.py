@@ -200,11 +200,13 @@ function render({ model, el }) {
     const preset = (get("boot").presets || []).find((x) => x.name === s.preset);
     const lvl = (c.settings || {}).thinking || (preset ? preset.thinking[preset.thinking.length - 1] : "");
     const pct = ctx.max ? Math.min(100, (ctx.used / ctx.max) * 100) : 0;
+    const ctxTitle = ctx.max ? `prompt ${fmtN(ctx.used)} / ${fmtN(ctx.max)} token${ctx.reserve ? ` · ruang jawaban ${fmtN(ctx.reserve)}` : ""} · compaction otomatis di ${Math.round((ctx.at || 0.8) * 100)}%` : "";
     $(".qr-chips").innerHTML = `
       <button class="qr-chip" data-act="open-tab" data-tab="model" title="${esc(s.preset || "")}"><i class="qr-dot ${phaseCls}"></i>${esc(short)}${s.ctx ? ` · ${Math.round(s.ctx / 1024)}K` : ""}</button>
       ${lvl ? `<span class="qr-chip qr-ghost" title="Level thinking">${icon("brain")}${esc(lvl)}</span>` : ""}
-      ${ctx.max ? `<span class="qr-chip qr-ghost" title="${fmtN(ctx.used)} / ${fmtN(ctx.max)} token · compaction otomatis di 90%">${pct.toFixed(0)}%</span>` : ""}
-      ${p.time ? `<span class="qr-chip qr-ghost" title="Jam dunia">${icon("clock")}${esc(p.time)}</span>` : ""}`;
+      ${ctx.max ? `<span class="qr-chip qr-ghost" title="${esc(ctxTitle)}">${pct.toFixed(0)}%</span>` : ""}
+      ${p.time ? `<span class="qr-chip qr-ghost" title="Jam dunia">${icon("clock")}${esc(p.time)}</span>` : ""}
+      ${p.lang ? `<span class="qr-chip qr-ghost" title="Level ${esc(p.lang.label)} tokohmu; naik saat kamu bermain">${icon("book")}${esc(p.lang.label)} ${esc(p.lang.band)} · ${p.lang.value}</span>` : ""}`;
     $(".qr-ctxfill").style.width = `${pct}%`;
     $(".qr-ctxfill").classList.toggle("warn", pct > 85);
     const note = (c.settings || {}).note;

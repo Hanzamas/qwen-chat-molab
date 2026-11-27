@@ -33,13 +33,15 @@ class Cards:
         for t, name, data in DEFAULT_CARDS:
             if not self.store.one("SELECT id FROM cards WHERE type = ? LIMIT 1", (t,)):
                 self.save(None, t, data, name=name)
-        if self.store.meta_get("defaults_v2") is None:
-            for t, name, key, old, new in DEFAULTS_CHANGED:
+        for flag, changes in DEFAULTS_CHANGED.items():
+            if self.store.meta_get(flag) is not None:
+                continue
+            for t, name, key, old, new in changes:
                 for r in self.store.q("SELECT id FROM cards WHERE type = ? AND name = ?", (t, name)):
                     c = self.get(r["id"])
                     if c and str(c["data"].get(key, "")).strip() == old:
                         self.save(c["id"], t, {**c["data"], key: new})  # a new version: the old one stays restorable
-            self.store.meta_set("defaults_v2", "1")
+            self.store.meta_set(flag, "1")
 
     def schema(self, type_):
         row = self.store.one("SELECT json FROM card_schemas WHERE type = ?", (type_,))

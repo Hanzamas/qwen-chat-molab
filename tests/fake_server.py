@@ -80,7 +80,7 @@ def _reply(body):
         return {"content": json.dumps({"qa": [{"q": "Siapa yang membuka jendela?", "a": "Lotte"}]})}
     if "Uji ingatan" in text:
         return {"content": json.dumps({"answers": ["Lotte"]})}
-    if "Jelaskan kalimat" in text:
+    if "Jelaskan kalimat" in text or "Explain the sentence below" in text:
         return {"content": json.dumps({"translation": "Hari ini dingin.", "grammar": ["es ist = itu adalah"],
                                        "vocab": [{"term": "kalt", "translation": "dingin", "note": "adjektiva"}]})}
     if "draf pesan berikutnya" in text:

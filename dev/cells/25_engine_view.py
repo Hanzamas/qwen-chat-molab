@@ -102,7 +102,8 @@ class EngineView:
                 "location": player.get("location") or ((c["cards"].get("scenario") or {}).get("data") or {}).get("start_location", ""),
                 "stats": [{"key": s["key"], "label": s["label"], "value": s["value"], "min": s["min"], "max": s["max"],
                            "change": s["change"]} for s in st["stats"]],
-                "status": {k: v for k, v in player.items() if k != "location"},
+                "status": {k: v for k, v in player.items() if k != "location" and not str(k).startswith("_")},
+                "lang": self._lang_panel(c, st),
                 "characters": self._observable(self.world.with_schedule(st, c["cards"]), player.get("location")),
                 "gm_view": bool(chat["settings"].get("gm_view")),
                 "relations": [{"who": a, "score": v["score"], "word": Relations.word(v["score"]), "last": v["last"]}
@@ -112,6 +113,10 @@ class EngineView:
                                                                      "new": not e["shown"]} for e in events],
                 "time_skips": gm.get("time_skips") or ["2 jam", "1 hari", "1 minggu"], "persona": persona["name"] if persona else "",
                 "story": (c["story"] or {}).get("title", "")}
+
+    def _lang_panel(self, c, st):
+        lv = Lang.of(c["cards"], st, self.world.start_time(c["cards"]))
+        return {k: lv[k] for k in ("label", "band", "value")} if lv else None
 
     # What can be seen of someone in the same place. Plans, attitudes, what they know and carry stay hidden.
     OBSERVABLE = ("outfit", "mood", "injuries", "keadaan")

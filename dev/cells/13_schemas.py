@@ -155,16 +155,25 @@ DEFAULT_SCHEMAS = {
     ]},
 }
 
-# Default values that changed: a default card still holding the old value moves to the new one, once per database.
-DEFAULTS_CHANGED = [("style", "Gaya RP default", "paragraphs", "5-10", "4-7"),
+DIALOGUE_RULE_ID = ("Dialog ditulis dalam bahasa tokohnya. Kalau bukan bahasa Indonesia, tulis kalimatnya UTUH dalam satu "
+                    "tanda kutip, lalu terjemahannya SATU kali dalam kurung tepat setelahnya.")
+DIALOGUE_RULE_EN = ("Dialogue is written in each character's own language. When it is not English, write the whole sentence "
+                    "inside one pair of quotes, then its English translation ONCE in parentheses right after it. Every such "
+                    "sentence is translated.")
+
+# Default values that changed: a default card still holding the old value moves to the new one, once per database
+# (one flag per change set).
+DEFAULTS_CHANGED = {
+    "defaults_v2": [("style", "Gaya RP default", "paragraphs", "5-10", "4-7"),
                     ("style", "Gaya RP default", "sentences", "5-10", "4-7"),
-                    ("gm", "GM membumi", "afk_scale", "1", "0")]
+                    ("gm", "GM membumi", "afk_scale", "1", "0")],
+    "defaults_v3": [("style", "Gaya RP default", "narration_lang", "Indonesia", "English"),
+                    ("style", "Gaya RP default", "dialogue_rule", DIALOGUE_RULE_ID, DIALOGUE_RULE_EN)],
+}
 
 DEFAULT_CARDS = [
     ("style", "Gaya RP default", {
-        "pov": "orang kedua (kamu)", "narration_lang": "Indonesia",
-        "dialogue_rule": "Dialog ditulis dalam bahasa tokohnya. Kalau bukan bahasa Indonesia, tulis kalimatnya UTUH dalam satu "
-                         "tanda kutip, lalu terjemahannya SATU kali dalam kurung tepat setelahnya.",
+        "pov": "orang kedua (kamu)", "narration_lang": "English", "dialogue_rule": DIALOGUE_RULE_EN,
         "paragraphs": "4-7", "sentences": "4-7",
         "sentence_style": "Kalimat panjang yang merangkai deskripsi, gerak, dan ucapan tokoh. Detail konkret dan indrawi.",
         "dialogue_ratio": "30-50%", "violence": "sedang", "tone": "Membumi dan wajar, tanpa superlatif.",
