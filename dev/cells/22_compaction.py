@@ -55,8 +55,8 @@ class Compactor:
                 return
             state["t"] = now
             think, out = len(acc["reasoning"]) * 2 // 7, len(acc["content"]) * 2 // 7
-            bits = ([f"thinking ≈{think:,}".replace(",", ".")] if think else []) + \
-                   [f"writing ≈{out:,}".replace(",", ".") + (f" / {limit:,}".replace(",", ".") if limit else "") + " tokens"]
+            bits = ([f"thinking ≈{think:,}"] if think else []) + \
+                   [f"writing ≈{out:,}" + (f" / {limit:,}" if limit else "") + " tokens"]
             phase(f"{label} {' · '.join(bits)}")
         return on_delta
 

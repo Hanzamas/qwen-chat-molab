@@ -80,7 +80,7 @@ function render({ model, el }) {
       <form class="qr-form">
         <button type="button" class="qr-icon" data-act="attach" title="Attach files">${icon("clip")}</button>
         <button type="button" class="qr-icon" data-act="impersonate" title="Draft my reply (impersonate)">${icon("wand")}</button>
-        <textarea class="qr-input" rows="1" placeholder="Send a message · Enter to send · Shift+Enter for a new line · /ooc /note /bab /ingat /studio"></textarea>
+        <textarea class="qr-input" rows="1" placeholder="Send a message · Enter to send · Shift+Enter for a new line · /ooc /note /chapter /remember /studio"></textarea>
         <button type="button" class="qr-note-chip" data-act="open-tab" data-tab="chat" hidden></button>
         <button type="submit" class="qr-send" aria-label="Send">${icon("send")}</button>
       </form>
@@ -1105,7 +1105,7 @@ function render({ model, el }) {
       case "canon-save": { const box = btn.closest(".qr-canon"), ta = box.querySelector("textarea"), sec = box.dataset.sec || box.querySelector(".qr-canon-new").value.trim();
         if (sec) { send("canon", { section: sec, text: ta.value }); ta.defaultValue = ta.value; if (!box.dataset.sec) { ta.value = ta.defaultValue = ""; box.querySelector(".qr-canon-new").value = ""; } } break; }
       case "toc": { const h = model.get("history") || {}, cid = get("chat").id;
-        openModal("Chapters", (h.chapters || []).map((c) => `<button class="qr-libitem" data-act="jump-to" data-chat="${cid}" data-id="${c.id}">${icon("bookmark")}<b>${esc(c.title)}</b><span class="qr-muted">message ${c.n}</span></button>`).join("") || "No chapters yet. Mark one with /bab or the chapter button on a reply."); break; }
+        openModal("Chapters", (h.chapters || []).map((c) => `<button class="qr-libitem" data-act="jump-to" data-chat="${cid}" data-id="${c.id}">${icon("bookmark")}<b>${esc(c.title)}</b><span class="qr-muted">message ${c.n}</span></button>`).join("") || "No chapters yet. Mark one with /chapter or the chapter button on a reply."); break; }
       case "speaker": send("settings", { speaker: btn.dataset.name || null }); break;
       case "props-make": send("proposals_make"); break;
       case "fame-suggest": send("fame_suggest"); break;

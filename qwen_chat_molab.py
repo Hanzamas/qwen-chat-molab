@@ -2074,7 +2074,8 @@ def _(datetime, re):
 
         # ---------- user input ----------
 
-        SLASH = ("ooc", "note", "reroll", "continue", "bab", "ingat", "impersonate", "studio", "cek")
+        # English names next to the original ones (bab = chapter, ingat = remember, cek = check)
+        SLASH = ("ooc", "note", "reroll", "continue", "bab", "chapter", "ingat", "remember", "impersonate", "studio", "cek", "check")
 
         @staticmethod
         def parse_input(text):
@@ -3029,7 +3030,7 @@ def _(
         events attached to messages that are not on the active path are ignored."""
 
         UNITS = {"menit": 1, "min": 1, "jam": 60, "hour": 60, "hari": 1440, "day": 1440, "minggu": 10080,
-                 "week": 10080, "bulan": 43200, "month": 43200, "tahun": 525600}
+                 "week": 10080, "bulan": 43200, "month": 43200, "tahun": 525600, "year": 525600}
         MONTHS = {m: i + 1 for i, m in enumerate(
             "januari februari maret april mei juni juli agustus september oktober november desember".split())}
 
@@ -3054,11 +3055,12 @@ def _(
         @staticmethod
         def fmt_span(minutes):
             m = int(minutes)
-            for unit, size in (("bulan", 43200), ("minggu", 10080), ("hari", 1440), ("jam", 60)):
+            for unit, size in (("month", 43200), ("week", 10080), ("day", 1440), ("hour", 60)):
                 if m >= size:
                     n = m / size
-                    return f"{n:.0f} {unit}" if abs(n - round(n)) < 0.1 else f"{n:.1f} {unit}"
-            return f"{m} menit"
+                    text = f"{n:.0f}" if abs(n - round(n)) < 0.1 else f"{n:.1f}"
+                    return f"{text} {unit}{'' if text == '1' else 's'}"
+            return f"{m} minute{'' if m == 1 else 's'}"
 
         @staticmethod
         def fmt_time(dt):
@@ -5401,8 +5403,8 @@ def _(TXT, re, threading, time):
                     return
                 state["t"] = now
                 think, out = len(acc["reasoning"]) * 2 // 7, len(acc["content"]) * 2 // 7
-                bits = ([f"thinking ≈{think:,}".replace(",", ".")] if think else []) + \
-                       [f"writing ≈{out:,}".replace(",", ".") + (f" / {limit:,}".replace(",", ".") if limit else "") + " tokens"]
+                bits = ([f"thinking ≈{think:,}"] if think else []) + \
+                       [f"writing ≈{out:,}" + (f" / {limit:,}" if limit else "") + " tokens"]
                 phase(f"{label} {' · '.join(bits)}")
             return on_delta
 
@@ -7053,12 +7055,12 @@ def _(
                 self.reroll(chat_id, head)
             elif cmd == "continue" and head:
                 self.continue_msg(chat_id, head)
-            elif cmd == "bab":
+            elif cmd in ("bab", "chapter"):
                 if head:
                     self.store.x("INSERT INTO chapters (chat_id, message_id, title, created) VALUES (?, ?, ?, ?)",
                                  (chat_id, head, arg or "New chapter", time.time()))
                     self.emit("history", chat_id)
-            elif cmd == "ingat":
+            elif cmd in ("ingat", "remember"):
                 rows = self.mem.search(arg, self.mem.ctx_of(chat_id), limit=10, kinds=("fact", "summary_core"))
                 self.emit("toast", {"text": "\n".join(f"#{r['id']} {r['text'][:160]}" for r in rows) or "No matching memory.",
                                     "long": True})
@@ -7066,7 +7068,7 @@ def _(
                 self.run(self._impersonate, chat_id, arg)
             elif cmd == "studio":
                 self.run(self._studio_change, chat_id, arg)
-            elif cmd == "cek" and head:
+            elif cmd in ("cek", "check") and head:
                 self.run(self._fact_check, chat_id, head, True)
             return chat_id
 
@@ -8880,7 +8882,7 @@ def _():
           <form class="qr-form">
             <button type="button" class="qr-icon" data-act="attach" title="Attach files">${icon("clip")}</button>
             <button type="button" class="qr-icon" data-act="impersonate" title="Draft my reply (impersonate)">${icon("wand")}</button>
-            <textarea class="qr-input" rows="1" placeholder="Send a message · Enter to send · Shift+Enter for a new line · /ooc /note /bab /ingat /studio"></textarea>
+            <textarea class="qr-input" rows="1" placeholder="Send a message · Enter to send · Shift+Enter for a new line · /ooc /note /chapter /remember /studio"></textarea>
             <button type="button" class="qr-note-chip" data-act="open-tab" data-tab="chat" hidden></button>
             <button type="submit" class="qr-send" aria-label="Send">${icon("send")}</button>
           </form>
@@ -9905,7 +9907,7 @@ def _():
           case "canon-save": { const box = btn.closest(".qr-canon"), ta = box.querySelector("textarea"), sec = box.dataset.sec || box.querySelector(".qr-canon-new").value.trim();
             if (sec) { send("canon", { section: sec, text: ta.value }); ta.defaultValue = ta.value; if (!box.dataset.sec) { ta.value = ta.defaultValue = ""; box.querySelector(".qr-canon-new").value = ""; } } break; }
           case "toc": { const h = model.get("history") || {}, cid = get("chat").id;
-            openModal("Chapters", (h.chapters || []).map((c) => `<button class="qr-libitem" data-act="jump-to" data-chat="${cid}" data-id="${c.id}">${icon("bookmark")}<b>${esc(c.title)}</b><span class="qr-muted">message ${c.n}</span></button>`).join("") || "No chapters yet. Mark one with /bab or the chapter button on a reply."); break; }
+            openModal("Chapters", (h.chapters || []).map((c) => `<button class="qr-libitem" data-act="jump-to" data-chat="${cid}" data-id="${c.id}">${icon("bookmark")}<b>${esc(c.title)}</b><span class="qr-muted">message ${c.n}</span></button>`).join("") || "No chapters yet. Mark one with /chapter or the chapter button on a reply."); break; }
           case "speaker": send("settings", { speaker: btn.dataset.name || null }); break;
           case "props-make": send("proposals_make"); break;
           case "fame-suggest": send("fame_suggest"); break;

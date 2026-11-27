@@ -397,7 +397,7 @@ def test_compaction_progress_and_clean_cancel(engine, nb, fake):
     assert text and "## Inti" in text
     cb = comp.progress(seen.append, "Summarizing…", 4096)
     cb({"reasoning": "x" * 700, "content": "y" * 3500})
-    assert seen[-1] == "Summarizing… thinking ≈200 · writing ≈1.000 / 4.096 tokens"
+    assert seen[-1] == "Summarizing… thinking ≈200 · writing ≈1,000 / 4,096 tokens"
     # a cancelled summary is never stored as if it were complete
     comp.cancel.set()
     try:

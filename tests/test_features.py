@@ -121,7 +121,7 @@ def test_old_mood_carries_its_age(nb):
     now = datetime(2026, 1, 1, 12, 0)
     out = json.loads(nb["PROMPT"].status_json({"mood": "cemas", "outfit": "mantel", "plan_now": ""},
                                               {"mood": now - timedelta(hours=5), "outfit": now - timedelta(hours=9)}, now))
-    assert out["mood"].startswith("cemas (dicatat 5 jam lalu") and out["outfit"] == "mantel" and "plan_now" not in out
+    assert out["mood"].startswith("cemas (dicatat 5 hours lalu") and out["outfit"] == "mantel" and "plan_now" not in out
     fresh = json.loads(nb["PROMPT"].status_json({"mood": "senang"}, {"mood": now - timedelta(minutes=30)}, now))
     assert fresh["mood"] == "senang"
 

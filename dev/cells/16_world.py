@@ -4,7 +4,7 @@ class World:
     events attached to messages that are not on the active path are ignored."""
 
     UNITS = {"menit": 1, "min": 1, "jam": 60, "hour": 60, "hari": 1440, "day": 1440, "minggu": 10080,
-             "week": 10080, "bulan": 43200, "month": 43200, "tahun": 525600}
+             "week": 10080, "bulan": 43200, "month": 43200, "tahun": 525600, "year": 525600}
     MONTHS = {m: i + 1 for i, m in enumerate(
         "januari februari maret april mei juni juli agustus september oktober november desember".split())}
 
@@ -29,11 +29,12 @@ class World:
     @staticmethod
     def fmt_span(minutes):
         m = int(minutes)
-        for unit, size in (("bulan", 43200), ("minggu", 10080), ("hari", 1440), ("jam", 60)):
+        for unit, size in (("month", 43200), ("week", 10080), ("day", 1440), ("hour", 60)):
             if m >= size:
                 n = m / size
-                return f"{n:.0f} {unit}" if abs(n - round(n)) < 0.1 else f"{n:.1f} {unit}"
-        return f"{m} menit"
+                text = f"{n:.0f}" if abs(n - round(n)) < 0.1 else f"{n:.1f}"
+                return f"{text} {unit}{'' if text == '1' else 's'}"
+        return f"{m} minute{'' if m == 1 else 's'}"
 
     @staticmethod
     def fmt_time(dt):

@@ -378,12 +378,12 @@ class Engine(EngineView):
             self.reroll(chat_id, head)
         elif cmd == "continue" and head:
             self.continue_msg(chat_id, head)
-        elif cmd == "bab":
+        elif cmd in ("bab", "chapter"):
             if head:
                 self.store.x("INSERT INTO chapters (chat_id, message_id, title, created) VALUES (?, ?, ?, ?)",
                              (chat_id, head, arg or "New chapter", time.time()))
                 self.emit("history", chat_id)
-        elif cmd == "ingat":
+        elif cmd in ("ingat", "remember"):
             rows = self.mem.search(arg, self.mem.ctx_of(chat_id), limit=10, kinds=("fact", "summary_core"))
             self.emit("toast", {"text": "\n".join(f"#{r['id']} {r['text'][:160]}" for r in rows) or "No matching memory.",
                                 "long": True})
@@ -391,7 +391,7 @@ class Engine(EngineView):
             self.run(self._impersonate, chat_id, arg)
         elif cmd == "studio":
             self.run(self._studio_change, chat_id, arg)
-        elif cmd == "cek" and head:
+        elif cmd in ("cek", "check") and head:
             self.run(self._fact_check, chat_id, head, True)
         return chat_id
 

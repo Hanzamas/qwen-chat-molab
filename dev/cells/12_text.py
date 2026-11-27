@@ -274,7 +274,8 @@ class TXT:
 
     # ---------- user input ----------
 
-    SLASH = ("ooc", "note", "reroll", "continue", "bab", "ingat", "impersonate", "studio", "cek")
+    # English names next to the original ones (bab = chapter, ingat = remember, cek = check)
+    SLASH = ("ooc", "note", "reroll", "continue", "bab", "chapter", "ingat", "remember", "impersonate", "studio", "cek", "check")
 
     @staticmethod
     def parse_input(text):

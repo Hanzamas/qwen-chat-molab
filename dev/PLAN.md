@@ -727,3 +727,20 @@ dicatat di bawah sebagai usulan.
 - Group chat: default mode narator GM (model memilih siapa yang bereaksi), bisa dipaksa lewat avatar / `@nama`.
 - Embedder: Qwen3-Embedding-0.6B.
 - Tidak ada keputusan yang masih terbuka.
+
+### Compaction, bahasa Inggris, dan level bahasa target (selesai, belum dites di GPU)
+
+- [x] Compaction memakai ukuran prompt giliran berikutnya yang sebenarnya (total server ikut menghitung thinking yang
+      dibuang prompt berikutnya). Jalan di 80%, atau lebih awal kalau prompt + ruang jawaban (thinking + teks) lewat
+      95% konteks. Chat grup cukup menyisakan 1 pesan pemain utuh. Kalau tidak bisa jalan, ada pemberitahuan alasannya.
+- [x] Narasi bahasa Inggris dipaksa: bahasa narasi disebut tiap giliran; balasan yang jelas berbahasa lain ditulis ulang
+      sekali. Ringkasan, catatan pemeriksa, dan kejadian dunia ikut bahasa narasi. Kartu Gaya default pindah ke English
+      dengan terjemahan bahasa Inggris (sekali, hanya kalau nilainya masih default lama).
+- [x] Level bahasa target tokoh pemain: baris skill di Persona (misalnya "Bahasa Jerman, 55") + poin dari bermain
+      (+1 menulis bahasa itu, +2/+0,5 roll berhasil/gagal, +3 per minggu waktu dunia). Level A1-C1 menentukan panjang dan
+      kerumitan ucapan tokoh lain; SEMUA kalimat selalu diterjemahkan. Ucapan terlalu pendek atau tanpa terjemahan
+      ditandai dan 3 giliran berikutnya diingatkan. Dadu memakai level yang sudah naik; naik level diumumkan.
+- [x] "Lihat arti" dalam bahasa Inggris.
+- [x] Tampilan aplikasi dalam bahasa Inggris: tombol, tab, form kartu (label skema), toast, status, pemberitahuan, kontrol
+      notebook. Nilai data tetap (fakta, bintang, "2 jam", dll.) dan ditampilkan dengan label Inggris. Perintah /chapter,
+      /remember, /check ditambahkan di samping /bab, /ingat, /cek. Instruksi ke model tetap bahasa Indonesia.
