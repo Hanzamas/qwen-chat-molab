@@ -79,3 +79,103 @@ def test_ui_markers(nb):
     esm = nb["UI_ESM"]
     for marker in ("live-th-rp", "qr-toolset", "STYLE_SUGGEST", "know-restore", "flushRedraws"):
         assert marker in esm, marker
+
+
+# ---------- RP naturalness (third review) ----------
+
+def _story_rich(nb, engine):
+    C = nb["CARDS"]
+    world = C.save(None, "world", {"name": "Berlin kecil", "realworld": "tidak"})
+    sc = C.save(None, "scenario", {"title": "Malam", "start_time": "2026-12-19 21:00", "start_location": "Ruang tengah",
+                                   "opening": "Lotte mengetuk pintumu."})
+    persona = C.save(None, "persona", {"name": "Raka"})
+    lotte = C.save(None, "character", {"name": "Lotte Braun", "aliases": ["Lotte"], "backstory": "Tumbuh di Hamburg.",
+                                       "fears": ["gelap"]})
+    gm = C.save(None, "gm", {"format": "prosa"})
+    return engine.start_story({"world": world, "scenario": sc, "persona": persona, "character": [lotte], "gm": gm})
+
+
+def test_note_is_background_with_the_player_last(engine, nb):
+    chat = _story_rich(nb, engine)
+    S, R, TH = nb["STORE"], nb["RELATIONS"], nb["THREADS"]
+    engine.send(chat, "Aku menatap Lotte.")
+    wait_idle(engine)
+    first = [m for m in S.path(chat) if m["role"] == "user"][-1]
+    assert "Tumbuh di Hamburg" in first["meta"]["ephemeral"]  # entering the scene: the whole card detail
+    head = S.chat(chat)["head_id"]
+    R.change(chat, head, "Lotte Braun", "player", 20, "dibantu")
+    TH.open(chat, None, "janji", "Mengembalikan payung tetangga")
+    TH.open(chat, None, "misteri", "Siapa yang mencuri sepeda Lotte")
+    S.add_message(chat, head, "user", "Aku bertanya ke Lotte soal sepeda.")
+    msgs, _ = nb["PROMPT"].build(chat)
+    last = msgs[-1]["content"]
+    assert last.startswith("[Catatan sistem") and last.endswith("[Pesan pemain]\nAku bertanya ke Lotte soal sepeda.")
+    assert "acuan konsistensi" in last
+    assert "sepeda Lotte" in last and "payung" not in last and "+1 benang terbuka lain" in last
+    assert "+20" not in last and "baru: dibantu" in last
+    assert "Tumbuh di Hamburg" not in last and "gelap" in last and "card_read kalau perlu" in last  # still in the scene
+
+
+def test_old_mood_carries_its_age(nb):
+    from datetime import datetime, timedelta
+    now = datetime(2026, 1, 1, 12, 0)
+    out = json.loads(nb["PROMPT"].status_json({"mood": "cemas", "outfit": "mantel", "plan_now": ""},
+                                              {"mood": now - timedelta(hours=5), "outfit": now - timedelta(hours=9)}, now))
+    assert out["mood"].startswith("cemas (dicatat 5 jam lalu") and out["outfit"] == "mantel" and "plan_now" not in out
+    fresh = json.loads(nb["PROMPT"].status_json({"mood": "senang"}, {"mood": now - timedelta(minutes=30)}, now))
+    assert fresh["mood"] == "senang"
+
+
+def test_length_note_and_no_fill_after_a_hand_off(engine, nb, fake):
+    chat, _ = _story(nb, engine)
+    fake["script"].append({"content": "Lotte mengangkat bahu.\n\n\"Na, und jetzt?\" tanyanya, lalu menunggu."})
+    engine.send(chat, "Aku diam.")
+    wait_idle(engine)
+    bot = engine.display(chat)["items"][-1]
+    assert "Paragraf tambahan" not in bot["content"]
+    note = [m for m in nb["STORE"].path(chat) if m["role"] == "user"][-1]["meta"]["ephemeral"]
+    assert "paragraf pendek" in note and "kerangka per paragraf" not in note
+
+
+def test_news_counts_as_told_only_when_told(engine, nb, fake):
+    chat, _ = _story(nb, engine)
+    S, W = nb["STORE"], nb["WORLD"]
+    eid = W.add_world_event(chat, None, "2026-12-19 21:00", "Polisi menggeledah toko roti Herr Weber.", ["player"])
+    unseen = lambda: [e["id"] for e in W.world_events(chat, S.path_ids(chat), who="player", unseen_only=True)]
+    fake["script"].append({"content": "Lotte menyalakan lampu dan duduk di sofa.\n\nHujan mengetuk jendela."})
+    engine.send(chat, "Aku duduk.")
+    wait_idle(engine)
+    assert eid in unseen() and S.chat(chat)["settings"]["offered"] == {str(eid): 1}
+    fake["script"].append({"content": "Dari jendela kamu melihat polisi menggeledah toko roti Herr Weber di seberang jalan."})
+    engine.send(chat, "Aku melihat keluar.")
+    wait_idle(engine)
+    assert eid not in unseen() and S.chat(chat)["settings"]["offered"] == {}
+
+
+def test_offscreen_world_moves_after_hours_of_play(engine, nb, fake):
+    chat, _ = _story(nb, engine)
+    S = nb["STORE"]
+    assert engine._offscreen_span(chat) is None  # the first look sets the mark
+    nb["WORLD"].advance(chat, S.chat(chat)["head_id"], 300, "tidur")
+    sync, now, minutes = engine._offscreen_span(chat)
+    assert minutes == 300
+    engine._queue_offscreen(chat)
+    assert engine.offscreen_jobs == [chat]
+    n = len(fake["log"])
+    engine._offscreen(engine.offscreen_jobs.pop(0))
+    body = fake["log"][n]
+    assert "TIDAK sedang satu adegan dengan pemain" in json.dumps(body, ensure_ascii=False)
+    assert len(body["tools"]) == len(engine.tools.specs(engine.prompt.ctx(chat)))  # same prompt prefix as the chat
+    assert any("Frau Brunner" in e["text"] for e in nb["WORLD"].world_events(chat, S.path_ids(chat)))
+    assert engine._offscreen_span(chat) is None
+
+
+def test_checker_records_when_it_runs(engine, nb, monkeypatch):
+    P = nb["PROMPT"]
+    monkeypatch.setenv("QCHAT_STATE_CHECK", "1")
+    chat, _ = _story(nb, engine)
+    text = P.system_text(chat)
+    assert nb["RECORD_MARK"] in text and "catat dengan relationship" not in text
+    monkeypatch.setenv("QCHAT_STATE_CHECK", "0")
+    other, _ = _story(nb, engine)
+    assert "catat dengan relationship" in P.system_text(other)

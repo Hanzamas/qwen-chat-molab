@@ -190,7 +190,7 @@ class Compactor:
         head = path[-1]["id"] if path else None
         allowed = {"canon_set", "memory_save", "memory_update", "memory_forget", "status_update", "fact_save", "world_event",
                    "knowledge_add", "tell", "thread_open", "thread_close"}
-        tools = [t for t in toolbox.specs(c) if t["function"]["name"] in allowed]
+        tools = toolbox.specs(c)  # the chat's full list: same prompt prefix as the turns (cache); allowed limits what runs
         for _ in range(4):
             acc = self.llm.chat(msgs, tools=tools, kwargs=self.prompt.kwargs(c), sampling={"temperature": 0.6},
                                 max_tokens=8000, stop=self.cancel, on_delta=on_delta)
@@ -207,7 +207,7 @@ class Compactor:
                                          "function": {"name": cl["name"], "arguments": cl["arguments"] or "{}"}}
                                         for i, cl in enumerate(calls)]})
             for i, cl in enumerate(calls):
-                res, _, _ = toolbox.call(chat_id, head, cl["name"], cl["arguments"])
+                res, _, _ = toolbox.call(chat_id, head, cl["name"], cl["arguments"], allowed=allowed)
                 msgs.append({"role": "tool", "tool_call_id": cl["id"] or f"f{i}", "content": res})
 
     def summarize(self, chat_id, path, a, b, budget, think, tools, on_delta=None):

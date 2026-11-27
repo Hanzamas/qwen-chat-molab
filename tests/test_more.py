@@ -806,7 +806,9 @@ def test_story_threads_with_deadlines(engine, nb, fake):
     tid = json.loads(res)["opened"]
     T.call(chat, head, "thread_open", json.dumps({"kind": "utang", "title": "Utang 20 euro ke Otto"}))
     note, _ = P.ephemeral(chat, S.path(chat), "Aku menunggu.")
-    assert "Benang cerita terbuka" in note and "Bertemu Lotte di Odeonsplatz" in note and "Lotte Braun" in note
+    # the due meeting is shown; the unrelated debt only as a count
+    assert "Benang cerita yang mendesak atau terkait adegan" in note and "Bertemu Lotte di Odeonsplatz" in note
+    assert "Lotte Braun" in note and "Utang 20 euro" not in note and "+1 benang terbuka lain" in note
     nb["WORLD"].advance(chat, head, 120, "uji")
     rows = TH.list(chat, now=nb["WORLD"].state(chat, S.path_ids(chat))["time"])
     assert rows[0]["id"] == tid and rows[0]["overdue"]
@@ -898,7 +900,7 @@ def test_relationships_and_card_proposals(engine, nb, fake):
     nb["WORLD"].status_update(chat, head, "player", {"location": "Dapur"})
     nb["WORLD"].status_update(chat, head, "Lotte Braun", {"location": "Dapur"})
     note, _ = P.ephemeral(chat, S.path(chat), "Halo.")
-    assert "ke pemain dekat (+27" in note
+    assert "ke pemain dekat (baru: ditolong saat jatuh)" in note and "+27" not in note
     fake["script"].append({"content": json.dumps({"proposals": [
         {"card": "Lotte", "field": "relations", "value": [["Raka", "teman dekat", "sejak insiden tangga"]], "reason": "makin akrab"},
         {"card": "Nobody", "field": "age", "value": "30"}]})})

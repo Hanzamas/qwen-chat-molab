@@ -434,6 +434,7 @@ class Relations:
             cur = out.setdefault((r["a"], r["b"]), {"score": 0.0, "last": ""})
             cur["score"] = max(-100.0, min(100.0, cur["score"] + r["delta"]))
             cur["last"] = r["reason"]
+            cur["mid"] = r["message_id"]
         return out
 
     @staticmethod

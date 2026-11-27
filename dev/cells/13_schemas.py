@@ -104,7 +104,7 @@ DEFAULT_SCHEMAS = {
         _f("banned", "Frasa terlarang", "Larangan", "list"),
         _f("rules", "Aturan tambahan", "Larangan", "list"),
     ]},
-    "gm": {"type": "gm", "label": "GM", "version": 2, "fields": [
+    "gm": {"type": "gm", "label": "GM", "version": 3, "fields": [
         _f("format", "Format", "Format", "select", options=["prosa", "game"], visibility="ui"),
         _f("realism", "Tingkat realisme", "Dunia", "select", options=["santai", "membumi", "keras"]),
         _f("lethality", "Kekejaman", "Dunia", "select", options=["rendah", "sedang", "tinggi"]),
@@ -123,6 +123,8 @@ DEFAULT_SCHEMAS = {
         _f("afk_scale", "Skala waktu saat AFK", "Waktu", visibility="ui",
            help="Jam cerita per jam nyata. 0 = dunia berhenti, 1 = sama dengan waktu nyata"),
         _f("tick_minutes", "World tick tiap (menit diam)", "Waktu", visibility="ui"),
+        _f("offscreen_hours", "Dunia di luar layar bergerak tiap (jam dunia)", "Waktu", visibility="ui",
+           help="Tokoh yang tidak ada di adegan menjalankan agendanya di latar setiap sekian jam waktu dunia. 0 = mati"),
         _f("state_check", "Pemeriksa keadaan setelah tiap giliran", "Kontinuitas", "select", options=["ya", "tidak"],
            visibility="ui", help="Mengisi waktu, status, dan ingatan tokoh yang lupa dicatat model"),
         _f("continuity_check", "Cek kontinuitas", "Kontinuitas", "select", options=["latar", "ketat", "mati"], visibility="ui",
@@ -174,6 +176,6 @@ DEFAULT_CARDS = [
         "checklist": ["Masuk akal secara fisik?", "Apa akibatnya?", "Tokoh ini sebenarnya tahu apa?",
                       "Berapa waktu yang lewat?", "Ada yang lebay?", "Ada fakta nyata yang belum pasti?"],
         "rules": [], "choices": "kadang", "choice_problems": "1-3", "choice_options": "3-5", "choice_sentences": "1-2",
-        "time_skips": ["2 jam", "3 jam", "1 hari", "1 minggu", "1 bulan"], "afk_scale": "0", "tick_minutes": "20",
+        "time_skips": ["2 jam", "3 jam", "1 hari", "1 minggu", "1 bulan"], "afk_scale": "0", "tick_minutes": "20", "offscreen_hours": "4",
     }),
 ]

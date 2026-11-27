@@ -151,6 +151,14 @@ class TXT:
         return TXT.words(t)[:n]
 
     @staticmethod
+    def mentions(text, item, share=0.3):
+        """The text tells this item: enough of its content words appear (two, or all of a short item)."""
+        words = set(TXT.content_words(item))
+        if not words:
+            return True
+        return len(words & set(TXT.content_words(text))) >= min(len(words), max(2, round(share * len(words))))
+
+    @staticmethod
     def repeats_opening(mine, previous):
         """A reply starts like the recent ones: the same first three words as one of them or three content words shared
         with it, the same first two words as both of the last two, or the same first word as all of the last four."""

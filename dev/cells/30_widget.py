@@ -90,7 +90,7 @@ class ChatApp:
 
     def chat_info(self, chat):
         return {"id": chat["id"], "title": chat["title"], "kind": chat["kind"], "story_id": chat["story_id"],
-                "settings": {k: v for k, v in chat["settings"].items() if k not in ("studio", "avoid", "openers")},
+                "settings": {k: v for k, v in chat["settings"].items() if k not in ("studio", "avoid", "openers", "offered", "offscreen_sync")},
                 "system": chat["system"], "epoch": chat["epoch"],
                 "drafts": (chat["settings"].get("studio") or {}).get("drafts") or {}}
 

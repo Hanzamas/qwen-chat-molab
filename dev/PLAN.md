@@ -638,6 +638,27 @@ dicatat di bawah sebagai usulan.
       memunculkannya lagi) dan bisa dipulihkan dari daftar "Dilupakan di cabang ini". Laci menyimpan teks yang sedang
       diketik saat digambar ulang; selama kursor di kolom, gambar ulang menunggu sampai fokus pindah.
 
+### Review ketiga — RP yang buyar dan tidak natural (selesai, belum dites di GPU)
+
+- [x] Catatan sistem tiap giliran jadi latar, bukan daftar: baris pembuka "acuan konsistensi, bukan daftar yang harus
+      disebut"; benang cerita hanya yang mendesak atau terkait adegan (+jumlah sisanya); perasaan tanpa angka, alasan
+      hanya kalau baru; detail kartu penuh saat tokoh masuk adegan, selama ia tetap di adegan hanya ketakutan, relasi,
+      dan pengetahuannya. Catatan ditaruh di awal pesan, tulisan pemain paling akhir ([Pesan pemain]).
+- [x] Status basi: mood dan rencana yang dicatat lama (2 dan 6 jam waktu dunia) diberi umur "bisa sudah berubah";
+      pemeriksa keadaan memperbarui mood/rencana yang berubah atau mereda.
+- [x] Panjang: target berupa jumlah kalimat total; ucapan tokoh boleh jadi paragraf pendek; instruksi kerangka per
+      paragraf dibuang. Tambal paragraf hanya untuk balasan di bawah separuh target dan tidak berakhir dengan pertanyaan
+      atau ucapan tokoh (titik serah).
+- [x] Dunia di luar layar bergerak di latar setiap 4 jam waktu dunia (GM: "Dunia di luar layar bergerak tiap", 0 = mati);
+      tokoh di adegan pemain tidak diubah; pesan baru menghentikannya dan ia diulang nanti. Lompat waktu dan AFK
+      menghitung rentang yang sama, jadi tidak dobel.
+- [x] Kejadian dunia dan garis waktu baru dianggap diketahui pemain kalau balasan menyebutnya (atau setelah 3 kali
+      ditawarkan); sebelumnya langsung hilang walau tidak diceritakan.
+- [x] Narator fokus bercerita: kalau pemeriksa keadaan aktif, prompt epoch baru menyerahkan pengetahuan tokoh,
+      hubungan, dan benang cerita ke pemeriksa. Chat lama ikut setelah epoch berikutnya (compaction/Terapkan sekarang).
+- [x] Cache: pemeriksa keadaan, world tick, dan flush compaction mengirim daftar tool lengkap chat (yang boleh dipakai
+      dibatasi di sisi engine), jadi prefix prompt sama dengan giliran dan riwayat tidak diproses ulang.
+
 ---
 
 ## 9. Tes

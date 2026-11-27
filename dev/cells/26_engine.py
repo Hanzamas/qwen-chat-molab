@@ -24,7 +24,9 @@ di giliran ini:
 - apa yang disaksikan atau didengar tokoh yang hadir, termasuk tokoh pemain (knowledge_add), dan apa yang diceritakan
   antar tokoh (tell);
 - janji, janji temu, utang, atau misteri baru (thread_open), dan benang yang selesai (thread_close);
+- mood, rencana, atau kegiatan tokoh yang sudah berubah atau mereda dibanding status tercatat (status_update);
 - perubahan perasaan antar tokoh atau terhadap pemain karena kejadian di narasi (relationship).
+Pakai hanya tool yang disebut di atas.
 Sudah tercatat di giliran ini:
 {done}
 Keadaan tercatat sekarang (jangan dicatat ulang; benang yang sudah ada jangan dibuka lagi):
@@ -101,6 +103,7 @@ class Engine(EngineView):
         self.bg_busy = False
         self.fact_jobs = []
         self.continuity_jobs = []
+        self.offscreen_jobs = []  # chats whose off-screen world is due to move (world time passed in play)
         self.compact_backoff = {}  # chat id -> time before which idle compaction is not retried
         self.afk_lock = threading.Lock()
         self.backfilled = False
@@ -176,6 +179,7 @@ class Engine(EngineView):
             time.sleep(0.1)
         self.fact_jobs[:] = [j for j in self.fact_jobs if j[0] != chat_id]
         self.continuity_jobs[:] = [j for j in self.continuity_jobs if j[0] != chat_id]
+        self.offscreen_jobs[:] = [j for j in self.offscreen_jobs if j != chat_id]
         for d in (self.compact_backoff, self.last_used):
             d.pop(chat_id, None)
         if self.active_chat == chat_id:
@@ -422,6 +426,7 @@ class Engine(EngineView):
             self.world.advance(chat_id, uid, minutes, "AFK")
         self._tick(chat_id, t0, minutes, "Pemain sedang tidak ada (AFK). Tokoh yang sedang satu adegan dengan pemain tetap di "
                                          "tempat dan menunggu, kecuali waktunya sangat lama.", head=uid, stop=self.stop)
+        self._offscreen_done(chat_id, t0 + timedelta(minutes=minutes))
         self._away_notice(chat_id, before, minutes)
         return [f"Pemain baru kembali setelah {World.fmt_span(minutes)} waktu dunia berlalu. Kejadian selama itu ada di atas."]
 
@@ -613,6 +618,10 @@ class Engine(EngineView):
             except Exception as e:
                 self.emit("live", {})
                 self.emit("toast", {"text": f"Pemeriksaan setelah giliran gagal: {type(e).__name__}: {e}", "kind": "warn"})
+            try:
+                self._queue_offscreen(chat_id, c)
+            except Exception:
+                pass
         self.emit("history", chat_id)
         self.emit("panels", chat_id)
         self.emit("ctx", {"used": self.last_used.get(chat_id, 0), "max": self.llm.max_context()})
@@ -684,19 +693,38 @@ class Engine(EngineView):
         if not m or not full.strip():
             return
         # world: mark events the player has now been told about (by this reply), fire due timeline entries
+        # News the note offered counts as told only when the reply tells it (or after three offers), else the player
+        # never learns it. A timeline entry that fired but was not narrated waits as news the same way.
+        offered = {}
         if used.get("events"):
-            self.world.mark_shown(used["events"], mid)
+            prev = (self.store.chat(chat_id) or {}).get("settings", {}).get("offered") or {}
+            told = []
+            for r in self.store.q(f"SELECT id, text FROM world_events WHERE id IN ({','.join('?' * len(used['events']))})",
+                                  list(used["events"])):
+                n = int(prev.get(str(r["id"]), 0)) + 1
+                if TXT.mentions(full, r["text"]) or n >= 3:
+                    told.append(r["id"])
+                else:
+                    offered[str(r["id"])] = n
+            self.world.mark_shown(told, mid)
+        self.store.chat_settings(chat_id, offered=offered)
         for e in used.get("timeline") or []:
-            self.world.add_world_event(chat_id, mid, e["at"], f"{e['title']}. {e['text']}", ["player"], True, f"timeline:{e['id']}")
+            text = f"{e['title']}. {e['text']}"
+            eid = self.world.add_world_event(chat_id, mid, e["at"], text, ["player"], True, f"timeline:{e['id']}")
+            if TXT.mentions(full, text):
+                self.world.mark_shown([eid], mid)
         flags = []
         # length: continue once if clearly short
         tgt = used.get("length")
         if tgt:
             paras, sents = TXT.shape(full)
-            # a reply that hands over with a question to the player is complete: more text would run past that point
-            handed_over = re.search(r"\?\s*[\"”“»«']?\s*$", full.rstrip().split("\n\n")[-1])
-            if paras < tgt["paragraphs"] - 1 and not self.stop.is_set() and not handed_over:
-                add = tgt["paragraphs"] - paras
+            # A reply that hands over (a question, or a character speaking last and waiting) is complete: more text would
+            # run past that point. Only a clearly short reply (under half the target's sentences) is continued.
+            last = full.rstrip().split("\n\n")[-1]
+            handed_over = re.search(r"\?\s*[\"”“»«']?\s*$", last) or re.search(r"[\"“”„«»]", last)
+            short = paras < tgt["paragraphs"] - 1 and sum(sents) * 2 < tgt["paragraphs"] * tgt["sent_lo"]
+            if short and not self.stop.is_set() and not handed_over:
+                add = max(1, tgt["paragraphs"] - paras)
                 self.emit("live", {"active": True, "content": m["content"], "phase": "Menambah paragraf…", "reasoning": "",
                                    "tools": [], "chat_id": chat_id})
                 instr = (f"Lanjutkan narasi tepat dari akhir jawaban terakhir dengan {add} paragraf lagi "
@@ -845,7 +873,7 @@ class Engine(EngineView):
                     advanced = advanced or fn.get("name") == "world_advance"
         names = {"world_advance", "status_update", "knowledge_add", "tell", "world_event", "thread_open", "thread_close",
                  "relationship"}
-        tools = [t for t in self.tools.specs(c) if t["function"]["name"] in names]
+        tools = self.tools.specs(c)  # the chat's full list: same prompt prefix as the turn (cache); names limits what runs
         kw = self.prompt.side_kwargs(c)
         st = self.world.state(chat_id, ids)
         now = [f"Jam {st['time_text']}"]
@@ -1407,14 +1435,62 @@ class Engine(EngineView):
         self.world.advance(chat_id, uid, minutes, f"lompat {label}")
         self.emit("history", chat_id)
         self._tick(chat_id, t0, minutes, f"Pemain melompati waktu {label} dan menjalani rutinitas yang wajar.", head=uid)
+        self._offscreen_done(chat_id, t0 + timedelta(minutes=minutes))
         self._turn(chat_id)  # the time skip note comes from the user message (a reroll gets it too)
+
+    OFFSCREEN_HOURS = 4
+
+    def _offscreen_span(self, chat_id, c=None):
+        """(world time of the last off-screen move, now, minutes since) on the active branch when it is due, else None."""
+        if not self.store.chat(chat_id):
+            return None
+        c = c or self.prompt.ctx(chat_id)
+        try:
+            hours = float(self.prompt.gm(c).get("offscreen_hours", self.OFFSCREEN_HOURS) or 0)
+        except (TypeError, ValueError):
+            hours = self.OFFSCREEN_HOURS
+        if hours <= 0:
+            return None
+        now = self.world.state(chat_id, self.store.path_ids(chat_id))["time"]
+        sync = TXT.parse_datetime((self.store.chat(chat_id) or {}).get("settings", {}).get("offscreen_sync") or "")
+        if not sync or sync > now:  # the first time, or the branch went back in time: count from here
+            self._offscreen_done(chat_id, now)
+            return None
+        minutes = int((now - sync).total_seconds() // 60)
+        return (sync, now, minutes) if minutes >= hours * 60 else None
+
+    def _offscreen_done(self, chat_id, t):
+        self.store.chat_settings(chat_id, offscreen_sync=t.strftime("%Y-%m-%d %H:%M"))
+
+    def _queue_offscreen(self, chat_id, c=None):
+        if chat_id not in self.offscreen_jobs and self._offscreen_span(chat_id, c):
+            self.offscreen_jobs.append(chat_id)
+
+    def _offscreen(self, chat_id, stop=None):
+        """Characters away from the player's scene follow their agendas for the world time that passed in play (runs in
+        the background; a new message stops it and it runs again later)."""
+        span = self._offscreen_span(chat_id)
+        if not span:
+            return
+        sync, now, minutes = span
+        stop = stop or self.stop
+        self.emit("status", "Dunia di luar layar bergerak…")
+        try:
+            self._tick(chat_id, sync, minutes, "Waktu itu berlalu selama adegan pemain. Gerakkan hanya tokoh dan pihak yang TIDAK "
+                                               "sedang satu adegan dengan pemain; tokoh di adegan pemain jangan diubah.", stop=stop)
+        finally:
+            self.emit("status", "")
+        if not stop.is_set():
+            self._offscreen_done(chat_id, now)
+            self.emit("panels", chat_id)
 
     def _tick(self, chat_id, t0, minutes, why, head=None, stop=None):
         c = self.prompt.ctx(chat_id)
         allowed = {"world_event", "status_update", "roll", "tell", "knowledge_add", "thread_close", "thread_open"}
-        tools = [t for t in self.tools.specs(c) if t["function"]["name"] in allowed]
+        tools = self.tools.specs(c)  # the chat's full list: same prompt prefix as the turns (cache); allowed limits what runs
         t1 = t0 + timedelta(minutes=minutes)
         instr = TICK_INSTRUCTION.format(span=World.fmt_span(minutes), t0=World.fmt_time(t0), t1=World.fmt_time(t1), why=why)
+        instr += "\nPakai hanya world_event, status_update, tell, knowledge_add, roll, thread_open, dan thread_close."
         due = [r for r in THREADS.list(chat_id, now=t1) if r["overdue"]]
         if due:
             instr += ("\nBenang cerita yang lewat tenggat selama itu (tentukan akibatnya dengan world_event; thread_close kalau "
@@ -1467,6 +1543,8 @@ class Engine(EngineView):
                 chat_id, mid = self.continuity_jobs.pop(0)
                 if self.store.msg(mid):
                     self._continuity_check(chat_id, mid, False)
+            while self.offscreen_jobs and not self.busy and not self.bg_cancel.is_set():
+                self._offscreen(self.offscreen_jobs.pop(0), stop=self.bg_cancel)
             chat_id = self.active_chat
             chat = self.store.chat(chat_id) if chat_id else None
             if not chat:
@@ -1535,6 +1613,7 @@ class Engine(EngineView):
                 self._tick(chat_id, t0, minutes, "Pemain sedang tidak ada (AFK). Tokoh yang sedang satu adegan dengan pemain "
                                                  "tetap di tempat dan menunggu, kecuali waktunya sangat lama.",
                            head=head, stop=self.bg_cancel)
+                self._offscreen_done(chat_id, t0 + timedelta(minutes=minutes))
                 self._away_notice(chat_id, before, minutes)
                 self.emit("status", "")
                 self.emit("panels", chat_id)

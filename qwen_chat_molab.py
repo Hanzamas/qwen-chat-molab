@@ -1951,6 +1951,14 @@ def _(datetime, re):
             return TXT.words(t)[:n]
 
         @staticmethod
+        def mentions(text, item, share=0.3):
+            """The text tells this item: enough of its content words appear (two, or all of a short item)."""
+            words = set(TXT.content_words(item))
+            if not words:
+                return True
+            return len(words & set(TXT.content_words(text))) >= min(len(words), max(2, round(share * len(words))))
+
+        @staticmethod
         def repeats_opening(mine, previous):
             """A reply starts like the recent ones: the same first three words as one of them or three content words shared
             with it, the same first two words as both of the last two, or the same first word as all of the last four."""
@@ -2171,7 +2179,7 @@ def _():
             _f("banned", "Frasa terlarang", "Larangan", "list"),
             _f("rules", "Aturan tambahan", "Larangan", "list"),
         ]},
-        "gm": {"type": "gm", "label": "GM", "version": 2, "fields": [
+        "gm": {"type": "gm", "label": "GM", "version": 3, "fields": [
             _f("format", "Format", "Format", "select", options=["prosa", "game"], visibility="ui"),
             _f("realism", "Tingkat realisme", "Dunia", "select", options=["santai", "membumi", "keras"]),
             _f("lethality", "Kekejaman", "Dunia", "select", options=["rendah", "sedang", "tinggi"]),
@@ -2190,6 +2198,8 @@ def _():
             _f("afk_scale", "Skala waktu saat AFK", "Waktu", visibility="ui",
                help="Jam cerita per jam nyata. 0 = dunia berhenti, 1 = sama dengan waktu nyata"),
             _f("tick_minutes", "World tick tiap (menit diam)", "Waktu", visibility="ui"),
+            _f("offscreen_hours", "Dunia di luar layar bergerak tiap (jam dunia)", "Waktu", visibility="ui",
+               help="Tokoh yang tidak ada di adegan menjalankan agendanya di latar setiap sekian jam waktu dunia. 0 = mati"),
             _f("state_check", "Pemeriksa keadaan setelah tiap giliran", "Kontinuitas", "select", options=["ya", "tidak"],
                visibility="ui", help="Mengisi waktu, status, dan ingatan tokoh yang lupa dicatat model"),
             _f("continuity_check", "Cek kontinuitas", "Kontinuitas", "select", options=["latar", "ketat", "mati"], visibility="ui",
@@ -2241,7 +2251,7 @@ def _():
             "checklist": ["Masuk akal secara fisik?", "Apa akibatnya?", "Tokoh ini sebenarnya tahu apa?",
                           "Berapa waktu yang lewat?", "Ada yang lebay?", "Ada fakta nyata yang belum pasti?"],
             "rules": [], "choices": "kadang", "choice_problems": "1-3", "choice_options": "3-5", "choice_sentences": "1-2",
-            "time_skips": ["2 jam", "3 jam", "1 hari", "1 minggu", "1 bulan"], "afk_scale": "0", "tick_minutes": "20",
+            "time_skips": ["2 jam", "3 jam", "1 hari", "1 minggu", "1 bulan"], "afk_scale": "0", "tick_minutes": "20", "offscreen_hours": "4",
         }),
     ]
     return DEFAULTS_CHANGED, DEFAULT_CARDS, DEFAULT_SCHEMAS
@@ -3396,6 +3406,7 @@ def _(
                 cur = out.setdefault((r["a"], r["b"]), {"score": 0.0, "last": ""})
                 cur["score"] = max(-100.0, min(100.0, cur["score"] + r["delta"]))
                 cur["last"] = r["reason"]
+                cur["mid"] = r["message_id"]
             return out
 
         @staticmethod
@@ -4566,6 +4577,7 @@ def _(
     WORLD,
     base64,
     json,
+    os,
     random,
     re,
     thinking_kwargs,
@@ -4590,13 +4602,13 @@ def _(
     - Tiap tokoh (termasuk tokoh pemain) tahu isi kartunya sendiri (riwayat, relasi, yang ia ketahui), pengetahuan umum
       zaman dan tempatnya, dan ingatannya di catatan sistem. Rahasia tokoh lain, lore RAHASIA, buku cerita, dan memory adalah
       pengetahuan narator; jangan biarkan tokoh memakainya kalau tidak ada di ingatannya. Ingatan bertanda KELIRU dipercaya
-      tokoh itu walaupun salah. Catat yang baru diketahui tokoh dengan knowledge_add atau tell.
-    - Hubungan: kalau kejadian mengubah perasaan tokoh terhadap tokoh lain atau pemain, catat dengan relationship.
+      tokoh itu walaupun salah.
+    {record_rule}
     - Lupa sesuatu tentang cerita ini? Cari dengan story_search (menurut makna) sebelum mengarang.
-    - Benang cerita: catat janji, janji temu (dengan tenggat), misteri, petunjuk, utang, dendam, dan rencana dengan thread_open;
-      tutup dengan thread_close. Benang yang lewat tenggat harus punya akibat di dunia (orang menunggu, kesal, pergi).
+    - Benang cerita yang lewat tenggat harus punya akibat di dunia (orang menunggu, kesal, pergi).
     - Pesan pemain yang diawali [OOC] adalah percakapan di luar cerita: jawab di luar cerita, singkat, tanpa memerankan tokoh.
-    - Bagian "Catatan sistem" di akhir pesan pemain dibuat sistem, bukan tulisan pemain. Pakai sebagai acuan, jangan dikutip.
+    - Bagian "Catatan sistem" di awal pesan pemain dibuat sistem; tulisan pemain ada setelah [Pesan pemain]. Pakai catatan
+      sebagai acuan, jangan dikutip.
     - Fakta dunia nyata yang spesifik dan tidak pasti: cek fact_lookup, lalu wiki_search/web_search. Simpan temuan dengan fact_save.
       Jangan mengarang angka, nama, atau tanggal nyata. Begitu ragu, langsung panggil tool; jangan menebak berulang-ulang
       di dalam pikiran.
@@ -4611,6 +4623,16 @@ def _(
     - canon_set: catat hal penting yang berubah ke buku cerita. memory_save/memory_update untuk fakta yang perlu diingat lama.
     - card_read: detail kartu tokoh yang belum ada di prompt.
     {format_rule}"""
+
+    # Who records what characters learn, feelings and threads: the narrator itself, or the checker after the turn.
+    RECORD_MARK = "dicatat pemeriksa setelah giliran"
+    RECORD_SELF = """- Catat yang baru diketahui tokoh dengan knowledge_add atau tell.
+    - Hubungan: kalau kejadian mengubah perasaan tokoh terhadap tokoh lain atau pemain, catat dengan relationship.
+    - Benang cerita: catat janji, janji temu (dengan tenggat), misteri, petunjuk, utang, dendam, dan rencana dengan thread_open;
+      tutup dengan thread_close."""
+    RECORD_CHECKER = ("- Yang baru diketahui tokoh, perubahan perasaan, dan benang cerita (janji, janji temu, utang, misteri) "
+                      + RECORD_MARK + " dari narasimu: tulis kejadiannya jelas di narasi, dan jangan memanggil knowledge_add, "
+                      "tell, relationship, thread_open, atau thread_close sendiri.")
 
     OOC_NOTE = ("Pesan pemain ini OOC (di luar cerita). Jawab sebagai penulis di luar cerita, singkat, tanpa melanjutkan adegan, "
                 "tanpa memerankan tokoh, dan tanpa tool pencatat dunia (world_advance, status_update, roll, knowledge_add, tell, "
@@ -4706,7 +4728,9 @@ def _(
             if kind == "studio":
                 parts.append(STUDIO_SYSTEM)
             elif kind in ("rp", "group"):
-                parts.append(BASE_RP.format(format_rule=FORMAT_GAME if self.gm(c).get("format") == "game" else ""))
+                checker = (self.gm(c).get("state_check") or "ya") == "ya" and os.environ.get("QCHAT_STATE_CHECK", "1") != "0"
+                parts.append(BASE_RP.format(format_rule=FORMAT_GAME if self.gm(c).get("format") == "game" else "",
+                                            record_rule=RECORD_CHECKER if checker else RECORD_SELF))
                 cards = c["cards"]
                 card_parts = [self.cards.render(cards[r]) for r in ("style", "gm", "persona", "world", "scenario") if cards.get(r)]
                 card_parts += [self.cards.render(ch) for ch in cards["character"]]
@@ -4841,6 +4865,29 @@ def _(
                 lo, hi = 3, 6
             return {"paragraphs": n, "sent_lo": lo, "sent_hi": hi}
 
+        VOLATILE = {"mood": 2, "plan_now": 6}  # world hours after which a recorded value may be out of date
+
+        def status_json(self, fields, seen, now):
+            """Status as JSON. Mood and plans recorded long ago (world time) carry their age, so an old mood is not played
+            as the current one."""
+            out = {}
+            for k, v in fields.items():
+                if v in (None, "", [], {}):
+                    continue
+                t, hrs = (seen or {}).get(k), self.VOLATILE.get(k)
+                if hrs and t and (now - t).total_seconds() >= hrs * 3600:
+                    v = f"{v} (dicatat {self.world.fmt_span(int((now - t).total_seconds() // 60))} lalu; bisa sudah berubah)"
+                out[k] = v
+            return json.dumps(out, ensure_ascii=False)
+
+        @staticmethod
+        def _present_before(path):
+            """Names that were in the scene in the previous turn's note (stored with that player message)."""
+            for m in reversed(path[:-1]):
+                if m["role"] == "user":
+                    return set(re.findall(r"^Tokoh di adegan, (.+?):$", ((m.get("meta") or {}).get("ephemeral") or ""), re.M))
+            return set()
+
         def ephemeral(self, chat_id, path, user_text, extra=None, length=None):
             """The temporary block for the last user message, plus what it used (for marking events shown)."""
             c = self.ctx(chat_id)
@@ -4861,6 +4908,9 @@ def _(
             wthr = self.world.weather((c["story"] or {}).get("id"), c["cards"], st["time"])
             if wthr:
                 lines[0] += f" · cuaca {wthr['text']}"
+            lines.append("Data di bawah ini acuan konsistensi, bukan daftar yang harus disebut. Pakai hanya yang relevan dengan "
+                         "adegan sekarang; jangan menyebut ulang pakaian, mood, luka, isi kartu, hubungan, atau benang cerita "
+                         "tanpa alasan di adegan.")
             for e in self.world.due_timeline(chat_id, c["cards"], st["time"], ids):
                 lines.append(f"Peristiwa garis waktu terjadi sekarang ({e['at']}): {e['title']}. {e['text']}")
                 used["timeline"].append(e)
@@ -4870,14 +4920,21 @@ def _(
                 used["events"] = [e["id"] for e in news]
             threads = THREADS.list(chat_id, now=st["time"])
             if threads:
-                lines.append("Benang cerita terbuka:\n" + "\n".join(THREADS.line(r) for r in threads[:10]))
+                # only what presses (due) or touches the scene: the full list every turn pushes the model to force them in
+                scene = set(TXT.content_words(user_text + "\n" + (path[-2]["content"] if len(path) > 1 else "")))
+                hot = [r for r in threads if r["overdue"] or r["due_soon"]
+                       or scene & set(TXT.content_words(" ".join(str(r.get(k) or "") for k in ("title", "text", "who"))))][:6]
+                if hot:
+                    rest = len(threads) - len(hot)
+                    lines.append("Benang cerita yang mendesak atau terkait adegan:\n" + "\n".join(THREADS.line(r) for r in hot)
+                                 + (f"\n(+{rest} benang terbuka lain, tidak terkait adegan ini)" if rest else ""))
             pend = self.stories.pending_list((c["story"] or {}).get("id"), chat_id)
             if pend:
                 lines.append("Perubahan sejak prompt dibekukan (berlaku sekarang):\n" + "\n".join(f"- {p['text']}" for p in pend))
             if st["stats"]:
                 lines.append("Statistik pemain: " + ", ".join(f"{s['label']} {s['value']:g}" for s in st["stats"]))
             if st["status"].get("player"):
-                lines.append("Status pemain: " + json.dumps(st["status"]["player"], ensure_ascii=False))
+                lines.append("Status pemain: " + self.status_json(st["status"]["player"], st["seen_at"].get("player"), st["time"]))
             recent = user_text + "\n" + (path[-2]["content"] if len(path) > 1 else "")
             mine = KNOW.relevant(chat_id, "player", recent, limit=6)
             if mine:
@@ -4890,17 +4947,20 @@ def _(
                 lines.append(f"Waktu tempuh dari {here}: " + ", ".join(f"{p} {m} menit" for p, m in trips[:8])
                              + " (pakai world_advance sesuai perjalanan)")
             present = self.present_characters(c, recent, where)
+            before = self._present_before(path)
             for ch in present:
                 bits = []
                 cur = dict(where.get(ch["name"]) or {})
                 guess = cur.pop("location_from", None) == "jadwal"
                 if cur:
-                    bits.append("status " + json.dumps(cur, ensure_ascii=False)
+                    bits.append("status " + self.status_json(cur, st["seen_at"].get(ch["name"]), st["time"])
                                 + (" (lokasi/kegiatan: perkiraan jadwal; kalau narasi menunjukkan lain, narasi yang benar)" if guess else ""))
                 rel = [(b, v) for (a, b), v in RELATIONS.scores(chat_id).items() if a == ch["name"]]
                 if rel:
-                    bits.append("perasaan: " + "; ".join(f"ke {'pemain' if b == 'player' else b} {Relations.word(v['score'])} "
-                                                         f"({v['score']:+.0f}, terakhir: {v['last']})" for b, v in rel[:6]))
+                    fresh = set(ids[-6:])  # a reason is news for a few turns; after that it is simply how they feel
+                    bits.append("perasaan: " + "; ".join(f"ke {'pemain' if b == 'player' else b} {Relations.word(v['score'])}"
+                                                         + (f" (baru: {v['last']})" if v.get("mid") in fresh and v["last"] else "")
+                                                         for b, v in rel[:6]))
                 heads = KNOW.relevant(chat_id, ch["name"], recent, limit=6)
                 if heads:
                     bits.append("ingatan (yang ia tahu atau yakini):\n" + "\n".join(KNOW.line(r) for r in heads))
@@ -4908,9 +4968,15 @@ def _(
                     known = self.world.world_events(chat_id, ids, who=ch["name"], limit=3)
                     if known:
                         bits.append("baru tahu: " + "; ".join(e["text"][:200] for e in known))
-                detail = self.cards.render(ch, mode="detail", limit=2500)
-                if detail:
-                    bits.append(detail)
+                # the whole card detail when the character enters the scene; while they stay, what steers reactions
+                if ch["name"] in before:
+                    detail = self.cards.render(ch, mode="detail", keys=["fears", "relations", "knowledge"], limit=900)
+                    if detail:
+                        bits.append(detail + "\n(detail kartu lain: card_read kalau perlu)")
+                else:
+                    detail = self.cards.render(ch, mode="detail", limit=2500)
+                    if detail:
+                        bits.append(detail)
                 if bits:
                     lines.append(f"Tokoh di adegan, {ch['name']}:\n" + "\n".join(bits))
             # people without a card (a landlord, squad mates) whose status was recorded: shown when here or named
@@ -4921,7 +4987,7 @@ def _(
                     continue
                 loc = str(fields.get("location") or "").strip().lower()
                 if subject.lower() in low or (here and loc and loc == str(here).strip().lower()):
-                    lines.append(f"Tokoh tanpa kartu, {subject}: status " + json.dumps(fields, ensure_ascii=False)[:600])
+                    lines.append(f"Tokoh tanpa kartu, {subject}: status " + self.status_json(fields, st["seen_at"].get(subject), st["time"])[:600])
             lore = self.mem.lore_triggered(c["mem"]["card_ids"], recent)
             if lore:
                 lines.append("Lore terkait:\n" + "\n".join(
@@ -4937,14 +5003,20 @@ def _(
             if c["settings"].get("note"):
                 lines.append("Catatan penulis: " + c["settings"]["note"])
             if (self.gm(c).get("state_check") or "ya") == "ya":
-                lines.append("Pengetahuan tokoh, benang cerita, dan hubungan yang tidak sempat kamu catat akan dilengkapi pemeriksa "
-                             "setelah giliran; utamakan narasi. Waktu, dadu, dan status tetap catat sendiri.")
+                if RECORD_MARK in self.system_text(chat_id):  # this epoch's prompt already leaves them to the checker
+                    lines.append("Pengetahuan tokoh, hubungan, dan benang cerita dicatat pemeriksa dari narasimu; utamakan narasi. "
+                                 "Waktu, dadu, dan status tetap catat sendiri.")
+                else:
+                    lines.append("Pengetahuan tokoh, benang cerita, dan hubungan yang tidak sempat kamu catat akan dilengkapi "
+                                 "pemeriksa setelah giliran; utamakan narasi. Waktu, dadu, dan status tetap catat sendiri.")
             tgt = self.length_target(c) if length is None else (length or None)
             if tgt:
-                lines.append(f"Panjang giliran ini: {tgt['paragraphs']} paragraf, {tgt['sent_lo']}-{tgt['sent_hi']} kalimat per "
-                             f"paragraf. Susun kerangka per paragraf di thinking dulu. Kalau target panjang bertabrakan dengan titik "
-                             f"pemain harus merespons, titik berhenti menang: isi dengan reaksi dan suasana sebelum titik itu, jangan "
-                             f"memajukan waktu atau aksi.")
+                total = tgt["paragraphs"] * (tgt["sent_lo"] + tgt["sent_hi"]) // 2
+                lines.append(f"Panjang giliran ini: sekitar {total} kalimat, kira-kira {tgt['paragraphs']} paragraf narasi berisi "
+                             f"{tgt['sent_lo']}-{tgt['sent_hi']} kalimat. Panjang paragraf boleh bervariasi; ucapan tokoh boleh berdiri "
+                             f"sebagai paragraf pendek di antaranya dan tidak dihitung sebagai paragraf narasi. Kalau target panjang "
+                             f"bertabrakan dengan titik pemain harus merespons, titik berhenti menang: isi dengan reaksi dan suasana "
+                             f"sebelum titik itu, jangan memajukan waktu atau aksi.")
                 used["length"] = tgt
             for x in (extra or []):
                 lines.append(x)
@@ -4982,11 +5054,12 @@ def _(
                 note = "\n\n".join([note] + [x for x in also if x]).strip()
             if note and target is not None:
                 persona = (((self.ctx(chat_id).get("cards") or {}).get("persona")) or {}).get("name") or "kamu"
-                block = "\n\n[Catatan sistem untuk giliran ini, bukan tulisan pemain]\n" + TXT.macros(note, user=persona)
+                # the note first and the player's own words last: what the player did is the last thing the model reads
+                block = "[Catatan sistem untuk giliran ini, bukan tulisan pemain]\n" + TXT.macros(note, user=persona) + "\n\n[Pesan pemain]\n"
                 if isinstance(target["content"], list):
-                    target["content"] = target["content"] + [{"type": "text", "text": block}]
+                    target["content"] = [{"type": "text", "text": block}] + target["content"]
                 else:
-                    target["content"] = target["content"] + block
+                    target["content"] = block + target["content"]
             return [{k: v for k, v in m.items() if not k.startswith("_")} for m in msgs], used
 
         def side(self, chat_id, instruction, path=None):
@@ -5255,7 +5328,7 @@ def _(TXT, re, threading, time):
             head = path[-1]["id"] if path else None
             allowed = {"canon_set", "memory_save", "memory_update", "memory_forget", "status_update", "fact_save", "world_event",
                        "knowledge_add", "tell", "thread_open", "thread_close"}
-            tools = [t for t in toolbox.specs(c) if t["function"]["name"] in allowed]
+            tools = toolbox.specs(c)  # the chat's full list: same prompt prefix as the turns (cache); allowed limits what runs
             for _ in range(4):
                 acc = self.llm.chat(msgs, tools=tools, kwargs=self.prompt.kwargs(c), sampling={"temperature": 0.6},
                                     max_tokens=8000, stop=self.cancel, on_delta=on_delta)
@@ -5272,7 +5345,7 @@ def _(TXT, re, threading, time):
                                              "function": {"name": cl["name"], "arguments": cl["arguments"] or "{}"}}
                                             for i, cl in enumerate(calls)]})
                 for i, cl in enumerate(calls):
-                    res, _, _ = toolbox.call(chat_id, head, cl["name"], cl["arguments"])
+                    res, _, _ = toolbox.call(chat_id, head, cl["name"], cl["arguments"], allowed=allowed)
                     msgs.append({"role": "tool", "tool_call_id": cl["id"] or f"f{i}", "content": res})
 
         def summarize(self, chat_id, path, a, b, budget, think, tools, on_delta=None):
@@ -6388,7 +6461,9 @@ def _(
     - apa yang disaksikan atau didengar tokoh yang hadir, termasuk tokoh pemain (knowledge_add), dan apa yang diceritakan
       antar tokoh (tell);
     - janji, janji temu, utang, atau misteri baru (thread_open), dan benang yang selesai (thread_close);
+    - mood, rencana, atau kegiatan tokoh yang sudah berubah atau mereda dibanding status tercatat (status_update);
     - perubahan perasaan antar tokoh atau terhadap pemain karena kejadian di narasi (relationship).
+    Pakai hanya tool yang disebut di atas.
     Sudah tercatat di giliran ini:
     {done}
     Keadaan tercatat sekarang (jangan dicatat ulang; benang yang sudah ada jangan dibuka lagi):
@@ -6465,6 +6540,7 @@ def _(
             self.bg_busy = False
             self.fact_jobs = []
             self.continuity_jobs = []
+            self.offscreen_jobs = []  # chats whose off-screen world is due to move (world time passed in play)
             self.compact_backoff = {}  # chat id -> time before which idle compaction is not retried
             self.afk_lock = threading.Lock()
             self.backfilled = False
@@ -6540,6 +6616,7 @@ def _(
                 time.sleep(0.1)
             self.fact_jobs[:] = [j for j in self.fact_jobs if j[0] != chat_id]
             self.continuity_jobs[:] = [j for j in self.continuity_jobs if j[0] != chat_id]
+            self.offscreen_jobs[:] = [j for j in self.offscreen_jobs if j != chat_id]
             for d in (self.compact_backoff, self.last_used):
                 d.pop(chat_id, None)
             if self.active_chat == chat_id:
@@ -6786,6 +6863,7 @@ def _(
                 self.world.advance(chat_id, uid, minutes, "AFK")
             self._tick(chat_id, t0, minutes, "Pemain sedang tidak ada (AFK). Tokoh yang sedang satu adegan dengan pemain tetap di "
                                              "tempat dan menunggu, kecuali waktunya sangat lama.", head=uid, stop=self.stop)
+            self._offscreen_done(chat_id, t0 + timedelta(minutes=minutes))
             self._away_notice(chat_id, before, minutes)
             return [f"Pemain baru kembali setelah {World.fmt_span(minutes)} waktu dunia berlalu. Kejadian selama itu ada di atas."]
 
@@ -6977,6 +7055,10 @@ def _(
                 except Exception as e:
                     self.emit("live", {})
                     self.emit("toast", {"text": f"Pemeriksaan setelah giliran gagal: {type(e).__name__}: {e}", "kind": "warn"})
+                try:
+                    self._queue_offscreen(chat_id, c)
+                except Exception:
+                    pass
             self.emit("history", chat_id)
             self.emit("panels", chat_id)
             self.emit("ctx", {"used": self.last_used.get(chat_id, 0), "max": self.llm.max_context()})
@@ -7048,19 +7130,38 @@ def _(
             if not m or not full.strip():
                 return
             # world: mark events the player has now been told about (by this reply), fire due timeline entries
+            # News the note offered counts as told only when the reply tells it (or after three offers), else the player
+            # never learns it. A timeline entry that fired but was not narrated waits as news the same way.
+            offered = {}
             if used.get("events"):
-                self.world.mark_shown(used["events"], mid)
+                prev = (self.store.chat(chat_id) or {}).get("settings", {}).get("offered") or {}
+                told = []
+                for r in self.store.q(f"SELECT id, text FROM world_events WHERE id IN ({','.join('?' * len(used['events']))})",
+                                      list(used["events"])):
+                    n = int(prev.get(str(r["id"]), 0)) + 1
+                    if TXT.mentions(full, r["text"]) or n >= 3:
+                        told.append(r["id"])
+                    else:
+                        offered[str(r["id"])] = n
+                self.world.mark_shown(told, mid)
+            self.store.chat_settings(chat_id, offered=offered)
             for e in used.get("timeline") or []:
-                self.world.add_world_event(chat_id, mid, e["at"], f"{e['title']}. {e['text']}", ["player"], True, f"timeline:{e['id']}")
+                text = f"{e['title']}. {e['text']}"
+                eid = self.world.add_world_event(chat_id, mid, e["at"], text, ["player"], True, f"timeline:{e['id']}")
+                if TXT.mentions(full, text):
+                    self.world.mark_shown([eid], mid)
             flags = []
             # length: continue once if clearly short
             tgt = used.get("length")
             if tgt:
                 paras, sents = TXT.shape(full)
-                # a reply that hands over with a question to the player is complete: more text would run past that point
-                handed_over = re.search(r"\?\s*[\"”“»«']?\s*$", full.rstrip().split("\n\n")[-1])
-                if paras < tgt["paragraphs"] - 1 and not self.stop.is_set() and not handed_over:
-                    add = tgt["paragraphs"] - paras
+                # A reply that hands over (a question, or a character speaking last and waiting) is complete: more text would
+                # run past that point. Only a clearly short reply (under half the target's sentences) is continued.
+                last = full.rstrip().split("\n\n")[-1]
+                handed_over = re.search(r"\?\s*[\"”“»«']?\s*$", last) or re.search(r"[\"“”„«»]", last)
+                short = paras < tgt["paragraphs"] - 1 and sum(sents) * 2 < tgt["paragraphs"] * tgt["sent_lo"]
+                if short and not self.stop.is_set() and not handed_over:
+                    add = max(1, tgt["paragraphs"] - paras)
                     self.emit("live", {"active": True, "content": m["content"], "phase": "Menambah paragraf…", "reasoning": "",
                                        "tools": [], "chat_id": chat_id})
                     instr = (f"Lanjutkan narasi tepat dari akhir jawaban terakhir dengan {add} paragraf lagi "
@@ -7209,7 +7310,7 @@ def _(
                         advanced = advanced or fn.get("name") == "world_advance"
             names = {"world_advance", "status_update", "knowledge_add", "tell", "world_event", "thread_open", "thread_close",
                      "relationship"}
-            tools = [t for t in self.tools.specs(c) if t["function"]["name"] in names]
+            tools = self.tools.specs(c)  # the chat's full list: same prompt prefix as the turn (cache); names limits what runs
             kw = self.prompt.side_kwargs(c)
             st = self.world.state(chat_id, ids)
             now = [f"Jam {st['time_text']}"]
@@ -7771,14 +7872,62 @@ def _(
             self.world.advance(chat_id, uid, minutes, f"lompat {label}")
             self.emit("history", chat_id)
             self._tick(chat_id, t0, minutes, f"Pemain melompati waktu {label} dan menjalani rutinitas yang wajar.", head=uid)
+            self._offscreen_done(chat_id, t0 + timedelta(minutes=minutes))
             self._turn(chat_id)  # the time skip note comes from the user message (a reroll gets it too)
+
+        OFFSCREEN_HOURS = 4
+
+        def _offscreen_span(self, chat_id, c=None):
+            """(world time of the last off-screen move, now, minutes since) on the active branch when it is due, else None."""
+            if not self.store.chat(chat_id):
+                return None
+            c = c or self.prompt.ctx(chat_id)
+            try:
+                hours = float(self.prompt.gm(c).get("offscreen_hours", self.OFFSCREEN_HOURS) or 0)
+            except (TypeError, ValueError):
+                hours = self.OFFSCREEN_HOURS
+            if hours <= 0:
+                return None
+            now = self.world.state(chat_id, self.store.path_ids(chat_id))["time"]
+            sync = TXT.parse_datetime((self.store.chat(chat_id) or {}).get("settings", {}).get("offscreen_sync") or "")
+            if not sync or sync > now:  # the first time, or the branch went back in time: count from here
+                self._offscreen_done(chat_id, now)
+                return None
+            minutes = int((now - sync).total_seconds() // 60)
+            return (sync, now, minutes) if minutes >= hours * 60 else None
+
+        def _offscreen_done(self, chat_id, t):
+            self.store.chat_settings(chat_id, offscreen_sync=t.strftime("%Y-%m-%d %H:%M"))
+
+        def _queue_offscreen(self, chat_id, c=None):
+            if chat_id not in self.offscreen_jobs and self._offscreen_span(chat_id, c):
+                self.offscreen_jobs.append(chat_id)
+
+        def _offscreen(self, chat_id, stop=None):
+            """Characters away from the player's scene follow their agendas for the world time that passed in play (runs in
+            the background; a new message stops it and it runs again later)."""
+            span = self._offscreen_span(chat_id)
+            if not span:
+                return
+            sync, now, minutes = span
+            stop = stop or self.stop
+            self.emit("status", "Dunia di luar layar bergerak…")
+            try:
+                self._tick(chat_id, sync, minutes, "Waktu itu berlalu selama adegan pemain. Gerakkan hanya tokoh dan pihak yang TIDAK "
+                                                   "sedang satu adegan dengan pemain; tokoh di adegan pemain jangan diubah.", stop=stop)
+            finally:
+                self.emit("status", "")
+            if not stop.is_set():
+                self._offscreen_done(chat_id, now)
+                self.emit("panels", chat_id)
 
         def _tick(self, chat_id, t0, minutes, why, head=None, stop=None):
             c = self.prompt.ctx(chat_id)
             allowed = {"world_event", "status_update", "roll", "tell", "knowledge_add", "thread_close", "thread_open"}
-            tools = [t for t in self.tools.specs(c) if t["function"]["name"] in allowed]
+            tools = self.tools.specs(c)  # the chat's full list: same prompt prefix as the turns (cache); allowed limits what runs
             t1 = t0 + timedelta(minutes=minutes)
             instr = TICK_INSTRUCTION.format(span=World.fmt_span(minutes), t0=World.fmt_time(t0), t1=World.fmt_time(t1), why=why)
+            instr += "\nPakai hanya world_event, status_update, tell, knowledge_add, roll, thread_open, dan thread_close."
             due = [r for r in THREADS.list(chat_id, now=t1) if r["overdue"]]
             if due:
                 instr += ("\nBenang cerita yang lewat tenggat selama itu (tentukan akibatnya dengan world_event; thread_close kalau "
@@ -7831,6 +7980,8 @@ def _(
                     chat_id, mid = self.continuity_jobs.pop(0)
                     if self.store.msg(mid):
                         self._continuity_check(chat_id, mid, False)
+                while self.offscreen_jobs and not self.busy and not self.bg_cancel.is_set():
+                    self._offscreen(self.offscreen_jobs.pop(0), stop=self.bg_cancel)
                 chat_id = self.active_chat
                 chat = self.store.chat(chat_id) if chat_id else None
                 if not chat:
@@ -7899,6 +8050,7 @@ def _(
                     self._tick(chat_id, t0, minutes, "Pemain sedang tidak ada (AFK). Tokoh yang sedang satu adegan dengan pemain "
                                                      "tetap di tempat dan menunggu, kecuali waktunya sangat lama.",
                                head=head, stop=self.bg_cancel)
+                    self._offscreen_done(chat_id, t0 + timedelta(minutes=minutes))
                     self._away_notice(chat_id, before, minutes)
                     self.emit("status", "")
                     self.emit("panels", chat_id)
@@ -9936,7 +10088,7 @@ def _(
 
         def chat_info(self, chat):
             return {"id": chat["id"], "title": chat["title"], "kind": chat["kind"], "story_id": chat["story_id"],
-                    "settings": {k: v for k, v in chat["settings"].items() if k not in ("studio", "avoid", "openers")},
+                    "settings": {k: v for k, v in chat["settings"].items() if k not in ("studio", "avoid", "openers", "offered", "offscreen_sync")},
                     "system": chat["system"], "epoch": chat["epoch"],
                     "drafts": (chat["settings"].get("studio") or {}).get("drafts") or {}}
 
