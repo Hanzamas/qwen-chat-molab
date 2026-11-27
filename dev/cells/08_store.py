@@ -152,6 +152,10 @@ _COLUMNS_V2 = [
     ("lore_entries", "known_to", "TEXT NOT NULL DEFAULT ''"),  # empty: common knowledge; else who knows this lore
     ("pending_changes", "message_id", "INTEGER"),  # a change made by a turn waits only on that turn's branch
 ]
+# Columns added to tables of _SCHEMA_V2 (added after that schema ran).
+_COLUMNS_V3 = [
+    ("knowledge", "hidden_at", "TEXT NOT NULL DEFAULT ''"),  # messages (comma list) after which the user deleted it
+]
 _SCHEMA_V2 = """
 CREATE TABLE IF NOT EXISTS canon_log (
     id INTEGER PRIMARY KEY, story_id INTEGER NOT NULL, chat_id INTEGER, message_id INTEGER, section TEXT NOT NULL,
@@ -237,6 +241,9 @@ class Store:
             if col not in self._columns(table):
                 self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
         self.conn.executescript(_SCHEMA_V2)
+        for table, col, decl in _COLUMNS_V3:
+            if col not in self._columns(table):
+                self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
         self.conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         self.conn.commit()
 
@@ -566,6 +573,11 @@ class Store:
         """Everything a turn left behind, for messages that are being deleted (call with the lock held, before the
         messages themselves go). Memory logs stay: an update whose message is gone simply never applies again."""
         ids = list(ids)
+        gone = set(ids)
+        for kid, hid in self.conn.execute("SELECT id, hidden_at FROM knowledge WHERE hidden_at != ''").fetchall():
+            keep = [x for x in hid.split(",") if x.strip().isdigit() and int(x) not in gone]
+            if len(keep) != len([x for x in hid.split(",") if x.strip()]):
+                self.conn.execute("UPDATE knowledge SET hidden_at = ? WHERE id = ?", (",".join(keep), kid))
         for i in range(0, len(ids), 500):
             part = ids[i:i + 500]
             marks = ",".join("?" * len(part))

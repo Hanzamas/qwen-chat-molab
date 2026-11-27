@@ -1142,6 +1142,10 @@ def _(CFG, Path, json, os, sqlite3, threading, time):
         ("lore_entries", "known_to", "TEXT NOT NULL DEFAULT ''"),  # empty: common knowledge; else who knows this lore
         ("pending_changes", "message_id", "INTEGER"),  # a change made by a turn waits only on that turn's branch
     ]
+    # Columns added to tables of _SCHEMA_V2 (added after that schema ran).
+    _COLUMNS_V3 = [
+        ("knowledge", "hidden_at", "TEXT NOT NULL DEFAULT ''"),  # messages (comma list) after which the user deleted it
+    ]
     _SCHEMA_V2 = """
     CREATE TABLE IF NOT EXISTS canon_log (
         id INTEGER PRIMARY KEY, story_id INTEGER NOT NULL, chat_id INTEGER, message_id INTEGER, section TEXT NOT NULL,
@@ -1227,6 +1231,9 @@ def _(CFG, Path, json, os, sqlite3, threading, time):
                 if col not in self._columns(table):
                     self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
             self.conn.executescript(_SCHEMA_V2)
+            for table, col, decl in _COLUMNS_V3:
+                if col not in self._columns(table):
+                    self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
             self.conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             self.conn.commit()
 
@@ -1556,6 +1563,11 @@ def _(CFG, Path, json, os, sqlite3, threading, time):
             """Everything a turn left behind, for messages that are being deleted (call with the lock held, before the
             messages themselves go). Memory logs stay: an update whose message is gone simply never applies again."""
             ids = list(ids)
+            gone = set(ids)
+            for kid, hid in self.conn.execute("SELECT id, hidden_at FROM knowledge WHERE hidden_at != ''").fetchall():
+                keep = [x for x in hid.split(",") if x.strip().isdigit() and int(x) not in gone]
+                if len(keep) != len([x for x in hid.split(",") if x.strip()]):
+                    self.conn.execute("UPDATE knowledge SET hidden_at = ? WHERE id = ?", (",".join(keep), kid))
             for i in range(0, len(ids), 500):
                 part = ids[i:i + 500]
                 marks = ",".join("?" * len(part))
@@ -1933,6 +1945,25 @@ def _(datetime, re):
         # ---------- RP checks ----------
 
         @staticmethod
+        def opening(text, n=5):
+            """The first words of a reply, without a leading **Name** speaker tag."""
+            t = re.sub(r"^\s*\*\*[^*\n]{1,60}\*\*\s*[:：]?", "", (text or "").strip())
+            return TXT.words(t)[:n]
+
+        @staticmethod
+        def repeats_opening(mine, previous):
+            """A reply starts like the recent ones: the same first three words as one of them or three content words shared
+            with it, the same first two words as both of the last two, or the same first word as all of the last four."""
+            if len(mine) < 3:
+                return False
+            for p in previous:
+                if p[:3] == mine[:3] or len((set(p) & set(mine)) - TXT.ALL_STOP) >= 3:
+                    return True
+            if len(previous) >= 2 and all(p[:2] == mine[:2] for p in previous[-2:]):
+                return True
+            return len(previous) >= 4 and all(p[:1] == mine[:1] for p in previous[-4:])
+
+        @staticmethod
         def repeated_phrases(text, previous, n=5, min_hits=2, top=5):
             """Word n-grams of `text` that already appeared in the previous replies (min_hits times in total)."""
             def grams(s):
@@ -2178,12 +2209,17 @@ def _():
         ]},
     }
 
+    # Default values that changed: a default card still holding the old value moves to the new one, once per database.
+    DEFAULTS_CHANGED = [("style", "Gaya RP default", "paragraphs", "5-10", "4-7"),
+                        ("style", "Gaya RP default", "sentences", "5-10", "4-7"),
+                        ("gm", "GM membumi", "afk_scale", "1", "0")]
+
     DEFAULT_CARDS = [
         ("style", "Gaya RP default", {
             "pov": "orang kedua (kamu)", "narration_lang": "Indonesia",
             "dialogue_rule": "Dialog ditulis dalam bahasa tokohnya. Kalau bukan bahasa Indonesia, tulis kalimatnya UTUH dalam satu "
                              "tanda kutip, lalu terjemahannya SATU kali dalam kurung tepat setelahnya.",
-            "paragraphs": "5-10", "sentences": "5-10",
+            "paragraphs": "4-7", "sentences": "4-7",
             "sentence_style": "Kalimat panjang yang merangkai deskripsi, gerak, dan ucapan tokoh. Detail konkret dan indrawi.",
             "dialogue_ratio": "30-50%", "violence": "sedang", "tone": "Membumi dan wajar, tanpa superlatif.",
             "pacing": "Sedang; tiap paragraf memajukan sesuatu.",
@@ -2205,14 +2241,24 @@ def _():
             "checklist": ["Masuk akal secara fisik?", "Apa akibatnya?", "Tokoh ini sebenarnya tahu apa?",
                           "Berapa waktu yang lewat?", "Ada yang lebay?", "Ada fakta nyata yang belum pasti?"],
             "rules": [], "choices": "kadang", "choice_problems": "1-3", "choice_options": "3-5", "choice_sentences": "1-2",
-            "time_skips": ["2 jam", "3 jam", "1 hari", "1 minggu", "1 bulan"], "afk_scale": "1", "tick_minutes": "20",
+            "time_skips": ["2 jam", "3 jam", "1 hari", "1 minggu", "1 bulan"], "afk_scale": "0", "tick_minutes": "20",
         }),
     ]
-    return DEFAULT_CARDS, DEFAULT_SCHEMAS
+    return DEFAULTS_CHANGED, DEFAULT_CARDS, DEFAULT_SCHEMAS
 
 
 @app.cell(hide_code=True)
-def _(DEFAULT_CARDS, DEFAULT_SCHEMAS, STORE, TXT, base64, json, re, time):
+def _(
+    DEFAULTS_CHANGED,
+    DEFAULT_CARDS,
+    DEFAULT_SCHEMAS,
+    STORE,
+    TXT,
+    base64,
+    json,
+    re,
+    time,
+):
     import struct as _struct
     import zlib as _zlib
 
@@ -2248,6 +2294,13 @@ def _(DEFAULT_CARDS, DEFAULT_SCHEMAS, STORE, TXT, base64, json, re, time):
             for t, name, data in DEFAULT_CARDS:
                 if not self.store.one("SELECT id FROM cards WHERE type = ? LIMIT 1", (t,)):
                     self.save(None, t, data, name=name)
+            if self.store.meta_get("defaults_v2") is None:
+                for t, name, key, old, new in DEFAULTS_CHANGED:
+                    for r in self.store.q("SELECT id FROM cards WHERE type = ? AND name = ?", (t, name)):
+                        c = self.get(r["id"])
+                        if c and str(c["data"].get(key, "")).strip() == old:
+                            self.save(c["id"], t, {**c["data"], key: new})  # a new version: the old one stays restorable
+                self.store.meta_set("defaults_v2", "1")
 
         def schema(self, type_):
             row = self.store.one("SELECT json FROM card_schemas WHERE type = ?", (type_,))
@@ -3911,13 +3964,40 @@ def _(
         def __init__(self, store):
             self.store = store
 
-        def _rows(self, chat_id, sql="", args=()):
+        @staticmethod
+        def _hides(r):
+            return {int(x) for x in (r.get("hidden_at") or "").split(",") if x.strip().isdigit()}
+
+        def _rows(self, chat_id, sql="", args=(), hidden=False):
+            """Rows that count on the active branch; hidden=True: the ones forgotten on it instead."""
             chats = self.store.lineage(chat_id)
             vis = self.store.visible_ids(chat_id)
             rows = self.store.q(f"SELECT * FROM knowledge WHERE chat_id IN ({','.join('?' * len(chats))}) {sql}",
                                 list(chats) + list(args)) if chats else []
-            return [r for r in rows if (not r["message_id"] or r["message_id"] in vis)
-                    and not (r["forgotten_at"] and r["forgotten_at"] in vis)]
+
+            def forgotten(r):
+                return bool(r["forgotten_at"] and r["forgotten_at"] in vis) or bool(self._hides(r) & vis)
+            return [r for r in rows if (not r["message_id"] or r["message_id"] in vis) and forgotten(r) == hidden]
+
+        def hide(self, kid, message_id):
+            """The user's delete: forgotten on the branches through message_id only, and restorable."""
+            r = self.store.one("SELECT hidden_at FROM knowledge WHERE id = ?", (kid,))
+            if r:
+                ids = sorted(self._hides(r) | {int(message_id)})
+                self.store.x("UPDATE knowledge SET hidden_at = ? WHERE id = ?", (",".join(map(str, ids)), kid))
+
+        def restore(self, kid, chat_id):
+            """Undo every forget of this row that lies on the active branch (the user's deletes and the model's)."""
+            r = self.store.one("SELECT hidden_at, forgotten_at FROM knowledge WHERE id = ?", (kid,))
+            if not r:
+                return
+            vis = self.store.visible_ids(chat_id)
+            self.store.x("UPDATE knowledge SET hidden_at = ?, forgotten_at = ? WHERE id = ?",
+                         (",".join(map(str, sorted(self._hides(r) - vis))),
+                          None if r["forgotten_at"] in vis else r["forgotten_at"], kid))
+
+        def hidden(self, chat_id, holder, limit=100):
+            return sorted(self._rows(chat_id, "AND holder = ?", (holder,), hidden=True), key=lambda r: -r["id"])[:limit]
 
         def add(self, chat_id, message_id, holders, text, kind="fakta", source="lihat sendiri", source_who="", truth="benar",
                 importance=0.5, world_time=""):
@@ -6760,6 +6840,10 @@ def _(
             avoid = c["settings"].get("avoid") or []
             if avoid and not turn["ooc"]:
                 extra.append("Hindari frasa yang sudah berulang ini: " + "; ".join(f'"{p}"' for p in avoid[:8]))
+            openers = c["settings"].get("openers") or []
+            if openers and not turn["ooc"]:
+                extra.append("Variasikan pembuka balasan. Balasan terakhir dimulai dengan pola yang sama seperti sebelumnya ("
+                             + ", ".join(f'"{o["text"]}…"' for o in openers[-3:]) + "). Mulai giliran ini dengan cara lain.")
             error, state = None, None
             seen_calls, fails_in_row = {}, 0
             try:
@@ -6933,6 +7017,22 @@ def _(
                 start -= 1
             return start, end
 
+        @staticmethod
+        def _openings(path, start, k=4):
+            """First words of the last k turns before `start`: each turn's first narration (a group round counts each
+            speaker's reply as a turn), OOC answers left out."""
+            out, fresh = [], True  # the story opening counts as a turn
+            for x in path[:start]:
+                if x["role"] == "user":
+                    fresh = True
+                    continue
+                if fresh and x["role"] == "assistant" and not x.get("ooc") and (x["content"] or "").strip():
+                    out.append(TXT.opening(x["content"]))
+                    fresh = False
+                if (x.get("meta") or {}).get("speaker"):
+                    fresh = True
+            return out[-k:]
+
         @classmethod
         def _turn_text(cls, path, mid):
             """All narration of the turn that ends at mid (rounds before and after tool calls), and the earlier replies."""
@@ -6997,6 +7097,15 @@ def _(
             self.store.chat_settings(chat_id, avoid=(rep + old)[:8])  # rolling: a phrase stays avoided for a while
             if rep:
                 flags.append({"kind": "repeat", "text": "Frasa berulang: " + "; ".join(rep[:4])})
+            # openings: a reply that starts like the recent ones; the next turns are told to start differently (3 turns)
+            mine = TXT.opening(full)
+            openers = [dict(o, left=o["left"] - 1) for o in (self.store.chat(chat_id) or {}).get("settings", {}).get("openers") or []
+                       if o.get("left", 0) > 1]
+            if TXT.repeats_opening(mine, self._openings(path, self._turn_start(path, mid)[0])):
+                text = " ".join(mine[:4])
+                openers = [o for o in openers if o["text"] != text] + [{"text": text, "left": 3}]
+                flags.append({"kind": "opening", "text": f"Pembuka mirip balasan sebelumnya: \"{text}…\""})
+            self.store.chat_settings(chat_id, openers=openers[-4:])
             banned = TXT.banned_hits(full, self.prompt.style(c).get("banned") or [])
             if banned:
                 flags.append({"kind": "banned", "text": "Frasa terlarang: " + ", ".join(banned)})
@@ -8270,14 +8379,39 @@ def _():
         const a = model.get("ack") || {};
         if (a.sid === sid) unacked = unacked.filter((c) => c._seq > a.seq);
       });
-      // A section of the drawer is not redrawn while someone types in it or has unsaved text in it (an open <select>
-      // counts too): the redraw would put the old text back.
-      const editing = (box) => {
-        if (!box) return false;
-        const f = rootActive();
-        if (f && box.contains(f) && /^(INPUT|TEXTAREA|SELECT)$/.test(f.tagName)) return true;
-        return [...box.querySelectorAll("input:not([type]), input[type=text], textarea")].some((i) => i.value !== i.defaultValue);
+      // Redrawing a drawer section: while a field in it has focus the redraw waits until focus leaves the section
+      // (redrawing under the cursor breaks typing and the phone keyboard). With keep, text typed and not saved yet stays.
+      const TEXT_FIELDS = "input:not([type]), input[type=text], textarea";
+      const fieldKey = (n) => {
+        const row = n.closest("[data-kid],[data-tid],[data-pid],[data-sec],[data-entry]");
+        const id = row ? ["kid", "tid", "pid", "sec", "entry"].map((k) => row.dataset[k] ?? "").join("/") : "";
+        return `${id}|${n.className}|${n.dataset.field || ""}`;
       };
+      const waiting = new Set();
+      const redraw = (box, html, keep = false) => {
+        if (!box) return;
+        const f = rootActive();
+        if (f && box.contains(f) && /^(INPUT|TEXTAREA|SELECT)$/.test(f.tagName)) { box._redraw = [html, keep]; waiting.add(box); return; }
+        const typed = new Map(), chat = String(get("chat").id || "");
+        if (keep && box.dataset.chat === chat)
+          box.querySelectorAll(TEXT_FIELDS).forEach((n) => { if (n.value !== n.defaultValue) typed.set(fieldKey(n), n.value); });
+        box._redraw = null; waiting.delete(box);
+        box.innerHTML = typeof html === "function" ? html() : html;
+        box.dataset.chat = chat;
+        if (typed.size) box.querySelectorAll(TEXT_FIELDS).forEach((n) => { const k = fieldKey(n); if (typed.has(k)) n.value = typed.get(k); });
+      };
+      let pointerDown = false;
+      const flushRedraws = () => {
+        if (pointerDown) return;  // a click inside the section is under way: its button must still be there for the click
+        for (const box of [...waiting]) {
+          if (!box.isConnected || !box._redraw) { waiting.delete(box); continue; }
+          const f = rootActive();
+          if (!(f && box.contains(f) && /^(INPUT|TEXTAREA|SELECT)$/.test(f.tagName))) redraw(box, ...box._redraw);
+        }
+      };
+      listen("focusout", () => setTimeout(flushRedraws, 0), true);
+      listen("pointerdown", () => { pointerDown = true; }, true);
+      for (const ev of ["pointerup", "pointercancel"]) listen(ev, () => setTimeout(() => { pointerDown = false; flushRedraws(); }, 60), true);
       const get = (k) => model.get(k) || {};
       const toast = (text, kind = "info", long = false) => {
         const t = document.createElement("div");
@@ -8386,7 +8520,16 @@ def _():
       // ---------- messages ----------
       function toolChips(tools, key) {
         if (!tools || !tools.length) return "";
-        return `<div class="qr-tools">${tools.map((t, j) => {
+        const chips = toolChipList(tools, key);
+        if (tools.length === 1) return `<div class="qr-tools">${chips}</div>`;
+        // several calls fold into one line; opened, each call shows as before
+        const k = `${key}-ts`, run = tools.some((t) => t.running), err = tools.filter((t) => t.error).length;
+        return `<div class="qr-tools"><details class="qr-tool qr-toolset ${err ? "err" : ""}" data-key="${k}" ${state.open.has(k) ? "open" : ""}>
+          <summary>${icon("tool")}<b>${tools.length} alat</b><span>${esc([...new Set(tools.map((t) => t.name))].join(", "))}</span>${run ? "<em>jalan…</em>" : err ? `<em>${err} gagal</em>` : ""}</summary>
+          <div class="qr-tools">${chips}</div></details></div>`;
+      }
+      function toolChipList(tools, key) {
+        return `${tools.map((t, j) => {
           const k = `${key}-t${j}`;
           const st = t.running ? "jalan…" : t.error ? "gagal" : "";
           let args = "";
@@ -8394,10 +8537,13 @@ def _():
           return `<details class="qr-tool ${t.error ? "err" : ""}" data-key="${k}" ${state.open.has(k) ? "open" : ""}>
             <summary>${icon("tool")}<b>${esc(t.name)}</b><span>${esc(args)}</span>${st ? `<em>${st}</em>` : ""}</summary>
             <pre>${esc(t.result || (t.running ? "…" : ""))}</pre></details>`;
-        }).join("")}</div>`;
+        }).join("")}`;
       }
+      // Live thinking opens by itself outside stories; in a story it stays closed (it can spoil the scene) until opened,
+      // and then stays open for the next replies too.
+      const rpChat = () => ["rp", "group"].includes(get("chat").kind);
       function thinkBlock(key, text, label, live) {
-        return `<details class="qr-think" data-key="${key}" ${state.open.has(key) || live ? "open" : ""}>
+        return `<details class="qr-think" data-key="${key}" ${state.open.has(key) || (live && !rpChat()) ? "open" : ""}>
           <summary>${icon("brain")}<span>${label}</span><span class="qr-muted">${fmtN(words(text))} kata</span></summary>
           <div class="qr-think-box"><div class="qr-think-body">${esc(text)}</div></div>
           ${live ? '<button class="qr-btn qr-sm qr-think-follow" data-act="think-follow" hidden>Ikuti</button>' : ""}
@@ -8545,7 +8691,7 @@ def _():
         if (!lv.active) { liveBox.innerHTML = ""; liveParts = null; thinkFollow = true; renderStatusLine(); return; }
         $(".qr-empty").hidden = true;
         if (!liveParts) {
-          liveBox.innerHTML = `<div class="qr-msg qr-bot qr-live-row">${thinkBlock("live-th", "", "Sedang berpikir", true)}
+          liveBox.innerHTML = `<div class="qr-msg qr-bot qr-live-row">${thinkBlock(rpChat() ? "live-th-rp" : "live-th", "", "Sedang berpikir", true)}
             <div class="qr-live-tools"></div><div class="qr-md"></div><div class="qr-phase qr-muted"></div>
             <div class="qr-typing"><span></span><span></span><span></span></div></div>`;
           liveParts = { think: liveBox.querySelector(".qr-think"), sum: liveBox.querySelector(".qr-think summary span"),
@@ -8626,6 +8772,13 @@ def _():
       }
 
       // ---------- card form ----------
+      // Suggestions the Style form can add to its rules. They only go into the form: the user edits them and saves.
+      const STYLE_SUGGEST = [
+        "Jangan membuka balasan dengan mengulang aksi atau ucapan pemain; langsung ke reaksi dan akibatnya.",
+        'Jangan menutup balasan dengan pertanyaan narator seperti "Apa yang kamu lakukan?"; berhenti di momen ketika pemain bisa bertindak.',
+        "Variasikan cara membuka balasan; jangan memulai beberapa balasan berturut-turut dengan pola yang sama.",
+        "Terjemahan dialog memakai bahasa Indonesia sehari-hari yang wajar, bukan terjemahan kata per kata.",
+      ];
       function fieldInput(f, v) {
         const key = esc(f.key);  // keys come from cards the model or an import wrote: never trust them in markup
         const name = `f-${String(f.key).replace(/[^\w-]/g, "_")}`;
@@ -8660,7 +8813,7 @@ def _():
         return `<div class="qr-card-form" data-card="${c.id}" data-version="${c.version}">
           <div class="qr-card-top">${c.avatar ? `<img class="qr-avatar" src="data:image/png;base64,${c.avatar}" alt="">` : `<div class="qr-avatar qr-noav">${icon("card")}</div>`}
             <div><div class="qr-muted">${esc((get("boot").types || {})[c.type] || c.type)} · versi ${c.version}</div><b>${esc(c.name)}</b></div></div>
-          ${Object.entries(sections).map(([s, fs]) => `<fieldset><legend>${esc(s)}</legend>${fs.map((f) => `<div class="qr-field">${fieldInput(f, c.data[f.key])}</div>`).join("")}</fieldset>`).join("")}
+          ${Object.entries(sections).map(([s, fs]) => `<fieldset><legend>${esc(s)}</legend>${fs.map((f) => `<div class="qr-field">${fieldInput(f, c.data[f.key])}${c.type === "style" && f.key === "rules" ? `<button class="qr-btn qr-sm" data-act="style-suggest" title="Menambahkan saran ke kolom ini; ubah atau hapus sebelum Simpan">${icon("plus")}Tambah saran aturan</button>` : ""}</div>`).join("")}</fieldset>`).join("")}
           <div class="qr-row qr-wrap">
             <button class="qr-btn qr-primary" data-act="card-save">${icon("check")}Simpan</button>
             ${compact ? "" : `<button class="qr-btn" data-act="card-avatar">${icon("upload")}Avatar</button>
@@ -8722,11 +8875,8 @@ def _():
         if (drawer.hidden) return;
         $(".qr-tabs").innerHTML = Object.keys(TAB_NAMES).map((t) => `<button class="qr-tabbtn ${t === state.tab ? "on" : ""}" data-act="tab" data-tab="${t}">${icon(TAB_ICONS[t])}${TAB_NAMES[t]}</button>`).join("");
         const fn = { chat: tabChat, story: tabStory, cards: tabCards, memory: tabMemory, model: tabModel, learn: tabLearn }[state.tab];
-        const active = el.getRootNode().activeElement || document.activeElement;  // the widget lives in a shadow root
-        if (active && dbody.contains(active) && /^(TEXTAREA|INPUT|SELECT)$/.test(active.tagName)) return;
-        if (state.tab === "story" && editing(dbody)) return;
         if (state.tab === "cards" && state.cardView && state.formDirty === state.cardView && dbody.querySelector(".qr-card-form")) return;
-        dbody.innerHTML = fn();
+        redraw(dbody, fn, state.tab === "story");
       }
       function tabChat() {
         const c = get("chat"), s = c.settings || {}, boot = get("boot"), srv = get("server");
@@ -8796,7 +8946,10 @@ def _():
             <span><input class="qr-know-text" value="${esc(r.text)}"><span class="qr-muted">${esc(r.source)}${r.source_who ? ` dari ${esc(r.source_who)}` : ""}${r.world_time ? ` · ${esc(r.world_time)}` : ""}</span></span>
             <select class="qr-know-truth">${["benar", "keliru", "belum pasti"].map((t) => `<option ${t === r.truth ? "selected" : ""}>${t}</option>`).join("")}</select>
             <button class="qr-icon qr-xs" data-act="know-save" title="Simpan">${icon("check")}</button>
-            <button class="qr-icon qr-xs" data-act="know-del" title="Hapus">${icon("trash")}</button></div>`).join("") || '<div class="qr-muted">Belum ada.</div>'}
+            <button class="qr-icon qr-xs" data-act="know-del" title="Lupakan di cabang ini (bisa dipulihkan)">${icon("trash")}</button></div>`).join("") || '<div class="qr-muted">Belum ada.</div>'}
+          ${(k.hidden || []).length ? `<details class="qr-know-hidden" data-key="know-hidden" ${state.open.has("know-hidden") ? "open" : ""}><summary class="qr-muted">Dilupakan di cabang ini (${k.hidden.length})</summary>
+            ${k.hidden.map((r) => `<div class="qr-memrow" data-kid="${r.id}"><span class="qr-badge">${esc(r.kind)}</span><span class="qr-muted"><s>${esc(r.text)}</s></span>
+              <button class="qr-btn qr-sm" data-act="know-restore">${icon("refresh")}Pulihkan</button></div>`).join("")}</details>` : ""}
           <div class="qr-row"><input class="qr-know-new" placeholder="Tambah yang ia tahu atau yakini"><select class="qr-know-kind">${kinds.map((x) => `<option>${x}</option>`).join("")}</select>
             <button class="qr-btn qr-sm" data-act="know-add">${icon("plus")}Tambah</button></div>`;
       }
@@ -9115,6 +9268,12 @@ def _():
           case "schema": send("schema_get", { type: btn.dataset.type }); break;
           case "schema-save": send("schema_save", { schema: el.querySelector(".qr-schema-text").value }); break;
           case "row-add": { const tbl = btn.closest(".qr-table"); state.formDirty = Number(btn.closest(".qr-card-form").dataset.card); const n = Number(tbl.dataset.cols); const r = document.createElement("div"); r.className = "qr-trow"; r.innerHTML = Array(n).fill("<input>").join("") + `<button class="qr-icon qr-xs" data-act="row-del">${icon("x")}</button>`; tbl.insertBefore(r, btn); break; }
+          case "style-suggest": { const ta = btn.closest(".qr-field").querySelector("textarea[data-field]");
+            const have = new Set(ta.value.split("\n").map((x) => x.trim()).filter(Boolean)), add = STYLE_SUGGEST.filter((x) => !have.has(x));
+            if (!add.length) { toast("Semua saran sudah ada di kolom ini."); break; }
+            ta.value = (ta.value.trim() ? ta.value.trimEnd() + "\n" : "") + add.join("\n");
+            ta.dispatchEvent(new Event("input", { bubbles: true }));
+            toast(`${add.length} saran ditambahkan ke kolom. Ubah atau hapus sesukamu, lalu Simpan.`); break; }
           case "row-del": state.formDirty = Number(btn.closest(".qr-card-form").dataset.card); btn.closest(".qr-trow").remove(); break;
           case "lore-save": { const box = btn.closest(".qr-lore-edit"), form = btn.closest(".qr-card-form"); const v = (c) => box.querySelector(c).value;
             if (!v(".le-title").trim()) { toast("Judul lore kosong.", "warn"); break; }
@@ -9124,7 +9283,8 @@ def _():
           case "tl-del": { const r = btn.closest(".qr-tl"), form = btn.closest(".qr-card-form"); send("timeline_delete", { card_id: Number(form.dataset.card), entry_id: Number(r.dataset.entry) }); break; }
           case "attach-card": { const cid = dbody.querySelector(".qr-attach-card").value; if (cid) send("story_attach", { card_id: Number(cid), role: dbody.querySelector(".qr-attach-role").value }); break; }
           case "detach": send("story_detach", { card_id: id, role: btn.dataset.role }); break;
-          case "canon-save": { const box = btn.closest(".qr-canon"); const sec = box.dataset.sec || box.querySelector(".qr-canon-new").value.trim(); if (sec) send("canon", { section: sec, text: box.querySelector("textarea").value }); break; }
+          case "canon-save": { const box = btn.closest(".qr-canon"), ta = box.querySelector("textarea"), sec = box.dataset.sec || box.querySelector(".qr-canon-new").value.trim();
+            if (sec) { send("canon", { section: sec, text: ta.value }); ta.defaultValue = ta.value; if (!box.dataset.sec) { ta.value = ta.defaultValue = ""; box.querySelector(".qr-canon-new").value = ""; } } break; }
           case "toc": { const h = model.get("history") || {}, cid = get("chat").id;
             openModal("Daftar bab", (h.chapters || []).map((c) => `<button class="qr-libitem" data-act="jump-to" data-chat="${cid}" data-id="${c.id}">${icon("bookmark")}<b>${esc(c.title)}</b><span class="qr-muted">pesan ${c.n}</span></button>`).join("") || "Belum ada bab. Tandai dengan /bab atau tombol bab di balasan."); break; }
           case "speaker": send("settings", { speaker: btn.dataset.name || null }); break;
@@ -9142,9 +9302,11 @@ def _():
             send("knowledge_edit", { kid: Number(row.dataset.kid), holder: state.know.holder, text: ta.value,
               truth: row.querySelector(".qr-know-truth").value });
             ta.defaultValue = ta.value; break; }
-          case "know-del": if (state.know && confirm("Hapus ingatan ini dari tokoh ini (di semua cabang chat ini)?"))
+          case "know-del": if (!state.know) break;
+            if (!(model.get("history") || {}).total && !confirm("Chat ini belum punya pesan, jadi ingatan ini dihapus permanen. Lanjut?")) break;
             send("knowledge_delete", { kid: Number(btn.closest("[data-kid]").dataset.kid), holder: state.know.holder }); break;
-          case "nf-save": send("never_forget", { items: dbody.querySelector(".qr-nf").value.split("\n") }); break;
+          case "know-restore": if (state.know) send("knowledge_restore", { kid: Number(btn.closest("[data-kid]").dataset.kid), holder: state.know.holder }); break;
+          case "nf-save": { const ta = dbody.querySelector(".qr-nf"); send("never_forget", { items: ta.value.split("\n") }); ta.defaultValue = ta.value; break; }
           case "apply-now": send("apply_now"); break;
           case "continue-new": if (confirm("Lanjutkan cerita ini di chat baru (kronik dan adegan terakhir dibawa)?")) send("continue_new"); break;
           case "branches": send("branches"); break;
@@ -9189,17 +9351,17 @@ def _():
         if (a.kind === "proposals") {
           state.props = d;
           const box = dbody.querySelector(".qr-props");
-          if (state.tab === "story" && box && !editing(box)) box.innerHTML = propsHTML();
+          if (state.tab === "story" && box) redraw(box, propsHTML, true);
         }
         else if (a.kind === "threads") {
           state.threads = d;
           const box = dbody.querySelector(".qr-threads");
-          if (state.tab === "story" && box && !editing(box)) box.innerHTML = threadsHTML();
+          if (state.tab === "story" && box) redraw(box, threadsHTML, true);
         }
         else if (a.kind === "knowledge") {
           state.know = d;
           const box = dbody.querySelector(".qr-know");
-          if (state.tab === "story" && box && !editing(box)) box.innerHTML = knowHTML();
+          if (state.tab === "story" && box) redraw(box, knowHTML, true);
         }
         else if (a.kind === "memory") {
           state.memory = d;
@@ -9467,7 +9629,9 @@ def _(UI_APP_JS, UI_BASE_JS, UI_PURIFY_JS):
     .qr-tool summary b { color:var(--text); font-family:ui-monospace, Menlo, Consolas, monospace; font-weight:500; font-size:12.5px; }
     .qr-tool summary span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:420px; }
     .qr-tool summary em { color:var(--warn); font-style:normal; }
-    .qr-tool.err summary em { color:var(--danger); }
+    .qr-tool.err > summary em { color:var(--danger); }
+    .qr-toolset > .qr-tools { margin:6px 0 0 20px; }
+    .qr-toolset > summary b { font-family:inherit; }
     .qr-tool pre { white-space:pre-wrap; background:var(--code); border:1px solid var(--line); border-radius:8px; padding:8px 10px; max-height:260px; overflow:auto; font-size:12px; }
     .qr-dices, .qr-flags { display:flex; flex-wrap:wrap; gap:6px; margin:6px 0 10px; align-items:center; }
     .qr-dice { display:inline-flex; align-items:center; gap:6px; font-size:12.5px; border-radius:999px; padding:2px 10px; border:1px solid var(--line); }
@@ -9772,7 +9936,7 @@ def _(
 
         def chat_info(self, chat):
             return {"id": chat["id"], "title": chat["title"], "kind": chat["kind"], "story_id": chat["story_id"],
-                    "settings": {k: v for k, v in chat["settings"].items() if k not in ("studio", "avoid")},
+                    "settings": {k: v for k, v in chat["settings"].items() if k not in ("studio", "avoid", "openers")},
                     "system": chat["system"], "epoch": chat["epoch"],
                     "drafts": (chat["settings"].get("studio") or {}).get("drafts") or {}}
 
@@ -10240,6 +10404,7 @@ def _(
             holder = holder or names[0]
             self.w.aux = {"n": time.time(), "kind": "knowledge", "data": {
                 "chat_id": cid, "holder": holder, "holders": names, "rows": KNOW.of(cid, holder),
+                "hidden": KNOW.hidden(cid, holder),
                 "persona": ((cards or {}).get("persona") or {}).get("name", "")}}
 
         def c_knowledge_add(self, holder, text, kind="fakta", truth="benar"):
@@ -10252,8 +10417,29 @@ def _(
             self.c_knowledge(holder)
 
         def c_knowledge_delete(self, kid, holder):
-            KNOW.forget(int(kid))
+            cid = self._cur()
+            anchor = self._know_anchor(cid) if cid else None
+            if anchor:
+                KNOW.hide(int(kid), anchor)
+            else:
+                KNOW.forget(int(kid))  # no message yet: there is no branch to forget it on
             self.c_knowledge(holder)
+
+        def c_knowledge_restore(self, kid, holder):
+            if self._cur():
+                KNOW.restore(int(kid), self._cur())
+            self.c_knowledge(holder)
+
+        @staticmethod
+        def _know_anchor(cid):
+            """Where a delete in the Story tab forgets: the last player message on the branch (rerolling the reply after it
+            keeps the delete; editing that message starts a branch where it is known again), else the newest message."""
+            ids = STORE.path_ids(cid)
+            for i in reversed(ids):
+                m = STORE.msg(i)
+                if m and m["role"] == "user":
+                    return i
+            return ids[-1] if ids else None
 
         # card proposals
         def c_proposals(self):

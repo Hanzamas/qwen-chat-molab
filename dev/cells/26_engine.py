@@ -476,6 +476,10 @@ class Engine(EngineView):
         avoid = c["settings"].get("avoid") or []
         if avoid and not turn["ooc"]:
             extra.append("Hindari frasa yang sudah berulang ini: " + "; ".join(f'"{p}"' for p in avoid[:8]))
+        openers = c["settings"].get("openers") or []
+        if openers and not turn["ooc"]:
+            extra.append("Variasikan pembuka balasan. Balasan terakhir dimulai dengan pola yang sama seperti sebelumnya ("
+                         + ", ".join(f'"{o["text"]}…"' for o in openers[-3:]) + "). Mulai giliran ini dengan cara lain.")
         error, state = None, None
         seen_calls, fails_in_row = {}, 0
         try:
@@ -649,6 +653,22 @@ class Engine(EngineView):
             start -= 1
         return start, end
 
+    @staticmethod
+    def _openings(path, start, k=4):
+        """First words of the last k turns before `start`: each turn's first narration (a group round counts each
+        speaker's reply as a turn), OOC answers left out."""
+        out, fresh = [], True  # the story opening counts as a turn
+        for x in path[:start]:
+            if x["role"] == "user":
+                fresh = True
+                continue
+            if fresh and x["role"] == "assistant" and not x.get("ooc") and (x["content"] or "").strip():
+                out.append(TXT.opening(x["content"]))
+                fresh = False
+            if (x.get("meta") or {}).get("speaker"):
+                fresh = True
+        return out[-k:]
+
     @classmethod
     def _turn_text(cls, path, mid):
         """All narration of the turn that ends at mid (rounds before and after tool calls), and the earlier replies."""
@@ -713,6 +733,15 @@ class Engine(EngineView):
         self.store.chat_settings(chat_id, avoid=(rep + old)[:8])  # rolling: a phrase stays avoided for a while
         if rep:
             flags.append({"kind": "repeat", "text": "Frasa berulang: " + "; ".join(rep[:4])})
+        # openings: a reply that starts like the recent ones; the next turns are told to start differently (3 turns)
+        mine = TXT.opening(full)
+        openers = [dict(o, left=o["left"] - 1) for o in (self.store.chat(chat_id) or {}).get("settings", {}).get("openers") or []
+                   if o.get("left", 0) > 1]
+        if TXT.repeats_opening(mine, self._openings(path, self._turn_start(path, mid)[0])):
+            text = " ".join(mine[:4])
+            openers = [o for o in openers if o["text"] != text] + [{"text": text, "left": 3}]
+            flags.append({"kind": "opening", "text": f"Pembuka mirip balasan sebelumnya: \"{text}…\""})
+        self.store.chat_settings(chat_id, openers=openers[-4:])
         banned = TXT.banned_hits(full, self.prompt.style(c).get("banned") or [])
         if banned:
             flags.append({"kind": "banned", "text": "Frasa terlarang: " + ", ".join(banned)})

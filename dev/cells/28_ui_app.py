@@ -109,14 +109,39 @@ function render({ model, el }) {
     const a = model.get("ack") || {};
     if (a.sid === sid) unacked = unacked.filter((c) => c._seq > a.seq);
   });
-  // A section of the drawer is not redrawn while someone types in it or has unsaved text in it (an open <select>
-  // counts too): the redraw would put the old text back.
-  const editing = (box) => {
-    if (!box) return false;
-    const f = rootActive();
-    if (f && box.contains(f) && /^(INPUT|TEXTAREA|SELECT)$/.test(f.tagName)) return true;
-    return [...box.querySelectorAll("input:not([type]), input[type=text], textarea")].some((i) => i.value !== i.defaultValue);
+  // Redrawing a drawer section: while a field in it has focus the redraw waits until focus leaves the section
+  // (redrawing under the cursor breaks typing and the phone keyboard). With keep, text typed and not saved yet stays.
+  const TEXT_FIELDS = "input:not([type]), input[type=text], textarea";
+  const fieldKey = (n) => {
+    const row = n.closest("[data-kid],[data-tid],[data-pid],[data-sec],[data-entry]");
+    const id = row ? ["kid", "tid", "pid", "sec", "entry"].map((k) => row.dataset[k] ?? "").join("/") : "";
+    return `${id}|${n.className}|${n.dataset.field || ""}`;
   };
+  const waiting = new Set();
+  const redraw = (box, html, keep = false) => {
+    if (!box) return;
+    const f = rootActive();
+    if (f && box.contains(f) && /^(INPUT|TEXTAREA|SELECT)$/.test(f.tagName)) { box._redraw = [html, keep]; waiting.add(box); return; }
+    const typed = new Map(), chat = String(get("chat").id || "");
+    if (keep && box.dataset.chat === chat)
+      box.querySelectorAll(TEXT_FIELDS).forEach((n) => { if (n.value !== n.defaultValue) typed.set(fieldKey(n), n.value); });
+    box._redraw = null; waiting.delete(box);
+    box.innerHTML = typeof html === "function" ? html() : html;
+    box.dataset.chat = chat;
+    if (typed.size) box.querySelectorAll(TEXT_FIELDS).forEach((n) => { const k = fieldKey(n); if (typed.has(k)) n.value = typed.get(k); });
+  };
+  let pointerDown = false;
+  const flushRedraws = () => {
+    if (pointerDown) return;  // a click inside the section is under way: its button must still be there for the click
+    for (const box of [...waiting]) {
+      if (!box.isConnected || !box._redraw) { waiting.delete(box); continue; }
+      const f = rootActive();
+      if (!(f && box.contains(f) && /^(INPUT|TEXTAREA|SELECT)$/.test(f.tagName))) redraw(box, ...box._redraw);
+    }
+  };
+  listen("focusout", () => setTimeout(flushRedraws, 0), true);
+  listen("pointerdown", () => { pointerDown = true; }, true);
+  for (const ev of ["pointerup", "pointercancel"]) listen(ev, () => setTimeout(() => { pointerDown = false; flushRedraws(); }, 60), true);
   const get = (k) => model.get(k) || {};
   const toast = (text, kind = "info", long = false) => {
     const t = document.createElement("div");
@@ -225,7 +250,16 @@ function render({ model, el }) {
   // ---------- messages ----------
   function toolChips(tools, key) {
     if (!tools || !tools.length) return "";
-    return `<div class="qr-tools">${tools.map((t, j) => {
+    const chips = toolChipList(tools, key);
+    if (tools.length === 1) return `<div class="qr-tools">${chips}</div>`;
+    // several calls fold into one line; opened, each call shows as before
+    const k = `${key}-ts`, run = tools.some((t) => t.running), err = tools.filter((t) => t.error).length;
+    return `<div class="qr-tools"><details class="qr-tool qr-toolset ${err ? "err" : ""}" data-key="${k}" ${state.open.has(k) ? "open" : ""}>
+      <summary>${icon("tool")}<b>${tools.length} alat</b><span>${esc([...new Set(tools.map((t) => t.name))].join(", "))}</span>${run ? "<em>jalan…</em>" : err ? `<em>${err} gagal</em>` : ""}</summary>
+      <div class="qr-tools">${chips}</div></details></div>`;
+  }
+  function toolChipList(tools, key) {
+    return `${tools.map((t, j) => {
       const k = `${key}-t${j}`;
       const st = t.running ? "jalan…" : t.error ? "gagal" : "";
       let args = "";
@@ -233,10 +267,13 @@ function render({ model, el }) {
       return `<details class="qr-tool ${t.error ? "err" : ""}" data-key="${k}" ${state.open.has(k) ? "open" : ""}>
         <summary>${icon("tool")}<b>${esc(t.name)}</b><span>${esc(args)}</span>${st ? `<em>${st}</em>` : ""}</summary>
         <pre>${esc(t.result || (t.running ? "…" : ""))}</pre></details>`;
-    }).join("")}</div>`;
+    }).join("")}`;
   }
+  // Live thinking opens by itself outside stories; in a story it stays closed (it can spoil the scene) until opened,
+  // and then stays open for the next replies too.
+  const rpChat = () => ["rp", "group"].includes(get("chat").kind);
   function thinkBlock(key, text, label, live) {
-    return `<details class="qr-think" data-key="${key}" ${state.open.has(key) || live ? "open" : ""}>
+    return `<details class="qr-think" data-key="${key}" ${state.open.has(key) || (live && !rpChat()) ? "open" : ""}>
       <summary>${icon("brain")}<span>${label}</span><span class="qr-muted">${fmtN(words(text))} kata</span></summary>
       <div class="qr-think-box"><div class="qr-think-body">${esc(text)}</div></div>
       ${live ? '<button class="qr-btn qr-sm qr-think-follow" data-act="think-follow" hidden>Ikuti</button>' : ""}
@@ -384,7 +421,7 @@ function render({ model, el }) {
     if (!lv.active) { liveBox.innerHTML = ""; liveParts = null; thinkFollow = true; renderStatusLine(); return; }
     $(".qr-empty").hidden = true;
     if (!liveParts) {
-      liveBox.innerHTML = `<div class="qr-msg qr-bot qr-live-row">${thinkBlock("live-th", "", "Sedang berpikir", true)}
+      liveBox.innerHTML = `<div class="qr-msg qr-bot qr-live-row">${thinkBlock(rpChat() ? "live-th-rp" : "live-th", "", "Sedang berpikir", true)}
         <div class="qr-live-tools"></div><div class="qr-md"></div><div class="qr-phase qr-muted"></div>
         <div class="qr-typing"><span></span><span></span><span></span></div></div>`;
       liveParts = { think: liveBox.querySelector(".qr-think"), sum: liveBox.querySelector(".qr-think summary span"),
@@ -465,6 +502,13 @@ function render({ model, el }) {
   }
 
   // ---------- card form ----------
+  // Suggestions the Style form can add to its rules. They only go into the form: the user edits them and saves.
+  const STYLE_SUGGEST = [
+    "Jangan membuka balasan dengan mengulang aksi atau ucapan pemain; langsung ke reaksi dan akibatnya.",
+    'Jangan menutup balasan dengan pertanyaan narator seperti "Apa yang kamu lakukan?"; berhenti di momen ketika pemain bisa bertindak.',
+    "Variasikan cara membuka balasan; jangan memulai beberapa balasan berturut-turut dengan pola yang sama.",
+    "Terjemahan dialog memakai bahasa Indonesia sehari-hari yang wajar, bukan terjemahan kata per kata.",
+  ];
   function fieldInput(f, v) {
     const key = esc(f.key);  // keys come from cards the model or an import wrote: never trust them in markup
     const name = `f-${String(f.key).replace(/[^\w-]/g, "_")}`;
@@ -499,7 +543,7 @@ function render({ model, el }) {
     return `<div class="qr-card-form" data-card="${c.id}" data-version="${c.version}">
       <div class="qr-card-top">${c.avatar ? `<img class="qr-avatar" src="data:image/png;base64,${c.avatar}" alt="">` : `<div class="qr-avatar qr-noav">${icon("card")}</div>`}
         <div><div class="qr-muted">${esc((get("boot").types || {})[c.type] || c.type)} · versi ${c.version}</div><b>${esc(c.name)}</b></div></div>
-      ${Object.entries(sections).map(([s, fs]) => `<fieldset><legend>${esc(s)}</legend>${fs.map((f) => `<div class="qr-field">${fieldInput(f, c.data[f.key])}</div>`).join("")}</fieldset>`).join("")}
+      ${Object.entries(sections).map(([s, fs]) => `<fieldset><legend>${esc(s)}</legend>${fs.map((f) => `<div class="qr-field">${fieldInput(f, c.data[f.key])}${c.type === "style" && f.key === "rules" ? `<button class="qr-btn qr-sm" data-act="style-suggest" title="Menambahkan saran ke kolom ini; ubah atau hapus sebelum Simpan">${icon("plus")}Tambah saran aturan</button>` : ""}</div>`).join("")}</fieldset>`).join("")}
       <div class="qr-row qr-wrap">
         <button class="qr-btn qr-primary" data-act="card-save">${icon("check")}Simpan</button>
         ${compact ? "" : `<button class="qr-btn" data-act="card-avatar">${icon("upload")}Avatar</button>
@@ -561,11 +605,8 @@ function render({ model, el }) {
     if (drawer.hidden) return;
     $(".qr-tabs").innerHTML = Object.keys(TAB_NAMES).map((t) => `<button class="qr-tabbtn ${t === state.tab ? "on" : ""}" data-act="tab" data-tab="${t}">${icon(TAB_ICONS[t])}${TAB_NAMES[t]}</button>`).join("");
     const fn = { chat: tabChat, story: tabStory, cards: tabCards, memory: tabMemory, model: tabModel, learn: tabLearn }[state.tab];
-    const active = el.getRootNode().activeElement || document.activeElement;  // the widget lives in a shadow root
-    if (active && dbody.contains(active) && /^(TEXTAREA|INPUT|SELECT)$/.test(active.tagName)) return;
-    if (state.tab === "story" && editing(dbody)) return;
     if (state.tab === "cards" && state.cardView && state.formDirty === state.cardView && dbody.querySelector(".qr-card-form")) return;
-    dbody.innerHTML = fn();
+    redraw(dbody, fn, state.tab === "story");
   }
   function tabChat() {
     const c = get("chat"), s = c.settings || {}, boot = get("boot"), srv = get("server");
@@ -635,7 +676,10 @@ function render({ model, el }) {
         <span><input class="qr-know-text" value="${esc(r.text)}"><span class="qr-muted">${esc(r.source)}${r.source_who ? ` dari ${esc(r.source_who)}` : ""}${r.world_time ? ` · ${esc(r.world_time)}` : ""}</span></span>
         <select class="qr-know-truth">${["benar", "keliru", "belum pasti"].map((t) => `<option ${t === r.truth ? "selected" : ""}>${t}</option>`).join("")}</select>
         <button class="qr-icon qr-xs" data-act="know-save" title="Simpan">${icon("check")}</button>
-        <button class="qr-icon qr-xs" data-act="know-del" title="Hapus">${icon("trash")}</button></div>`).join("") || '<div class="qr-muted">Belum ada.</div>'}
+        <button class="qr-icon qr-xs" data-act="know-del" title="Lupakan di cabang ini (bisa dipulihkan)">${icon("trash")}</button></div>`).join("") || '<div class="qr-muted">Belum ada.</div>'}
+      ${(k.hidden || []).length ? `<details class="qr-know-hidden" data-key="know-hidden" ${state.open.has("know-hidden") ? "open" : ""}><summary class="qr-muted">Dilupakan di cabang ini (${k.hidden.length})</summary>
+        ${k.hidden.map((r) => `<div class="qr-memrow" data-kid="${r.id}"><span class="qr-badge">${esc(r.kind)}</span><span class="qr-muted"><s>${esc(r.text)}</s></span>
+          <button class="qr-btn qr-sm" data-act="know-restore">${icon("refresh")}Pulihkan</button></div>`).join("")}</details>` : ""}
       <div class="qr-row"><input class="qr-know-new" placeholder="Tambah yang ia tahu atau yakini"><select class="qr-know-kind">${kinds.map((x) => `<option>${x}</option>`).join("")}</select>
         <button class="qr-btn qr-sm" data-act="know-add">${icon("plus")}Tambah</button></div>`;
   }
@@ -954,6 +998,12 @@ function render({ model, el }) {
       case "schema": send("schema_get", { type: btn.dataset.type }); break;
       case "schema-save": send("schema_save", { schema: el.querySelector(".qr-schema-text").value }); break;
       case "row-add": { const tbl = btn.closest(".qr-table"); state.formDirty = Number(btn.closest(".qr-card-form").dataset.card); const n = Number(tbl.dataset.cols); const r = document.createElement("div"); r.className = "qr-trow"; r.innerHTML = Array(n).fill("<input>").join("") + `<button class="qr-icon qr-xs" data-act="row-del">${icon("x")}</button>`; tbl.insertBefore(r, btn); break; }
+      case "style-suggest": { const ta = btn.closest(".qr-field").querySelector("textarea[data-field]");
+        const have = new Set(ta.value.split("\n").map((x) => x.trim()).filter(Boolean)), add = STYLE_SUGGEST.filter((x) => !have.has(x));
+        if (!add.length) { toast("Semua saran sudah ada di kolom ini."); break; }
+        ta.value = (ta.value.trim() ? ta.value.trimEnd() + "\n" : "") + add.join("\n");
+        ta.dispatchEvent(new Event("input", { bubbles: true }));
+        toast(`${add.length} saran ditambahkan ke kolom. Ubah atau hapus sesukamu, lalu Simpan.`); break; }
       case "row-del": state.formDirty = Number(btn.closest(".qr-card-form").dataset.card); btn.closest(".qr-trow").remove(); break;
       case "lore-save": { const box = btn.closest(".qr-lore-edit"), form = btn.closest(".qr-card-form"); const v = (c) => box.querySelector(c).value;
         if (!v(".le-title").trim()) { toast("Judul lore kosong.", "warn"); break; }
@@ -963,7 +1013,8 @@ function render({ model, el }) {
       case "tl-del": { const r = btn.closest(".qr-tl"), form = btn.closest(".qr-card-form"); send("timeline_delete", { card_id: Number(form.dataset.card), entry_id: Number(r.dataset.entry) }); break; }
       case "attach-card": { const cid = dbody.querySelector(".qr-attach-card").value; if (cid) send("story_attach", { card_id: Number(cid), role: dbody.querySelector(".qr-attach-role").value }); break; }
       case "detach": send("story_detach", { card_id: id, role: btn.dataset.role }); break;
-      case "canon-save": { const box = btn.closest(".qr-canon"); const sec = box.dataset.sec || box.querySelector(".qr-canon-new").value.trim(); if (sec) send("canon", { section: sec, text: box.querySelector("textarea").value }); break; }
+      case "canon-save": { const box = btn.closest(".qr-canon"), ta = box.querySelector("textarea"), sec = box.dataset.sec || box.querySelector(".qr-canon-new").value.trim();
+        if (sec) { send("canon", { section: sec, text: ta.value }); ta.defaultValue = ta.value; if (!box.dataset.sec) { ta.value = ta.defaultValue = ""; box.querySelector(".qr-canon-new").value = ""; } } break; }
       case "toc": { const h = model.get("history") || {}, cid = get("chat").id;
         openModal("Daftar bab", (h.chapters || []).map((c) => `<button class="qr-libitem" data-act="jump-to" data-chat="${cid}" data-id="${c.id}">${icon("bookmark")}<b>${esc(c.title)}</b><span class="qr-muted">pesan ${c.n}</span></button>`).join("") || "Belum ada bab. Tandai dengan /bab atau tombol bab di balasan."); break; }
       case "speaker": send("settings", { speaker: btn.dataset.name || null }); break;
@@ -981,9 +1032,11 @@ function render({ model, el }) {
         send("knowledge_edit", { kid: Number(row.dataset.kid), holder: state.know.holder, text: ta.value,
           truth: row.querySelector(".qr-know-truth").value });
         ta.defaultValue = ta.value; break; }
-      case "know-del": if (state.know && confirm("Hapus ingatan ini dari tokoh ini (di semua cabang chat ini)?"))
+      case "know-del": if (!state.know) break;
+        if (!(model.get("history") || {}).total && !confirm("Chat ini belum punya pesan, jadi ingatan ini dihapus permanen. Lanjut?")) break;
         send("knowledge_delete", { kid: Number(btn.closest("[data-kid]").dataset.kid), holder: state.know.holder }); break;
-      case "nf-save": send("never_forget", { items: dbody.querySelector(".qr-nf").value.split("\n") }); break;
+      case "know-restore": if (state.know) send("knowledge_restore", { kid: Number(btn.closest("[data-kid]").dataset.kid), holder: state.know.holder }); break;
+      case "nf-save": { const ta = dbody.querySelector(".qr-nf"); send("never_forget", { items: ta.value.split("\n") }); ta.defaultValue = ta.value; break; }
       case "apply-now": send("apply_now"); break;
       case "continue-new": if (confirm("Lanjutkan cerita ini di chat baru (kronik dan adegan terakhir dibawa)?")) send("continue_new"); break;
       case "branches": send("branches"); break;
@@ -1028,17 +1081,17 @@ function render({ model, el }) {
     if (a.kind === "proposals") {
       state.props = d;
       const box = dbody.querySelector(".qr-props");
-      if (state.tab === "story" && box && !editing(box)) box.innerHTML = propsHTML();
+      if (state.tab === "story" && box) redraw(box, propsHTML, true);
     }
     else if (a.kind === "threads") {
       state.threads = d;
       const box = dbody.querySelector(".qr-threads");
-      if (state.tab === "story" && box && !editing(box)) box.innerHTML = threadsHTML();
+      if (state.tab === "story" && box) redraw(box, threadsHTML, true);
     }
     else if (a.kind === "knowledge") {
       state.know = d;
       const box = dbody.querySelector(".qr-know");
-      if (state.tab === "story" && box && !editing(box)) box.innerHTML = knowHTML();
+      if (state.tab === "story" && box) redraw(box, knowHTML, true);
     }
     else if (a.kind === "memory") {
       state.memory = d;

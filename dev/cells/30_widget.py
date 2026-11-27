@@ -90,7 +90,7 @@ class ChatApp:
 
     def chat_info(self, chat):
         return {"id": chat["id"], "title": chat["title"], "kind": chat["kind"], "story_id": chat["story_id"],
-                "settings": {k: v for k, v in chat["settings"].items() if k not in ("studio", "avoid")},
+                "settings": {k: v for k, v in chat["settings"].items() if k not in ("studio", "avoid", "openers")},
                 "system": chat["system"], "epoch": chat["epoch"],
                 "drafts": (chat["settings"].get("studio") or {}).get("drafts") or {}}
 
@@ -558,6 +558,7 @@ class ChatApp:
         holder = holder or names[0]
         self.w.aux = {"n": time.time(), "kind": "knowledge", "data": {
             "chat_id": cid, "holder": holder, "holders": names, "rows": KNOW.of(cid, holder),
+            "hidden": KNOW.hidden(cid, holder),
             "persona": ((cards or {}).get("persona") or {}).get("name", "")}}
 
     def c_knowledge_add(self, holder, text, kind="fakta", truth="benar"):
@@ -570,8 +571,29 @@ class ChatApp:
         self.c_knowledge(holder)
 
     def c_knowledge_delete(self, kid, holder):
-        KNOW.forget(int(kid))
+        cid = self._cur()
+        anchor = self._know_anchor(cid) if cid else None
+        if anchor:
+            KNOW.hide(int(kid), anchor)
+        else:
+            KNOW.forget(int(kid))  # no message yet: there is no branch to forget it on
         self.c_knowledge(holder)
+
+    def c_knowledge_restore(self, kid, holder):
+        if self._cur():
+            KNOW.restore(int(kid), self._cur())
+        self.c_knowledge(holder)
+
+    @staticmethod
+    def _know_anchor(cid):
+        """Where a delete in the Story tab forgets: the last player message on the branch (rerolling the reply after it
+        keeps the delete; editing that message starts a branch where it is known again), else the newest message."""
+        ids = STORE.path_ids(cid)
+        for i in reversed(ids):
+            m = STORE.msg(i)
+            if m and m["role"] == "user":
+                return i
+        return ids[-1] if ids else None
 
     # card proposals
     def c_proposals(self):

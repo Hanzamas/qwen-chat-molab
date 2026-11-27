@@ -142,12 +142,17 @@ DEFAULT_SCHEMAS = {
     ]},
 }
 
+# Default values that changed: a default card still holding the old value moves to the new one, once per database.
+DEFAULTS_CHANGED = [("style", "Gaya RP default", "paragraphs", "5-10", "4-7"),
+                    ("style", "Gaya RP default", "sentences", "5-10", "4-7"),
+                    ("gm", "GM membumi", "afk_scale", "1", "0")]
+
 DEFAULT_CARDS = [
     ("style", "Gaya RP default", {
         "pov": "orang kedua (kamu)", "narration_lang": "Indonesia",
         "dialogue_rule": "Dialog ditulis dalam bahasa tokohnya. Kalau bukan bahasa Indonesia, tulis kalimatnya UTUH dalam satu "
                          "tanda kutip, lalu terjemahannya SATU kali dalam kurung tepat setelahnya.",
-        "paragraphs": "5-10", "sentences": "5-10",
+        "paragraphs": "4-7", "sentences": "4-7",
         "sentence_style": "Kalimat panjang yang merangkai deskripsi, gerak, dan ucapan tokoh. Detail konkret dan indrawi.",
         "dialogue_ratio": "30-50%", "violence": "sedang", "tone": "Membumi dan wajar, tanpa superlatif.",
         "pacing": "Sedang; tiap paragraf memajukan sesuatu.",
@@ -169,6 +174,6 @@ DEFAULT_CARDS = [
         "checklist": ["Masuk akal secara fisik?", "Apa akibatnya?", "Tokoh ini sebenarnya tahu apa?",
                       "Berapa waktu yang lewat?", "Ada yang lebay?", "Ada fakta nyata yang belum pasti?"],
         "rules": [], "choices": "kadang", "choice_problems": "1-3", "choice_options": "3-5", "choice_sentences": "1-2",
-        "time_skips": ["2 jam", "3 jam", "1 hari", "1 minggu", "1 bulan"], "afk_scale": "1", "tick_minutes": "20",
+        "time_skips": ["2 jam", "3 jam", "1 hari", "1 minggu", "1 bulan"], "afk_scale": "0", "tick_minutes": "20",
     }),
 ]

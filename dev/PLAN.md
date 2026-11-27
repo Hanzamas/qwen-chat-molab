@@ -624,13 +624,19 @@ dicatat di bawah sebagai usulan.
       penanda rahasia, cara roll); target panjang kalah dari titik berhenti; pilihan ditulis sebagai "Aku …" dan hanya
       di balasan terakhir; frasa berulang dihindari bergulir (kecuali contoh ucapan kartu); Studio melihat semua field.
 
-**Usulan fitur (belum dikerjakan, menunggu keputusanmu):**
-- Cek pembuka berulang: lima kata pertama balasan dibandingkan dengan empat balasan sebelumnya.
-- Aturan Gaya tambahan (kamu ketik sendiri kalau mau): jangan mengulang aksi pemain di awal; jangan menutup dengan
-  pertanyaan narator; variasikan pembuka; terjemahan dialog bahasa sehari-hari.
-- Default panjang 4-7 × 4-7 kalimat dan AFK mati secara default (sekarang 5-10 × 5-10 dan AFK skala 1).
-- Thinking live tertutup di chat RP (menghindari spoiler) dan chip tool dilipat jadi satu.
-- Hapus ingatan tokoh per cabang dengan undo; isi form tetap saat laci digambar ulang.
+**Fitur dari usulan review kedua (selesai, belum dites di GPU):**
+- [x] Cek pembuka berulang: lima kata pertama balasan dibandingkan dengan empat giliran sebelumnya (tiga kata awal
+      sama, tiga kata isi sama, dua kata awal sama dengan dua giliran terakhir, atau kata pertama sama dengan empat
+      giliran terakhir). Balasannya diberi tanda, dan tiga giliran berikutnya diminta memulai dengan cara lain.
+- [x] Aturan Gaya tambahan tidak ditulis ke kartu: form Gaya punya tombol "Tambah saran aturan" yang memasukkan
+      empat saran ke kolom Aturan tambahan; kamu ubah atau hapus dulu, lalu Simpan sendiri.
+- [x] Default panjang 4-7 × 4-7 kalimat dan AFK mati (skala 0). Kartu "Gaya RP default" dan "GM membumi" yang masih
+      memakai nilai lama ikut pindah sekali (versi lama tetap bisa dipulihkan); nilai yang sudah kamu ubah tidak disentuh.
+- [x] Thinking live tertutup di chat cerita; sekali kamu buka, balasan berikutnya ikut terbuka. Beberapa panggilan
+      tool dalam satu balasan dilipat jadi satu baris ("3 alat …").
+- [x] Hapus ingatan tokoh hanya berlaku di cabang aktif (sejak pesan pemain terakhir, jadi reroll balasan tidak
+      memunculkannya lagi) dan bisa dipulihkan dari daftar "Dilupakan di cabang ini". Laci menyimpan teks yang sedang
+      diketik saat digambar ulang; selama kursor di kolom, gambar ulang menunggu sampai fokus pindah.
 
 ---
 

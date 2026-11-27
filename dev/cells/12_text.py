@@ -145,6 +145,25 @@ class TXT:
     # ---------- RP checks ----------
 
     @staticmethod
+    def opening(text, n=5):
+        """The first words of a reply, without a leading **Name** speaker tag."""
+        t = re.sub(r"^\s*\*\*[^*\n]{1,60}\*\*\s*[:：]?", "", (text or "").strip())
+        return TXT.words(t)[:n]
+
+    @staticmethod
+    def repeats_opening(mine, previous):
+        """A reply starts like the recent ones: the same first three words as one of them or three content words shared
+        with it, the same first two words as both of the last two, or the same first word as all of the last four."""
+        if len(mine) < 3:
+            return False
+        for p in previous:
+            if p[:3] == mine[:3] or len((set(p) & set(mine)) - TXT.ALL_STOP) >= 3:
+                return True
+        if len(previous) >= 2 and all(p[:2] == mine[:2] for p in previous[-2:]):
+            return True
+        return len(previous) >= 4 and all(p[:1] == mine[:1] for p in previous[-4:])
+
+    @staticmethod
     def repeated_phrases(text, previous, n=5, min_hits=2, top=5):
         """Word n-grams of `text` that already appeared in the previous replies (min_hits times in total)."""
         def grams(s):

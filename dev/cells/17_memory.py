@@ -537,13 +537,40 @@ class Knowledge:
     def __init__(self, store):
         self.store = store
 
-    def _rows(self, chat_id, sql="", args=()):
+    @staticmethod
+    def _hides(r):
+        return {int(x) for x in (r.get("hidden_at") or "").split(",") if x.strip().isdigit()}
+
+    def _rows(self, chat_id, sql="", args=(), hidden=False):
+        """Rows that count on the active branch; hidden=True: the ones forgotten on it instead."""
         chats = self.store.lineage(chat_id)
         vis = self.store.visible_ids(chat_id)
         rows = self.store.q(f"SELECT * FROM knowledge WHERE chat_id IN ({','.join('?' * len(chats))}) {sql}",
                             list(chats) + list(args)) if chats else []
-        return [r for r in rows if (not r["message_id"] or r["message_id"] in vis)
-                and not (r["forgotten_at"] and r["forgotten_at"] in vis)]
+
+        def forgotten(r):
+            return bool(r["forgotten_at"] and r["forgotten_at"] in vis) or bool(self._hides(r) & vis)
+        return [r for r in rows if (not r["message_id"] or r["message_id"] in vis) and forgotten(r) == hidden]
+
+    def hide(self, kid, message_id):
+        """The user's delete: forgotten on the branches through message_id only, and restorable."""
+        r = self.store.one("SELECT hidden_at FROM knowledge WHERE id = ?", (kid,))
+        if r:
+            ids = sorted(self._hides(r) | {int(message_id)})
+            self.store.x("UPDATE knowledge SET hidden_at = ? WHERE id = ?", (",".join(map(str, ids)), kid))
+
+    def restore(self, kid, chat_id):
+        """Undo every forget of this row that lies on the active branch (the user's deletes and the model's)."""
+        r = self.store.one("SELECT hidden_at, forgotten_at FROM knowledge WHERE id = ?", (kid,))
+        if not r:
+            return
+        vis = self.store.visible_ids(chat_id)
+        self.store.x("UPDATE knowledge SET hidden_at = ?, forgotten_at = ? WHERE id = ?",
+                     (",".join(map(str, sorted(self._hides(r) - vis))),
+                      None if r["forgotten_at"] in vis else r["forgotten_at"], kid))
+
+    def hidden(self, chat_id, holder, limit=100):
+        return sorted(self._rows(chat_id, "AND holder = ?", (holder,), hidden=True), key=lambda r: -r["id"])[:limit]
 
     def add(self, chat_id, message_id, holders, text, kind="fakta", source="lihat sendiri", source_who="", truth="benar",
             importance=0.5, world_time=""):

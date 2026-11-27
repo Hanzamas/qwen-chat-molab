@@ -137,7 +137,9 @@ UI_CSS = r"""
 .qr-tool summary b { color:var(--text); font-family:ui-monospace, Menlo, Consolas, monospace; font-weight:500; font-size:12.5px; }
 .qr-tool summary span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:420px; }
 .qr-tool summary em { color:var(--warn); font-style:normal; }
-.qr-tool.err summary em { color:var(--danger); }
+.qr-tool.err > summary em { color:var(--danger); }
+.qr-toolset > .qr-tools { margin:6px 0 0 20px; }
+.qr-toolset > summary b { font-family:inherit; }
 .qr-tool pre { white-space:pre-wrap; background:var(--code); border:1px solid var(--line); border-radius:8px; padding:8px 10px; max-height:260px; overflow:auto; font-size:12px; }
 .qr-dices, .qr-flags { display:flex; flex-wrap:wrap; gap:6px; margin:6px 0 10px; align-items:center; }
 .qr-dice { display:inline-flex; align-items:center; gap:6px; font-size:12.5px; border-radius:999px; padding:2px 10px; border:1px solid var(--line); }
