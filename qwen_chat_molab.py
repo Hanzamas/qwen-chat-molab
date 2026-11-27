@@ -29,17 +29,17 @@ def _():
     mo.md(r"""
     # Qwen Chat RP
 
-    Chat dan roleplay panjang (sampai 512K/1M token) di GPU molab, dengan kartu (tokoh, persona, dunia, skenario,
-    gaya, GM), Studio untuk menyusun kartu sambil ngobrol, memory berlingkup, buku fakta, dunia yang tetap
-    berjalan, dan compaction yang tidak melupakan detail.
+    Chat and long roleplay (up to 512K/1M tokens) on a molab GPU, with cards (character, persona, world, scenario,
+    style, GM), a Studio to build cards while you chat, scoped memory, a fact book, a world that keeps moving,
+    and compaction that does not forget details.
 
-    1. Nyalakan GPU lewat *notebook specs*, lalu **Run all**.
-    2. Klik **Install** (sekali per sesi).
-    3. Pilih model, klik **Start**, tunggu status `READY`.
-    4. Ngobrol di jendela chat paling bawah. Model juga bisa diganti dari dalam chat.
+    1. Turn on a GPU in *notebook specs*, then **Run all**.
+    2. Click **Install** (once per session).
+    3. Pick a model, click **Start**, and wait for the `READY` status.
+    4. Chat in the chat window at the bottom. You can also switch models from inside the chat.
 
-    Semua data (chat, kartu, memory, fakta) ada di satu file SQLite. Isi workspace molab hilang saat notebook mati:
-    pakai **Backup ke Hugging Face** atau tombol **Simpan** di chat.
+    All data (chats, cards, memory, facts) lives in one SQLite file. The molab workspace is wiped when the notebook
+    shuts down: use **Backup to Hugging Face** or the **Save** button in the chat.
     """)
     return (mo,)
 
@@ -293,7 +293,7 @@ def _(CFG, Path, json, mo, os, re, signal, subprocess, time, urllib):
 
         @staticmethod
         def cell_log(title, text, code):
-            status = "jalan..." if code is None else ("selesai" if code == 0 else f"GAGAL (exit {code})")
+            status = "running..." if code is None else ("done" if code == 0 else f"FAILED (exit {code})")
             mo.output.replace(mo.vstack([mo.md(f"**{title}**: {status}"), mo.plain_text(text)]))
 
         @staticmethod
@@ -327,7 +327,7 @@ def _(CFG, Path, json, mo, os, re, signal, subprocess, time, urllib):
                     f.seek(max(0, f.tell() - max_bytes))
                     return "\n".join(f.read().decode("utf-8", "replace").splitlines()[-n:])
             except FileNotFoundError:
-                return "(belum ada log)"
+                return "(no log yet)"
 
         @staticmethod
         def log_errors(path, n=12):
@@ -553,41 +553,41 @@ def _(
             except ValueError:
                 driver = 0
             if not driver:
-                raise RuntimeError("GPU belum terdeteksi. Nyalakan GPU lewat notebook specs, lalu Install lagi.")
+                raise RuntimeError("No GPU detected. Turn on a GPU in notebook specs, then run Install again.")
             # Triton needs cc, FlashInfer JIT needs ninja and links -lcudart from nvidia/cu13/lib64,
             # where the pip CUDA runtime only ships libcudart.so.13.
             Sys.run_live(
-                "(command -v cc && command -v ninja) >/dev/null && echo 'cc + ninja ada' "
-                "|| (apt-get -qq update && apt-get -qq install -y gcc g++ ninja-build >/dev/null && echo 'gcc + ninja terpasang') "
-                "|| echo 'gcc/ninja gagal dipasang'; "
+                "(command -v cc && command -v ninja) >/dev/null && echo 'cc + ninja present' "
+                "|| (apt-get -qq update && apt-get -qq install -y gcc g++ ninja-build >/dev/null && echo 'gcc + ninja installed') "
+                "|| echo 'gcc/ninja install failed'; "
                 "for D in /usr/local/lib/python3.*/site-packages/nvidia/cu13 "
                 f"{CFG.VENV}/lib/python3.*/site-packages/nvidia/cu13; do "
                 "[ -d \"$D\" ] || continue; L=$(find \"$D\" -name 'libcudart.so.1*' | head -1); "
                 "[ -n \"$L\" ] && mkdir -p \"$D/lib64\" && ln -sf \"$L\" \"$D/lib64/libcudart.so\" && echo \"libcudart.so -> $L\"; done",
-                "Persiapan compiler", log)
+                "Compiler setup", log)
             pins = " ".join(f"'{k}=={v}'" for k, v in CFG.PIP_PINS.items())
             code = Sys.run_live(
                 f"(uv pip install --python {sys.executable} {pins} || {sys.executable} -m pip install -q {pins}) "
                 f"&& {sys.executable} -m playwright install --with-deps chromium firefox "
                 f"&& {sys.executable} -m camoufox fetch",
-                "Paket kernel + Camoufox + Playwright", log)
+                "Kernel packages + Camoufox + Playwright", log)
             if code != 0:
-                raise RuntimeError("Gagal memasang paket kernel. Lihat log di atas.")
+                raise RuntimeError("Installing the kernel packages failed. See the log above.")
             if not CFG.VLLM_OK.exists():
                 pkg = (f'"https://github.com/vllm-project/vllm/releases/download/v{CFG.VLLM_VERSION}/'
                        f'vllm-{CFG.VLLM_VERSION}+cu129-cp38-abi3-manylinux_2_28_x86_64.whl" --torch-backend=cu129'
                        if driver < 580 else f"vllm=={CFG.VLLM_VERSION} --torch-backend=cu130")
                 code = Sys.run_live(
                     f"set -e; uv venv --allow-existing {CFG.VENV}; uv pip install --python {CFG.VENV}/bin/python {pkg}; "
-                    f"{CFG.VLLM_BIN} download-kernels || echo 'download-kernels dilewati'",
+                    f"{CFG.VLLM_BIN} download-kernels || echo 'download-kernels skipped'",
                     f"vLLM {CFG.VLLM_VERSION}", log)
                 if code != 0:
-                    raise RuntimeError("Gagal memasang vLLM. Lihat log di atas.")
+                    raise RuntimeError("Installing vLLM failed. See the log above.")
                 CFG.VLLM_OK.touch()
             if not self.llama_bin():
                 code = Sys.run_live(self.llama_install_cmd(), f"llama.cpp {CFG.LLAMA_TAG}", log)
                 if code != 0 or not self.llama_bin():
-                    raise RuntimeError("Gagal memasang llama.cpp. Lihat log di atas.")
+                    raise RuntimeError("Installing llama.cpp failed. See the log above.")
             return True
 
         @staticmethod
@@ -622,10 +622,10 @@ def _(
             call = (f"hf_hub_download('{repo}', '{filename}', revision='{revision}', local_dir='{dest}')" if filename
                     else f"snapshot_download('{repo}', revision='{revision}', local_dir='{dest}')")
             code = Sys.run_live(
-                f"{sys.executable} -c \"from huggingface_hub import hf_hub_download, snapshot_download; {call}; print('selesai')\"",
+                f"{sys.executable} -c \"from huggingface_hub import hf_hub_download, snapshot_download; {call}; print('done')\"",
                 f"Download {repo}{'/' + filename if filename else ''}", log)
             if code != 0:
-                raise RuntimeError(f"Download {repo} gagal. Lihat log di atas.")
+                raise RuntimeError(f"Download of {repo} failed. See the log above.")
             marker.touch()
             return target
 
@@ -636,9 +636,9 @@ def _(
             a watcher thread marks it ready, or retries without MTP if the drafter makes it crash."""
             p = PRESETS[name]
             if ctx > p["yarn_max"]:
-                raise ValueError(f"{name} maksimal {p['yarn_max']:,} token. Pilih konteks yang lebih kecil.")
+                raise ValueError(f"{name} allows at most {p['yarn_max']:,} tokens. Pick a smaller context.")
             if not self.installed() and not CFG.BASE_URL:
-                raise RuntimeError("Belum terpasang. Klik Install dulu.")
+                raise RuntimeError("Not installed yet. Click Install first.")
             with self.lock:
                 self.stop(keep_embed=embed)
                 # Each start gets a number; stop() and a newer start change it, so a launch whose download
@@ -766,18 +766,18 @@ def _(
                     if f.suffix in (".log", ".txt", ".err") or "log" in f.name.lower():
                         out.append(f"--- {f} ---\n" + f.read_text(errors="replace")[-4000:])
                 if not out and files:
-                    out.append(f"--- isi {p} ---\n" + "\n".join(f.name for f in files))
+                    out.append(f"--- contents of {p} ---\n" + "\n".join(f.name for f in files))
             return ("\n\n" + "\n\n".join(out)) if out else ""
 
         @staticmethod
         def hint(log_tail, p):
             if "NVRTCCompiler failed" in log_tail or "humming" in log_tail:
-                return ("\n\nPenyebab: kernel Humming vLLM meng-compile kernel saat jalan (NVRTC) dan gagal di GPU/driver ini. "
-                        "Paksa kernel lain lewat preset: vllm_args=['--kernel-config', "
-                        "'{\"linear_backend_per_quant\":{\"<kunci kuantisasi>\":\"marlin\"}}'] (kunci: w8a16_fp8, mixed_precision, "
-                        "mxfp4, nvfp4_w4a16, ...). Log compiler ada di atas.")
+                return ("\n\nCause: vLLM's Humming kernel compiles kernels at run time (NVRTC), and that fails on this GPU/driver. "
+                        "Force another kernel in the preset: vllm_args=['--kernel-config', "
+                        "'{\"linear_backend_per_quant\":{\"<quantization key>\":\"marlin\"}}'] (keys: w8a16_fp8, mixed_precision, "
+                        "mxfp4, nvfp4_w4a16, ...). The compiler log is above.")
             if "out of memory" in log_tail.lower():
-                return "\n\nSaran: VRAM tidak cukup. Kecilkan konteks atau matikan embedder."
+                return "\n\nTip: not enough VRAM. Use a smaller context or turn off the embedder."
             return ""
 
         def _watch(self, p, files, ctx, gen=None):
@@ -789,9 +789,9 @@ def _(
                 if proc is not None and proc.poll() is not None:
                     log_tail = Sys.tail(self.logf[backend], 400)
                     # MTP is required: no silent restart without it. Show the real cause instead.
-                    error = Sys.log_errors(self.logf[backend]) or "server berhenti"
+                    error = Sys.log_errors(self.logf[backend]) or "server stopped"
                     if self.state.get("mtp") and self.SPEC_ERROR.search(log_tail):
-                        error = "Gagal di bagian MTP/drafter (MTP wajib, server tidak dijalankan ulang tanpa MTP).\n" + error
+                        error = "Failed in the MTP/drafter part (MTP is required; the server is not restarted without MTP).\n" + error
                     self.state.update(phase="failed", error=error + self.jit_logs(log_tail) + self.hint(log_tail, p))
                     self._save()
                     return
@@ -863,22 +863,22 @@ def _(CTX_CHOICES, EMBEDDERS, PRESETS, STORE, mo):
     _ctx_label = next((k for k, v in CTX_CHOICES.items() if v == _last.get("ctx")), "512K (YaRN)")
     ctl_preset = mo.ui.dropdown(options=list(PRESETS), value=_last.get("preset") if _last.get("preset") in PRESETS else next(iter(PRESETS)),
                                 label="Model", full_width=True)
-    ctl_ctx = mo.ui.dropdown(options=CTX_CHOICES, value=_ctx_label, label="Konteks")
-    ctl_mtp = mo.ui.switch(value=_last.get("mtp", True), label="MTP (lebih cepat)")
-    ctl_embed = mo.ui.switch(value=_last.get("embed", True), label="Embedder (pencarian memory lebih pintar)")
+    ctl_ctx = mo.ui.dropdown(options=CTX_CHOICES, value=_ctx_label, label="Context")
+    ctl_mtp = mo.ui.switch(value=_last.get("mtp", True), label="MTP (faster)")
+    ctl_embed = mo.ui.switch(value=_last.get("embed", True), label="Embedder (smarter memory search)")
     ctl_embed_model = mo.ui.dropdown(options=list(EMBEDDERS), value=_last.get("embed_model") if _last.get("embed_model") in EMBEDDERS
-                                     else "0.6B", label="Ukuran embedder")
+                                     else "0.6B", label="Embedder size")
     ctl_hf = mo.ui.text(kind="password", full_width=True,
-                         label="Token Hugging Face (opsional; untuk model gated, download lebih cepat, dan backup)")
+                         label="Hugging Face token (optional; for gated models, faster downloads, and backup)")
     ctl_install = mo.ui.run_button(label="Install")
     ctl_start = mo.ui.run_button(label="Start", kind="success")
     ctl_stop = mo.ui.run_button(label="Stop", kind="danger")
     mo.vstack([
-        mo.md("### Server model"),
+        mo.md("### Model server"),
         ctl_preset,
         mo.hstack([ctl_ctx, ctl_mtp, ctl_embed, ctl_embed_model], justify="start", align="center", gap=2),
         ctl_hf,
-        mo.md("_Token hanya disimpan di memori kernel (env `HF_TOKEN`), tidak ditulis ke database, disk, atau backup._"),
+        mo.md("_The token stays in kernel memory only (env `HF_TOKEN`), never in the database, on disk, or in a backup._"),
         mo.hstack([ctl_install, ctl_start, ctl_stop], justify="start"),
     ])
     return (
@@ -917,30 +917,30 @@ def _(
         if ctl_install.value:
             try:
                 SERVERS.install()
-                return mo.callout(mo.md("Install selesai. Pilih model lalu klik **Start**."), kind="success")
+                return mo.callout(mo.md("Install finished. Pick a model, then click **Start**."), kind="success")
             except Exception as e:
-                return mo.callout(mo.md(f"Install gagal: {e}"), kind="danger")
+                return mo.callout(mo.md(f"Install failed: {e}"), kind="danger")
         if ctl_start.value:
             p = PRESETS[ctl_preset.value]
             if ctl_ctx.value > p["yarn_max"]:
-                return mo.callout(mo.md(f"**{ctl_preset.value}** maksimal {p['yarn_max']:,} token. Pilih konteks yang lebih kecil."),
+                return mo.callout(mo.md(f"**{ctl_preset.value}** allows at most {p['yarn_max']:,} tokens. Pick a smaller context."),
                                   kind="danger")
             try:
                 SERVERS.start(ctl_preset.value, ctl_ctx.value, mtp=ctl_mtp.value, embed=ctl_embed.value,
                               embed_model=ctl_embed_model.value)
             except Exception as e:
-                return mo.callout(mo.md(f"Start gagal: {e}"), kind="danger")
+                return mo.callout(mo.md(f"Start failed: {e}"), kind="danger")
             STORE.meta_set("server", {"preset": ctl_preset.value, "ctx": ctl_ctx.value, "mtp": ctl_mtp.value,
                                       "embed": ctl_embed.value, "embed_model": ctl_embed_model.value})
             note = ""
             if ctl_ctx.value > p["max_ctx"] and p.get("yarn_exp"):
-                note = ("\n\n**YaRN eksperimental:** model ini tidak punya resep YaRN resmi. Cek `n_ctx` di log dan uji "
-                        "ingatan sebelum percaya jawaban di atas 262K.")
-            return mo.callout(mo.md(f"**{ctl_preset.value}** dimulai dengan konteks {ctl_ctx.value:,}. "
-                                    f"Pantau status di bawah.{note}"), kind="neutral")
+                note = ("\n\n**Experimental YaRN:** this model has no official YaRN recipe. Check `n_ctx` in the log and test "
+                        "its recall before you trust answers beyond 262K.")
+            return mo.callout(mo.md(f"**{ctl_preset.value}** started with a context of {ctl_ctx.value:,}. "
+                                    f"Watch the status below.{note}"), kind="neutral")
         if ctl_stop.value:
             stopped = SERVERS.stop()
-            return mo.md("Server dihentikan." if stopped else "Tidak ada server yang jalan.")
+            return mo.md("Server stopped." if stopped else "No server is running.")
         return None
 
 
@@ -953,13 +953,13 @@ def _(SERVERS, Sys, mo, time):
         st = SERVERS.status()
         phase = st["phase"]
         kinds = {"ready": "success", "failed": "danger"}
-        titles = {"idle": "Belum di-start.", "downloading": "Download model…", "loading": "Memuat model…",
-                  "ready": "READY: chat siap dipakai.", "failed": "Server gagal."}
+        titles = {"idle": "Not started.", "downloading": "Downloading model…", "loading": "Loading model…",
+                  "ready": "READY: the chat is ready to use.", "failed": "Server failed."}
         head = f"**{titles.get(phase, phase)}**"
         if st.get("preset"):
-            head += f" {st['preset']} · konteks {st['ctx']:,} · MTP {'nyala' if st.get('mtp') else 'mati'}"
+            head += f" {st['preset']} · context {st['ctx']:,} · MTP {'on' if st.get('mtp') else 'off'}"
         if st.get("embed"):
-            head += f" · embedder {'siap' if st.get('embed_ready') else 'memuat'}"
+            head += f" · embedder {'ready' if st.get('embed_ready') else 'loading'}"
         parts = [mo.callout(mo.md(head), kind=kinds.get(phase, "neutral"))]
         for w in st.get("warnings") or []:
             parts.append(mo.callout(mo.md(w), kind="warn"))
@@ -969,7 +969,7 @@ def _(SERVERS, Sys, mo, time):
         if gpu:
             parts.append(mo.md(f"`GPU {gpu['util']:.0f}% · VRAM {gpu['used_gb']:.1f} / {gpu['total_gb']:.0f} GB`"))
         if st.get("log"):
-            parts.append(mo.accordion({"Log server (40 baris terakhir)": mo.plain_text(st["log"])}))
+            parts.append(mo.accordion({"Server log (last 40 lines)": mo.plain_text(st["log"])}))
         return mo.vstack(parts)
 
 
@@ -1686,7 +1686,7 @@ def _(CFG, Path, STORE, os, threading, time):
                 try:
                     self.repo = f"{self._api().whoami()['name']}/qwen-chat-backup"
                 except Exception as e:
-                    self.status["last_error"] = f"Token tidak bisa dipakai: {type(e).__name__}"
+                    self.status["last_error"] = f"The token cannot be used: {type(e).__name__}"
                     self.status["enabled"] = False
             self.status["repo"] = self.repo
             if self.status["enabled"]:
@@ -1710,7 +1710,7 @@ def _(CFG, Path, STORE, os, threading, time):
 
         def backup_now(self):
             if not self.token:
-                raise RuntimeError("Isi token HF dulu.")
+                raise RuntimeError("Enter an HF token first.")
             with self.lock:
                 self.status["busy"] = True
                 rev = self.store.rev
@@ -1721,7 +1721,7 @@ def _(CFG, Path, STORE, os, threading, time):
                     api.create_repo(self.repo, repo_type="dataset", private=True, exist_ok=True)
                     # exist_ok keeps an existing repo as it is: never upload chats to a public one
                     if not getattr(api.repo_info(self.repo, repo_type="dataset"), "private", False):
-                        raise RuntimeError(f"Repo {self.repo} publik. Jadikan private dulu di Hugging Face; backup tidak diunggah.")
+                        raise RuntimeError(f"Repo {self.repo} is public. Make it private on Hugging Face first; nothing was uploaded.")
                     stamp = time.strftime("%Y%m%d-%H%M%S")
                     from huggingface_hub import CommitOperationAdd, CommitOperationDelete
                     ops = [CommitOperationAdd(f"backups/qwen-chat-{stamp}.sqlite", str(tmp)),
@@ -1755,20 +1755,20 @@ def _(CFG, Path, STORE, os, threading, time):
 
 @app.cell(hide_code=True)
 def _(STORE, mo):
-    bk_token = mo.ui.text(kind="password", label="Token Hugging Face (write, sebaiknya fine-grained ke repo backup saja)",
+    bk_token = mo.ui.text(kind="password", label="Hugging Face token (write; ideally fine-grained to the backup repo only)",
                           full_width=True)
     _bk_last = STORE.meta_get("backup", {}) or {}
-    _bk_choices = {"5 menit": 300, "10 menit": 600, "30 menit": 1800}
-    bk_repo = mo.ui.text(value=_bk_last.get("repo", ""), label="Repo dataset private (kosong = <username>/qwen-chat-backup)",
+    _bk_choices = {"5 minutes": 300, "10 minutes": 600, "30 minutes": 1800}
+    bk_repo = mo.ui.text(value=_bk_last.get("repo", ""), label="Private dataset repo (empty = <username>/qwen-chat-backup)",
                          full_width=True)
-    bk_interval = mo.ui.dropdown(options=_bk_choices, label="Backup otomatis tiap",
-                                 value=next((k for k, v in _bk_choices.items() if v == _bk_last.get("interval")), "10 menit"))
-    bk_now = mo.ui.run_button(label="Backup sekarang")
-    bk_restore = mo.ui.run_button(label="Pulihkan terbaru", kind="danger")
-    mo.accordion({"Backup ke Hugging Face": mo.vstack([
-        mo.md("Token hanya disimpan di memori kernel, tidak pernah ditulis ke database, disk, atau file backup. "
-              "Kalau kosong, dipakai token di panel **Server model** (env `HF_TOKEN`); token itu harus punya izin write. "
-              "Repo dibuat **private**."),
+    bk_interval = mo.ui.dropdown(options=_bk_choices, label="Automatic backup every",
+                                 value=next((k for k, v in _bk_choices.items() if v == _bk_last.get("interval")), "10 minutes"))
+    bk_now = mo.ui.run_button(label="Back up now")
+    bk_restore = mo.ui.run_button(label="Restore latest", kind="danger")
+    mo.accordion({"Backup to Hugging Face": mo.vstack([
+        mo.md("The token stays in kernel memory only and is never written to the database, disk, or backup file. "
+              "If it is empty, the token from the **Model server** panel (env `HF_TOKEN`) is used; that token needs write "
+              "access. The repo is created **private**."),
         bk_token, mo.hstack([bk_repo, bk_interval], widths=[3, 1]), mo.hstack([bk_now, bk_restore], justify="start"),
     ])})
     return bk_interval, bk_now, bk_repo, bk_restore, bk_token
@@ -1779,18 +1779,18 @@ def _(BACKUP, bk_interval, bk_now, bk_repo, bk_restore, bk_token, ctl_hf, mo):
     def _backup_act():
         BACKUP.configure(bk_token.value or ctl_hf.value, bk_repo.value, bk_interval.value)
         if not BACKUP.status["enabled"]:
-            return mo.md(f"_Backup mati: {BACKUP.status['last_error'] or 'belum ada token.'}_")
+            return mo.md(f"_Backup is off: {BACKUP.status['last_error'] or 'no token yet.'}_")
         try:
             if bk_now.value:
                 BACKUP.backup_now()
-                return mo.callout(mo.md(f"Backup tersimpan di `{BACKUP.repo}`."), kind="success")
+                return mo.callout(mo.md(f"Backup saved to `{BACKUP.repo}`."), kind="success")
             if bk_restore.value:
                 BACKUP.restore_latest()
-                return mo.callout(mo.md(f"Database dipulihkan dari `{BACKUP.repo}/latest.sqlite`. Muat ulang jendela chat "
-                                        f"(pilih chat lagi dari sidebar)."), kind="success")
+                return mo.callout(mo.md(f"Database restored from `{BACKUP.repo}/latest.sqlite`. Reload the chat window "
+                                        f"(pick the chat again in the sidebar)."), kind="success")
         except Exception as e:
-            return mo.callout(mo.md(f"Gagal: {e}"), kind="danger")
-        return mo.md(f"_Backup otomatis aktif ke `{BACKUP.repo}` setiap {BACKUP.interval // 60} menit kalau ada perubahan._")
+            return mo.callout(mo.md(f"Failed: {e}"), kind="danger")
+        return mo.md(f"_Automatic backup to `{BACKUP.repo}` is on, every {BACKUP.interval // 60} minutes when something changed._")
 
 
     _backup_act()
@@ -2106,149 +2106,152 @@ def _():
     # Default schemas. They are data: stored in card_schemas, editable in the schema editor, exported with cards.
     # Nothing here is tied to a genre; examples in `help` are only hints.
     DEFAULT_SCHEMAS = {
-        "character": {"type": "character", "label": "Tokoh", "version": 3, "fields": [
-            _f("name", "Nama", "Identitas"),
-            _f("aliases", "Nama lain / panggilan", "Identitas", "tags"),
-            _f("age", "Umur", "Identitas"),
-            _f("role", "Peran dalam cerita", "Identitas"),
-            _f("fame", "Pamor", "Identitas", "select", core=False, options=FAME_LEVELS,
-               help="Seberapa dikenal di lingkungan cerita (misalnya kampus). Bintang dan terkenal: dikenal semua orang, lebih aktif "
-                    "di dunia, dan kartunya selalu ada di prompt kalau tokoh lebih dari 12"),
-            _f("fame_for", "Dikenal karena", "Identitas", core=False),
-            _f("appearance", "Penampilan", "Identitas", "longtext"),
-            _f("description", "Deskripsi umum", "Identitas", "longtext"),
-            _f("traits", "Sifat", "Kepribadian", "table", columns=["sifat", "kekuatan 1-5"]),
-            _f("personality", "Kepribadian", "Kepribadian", "longtext"),
-            _f("speech_style", "Gaya bicara", "Gaya bicara", "longtext", help="Kebiasaan ucapan, panggilan untukmu, campuran bahasa"),
-            _f("speech_samples", "Contoh kalimat khas", "Gaya bicara", "list", max_items=5,
-               help="3-5 kalimat persis seperti tokoh ini bicara"),
-            _f("example_dialogue", "Contoh dialog", "Gaya bicara", "longtext", core=False),
-            _f("languages", "Bahasa yang dikuasai", "Gaya bicara"),
-            _f("goals", "Tujuan", "Agenda", "list"),
-            _f("plan", "Rencana saat ini (awal)", "Agenda", "longtext", core=False),
-            _f("routine", "Rutinitas", "Agenda", "longtext", core=False),
-            _f("schedule", "Jadwal (lokasi menurut jam dunia)", "Agenda", "table", core=False, columns=["jam", "lokasi", "kegiatan"],
-               help="Jam 0-23 atau rentang seperti 08-12. Dipakai untuk tahu di mana tokoh berada saat tidak terlihat"),
-            _f("skill_levels", "Nilai kemampuan", "Kemampuan", "table", core=False, columns=["kemampuan", "nilai 0-100"],
-               help="Dipakai sistem untuk menghitung peluang dadu"),
-            _f("fears", "Ketakutan", "Agenda", "list", core=False),
-            _f("secrets", "Rahasia", "Agenda", "list", visibility="secret"),
-            _f("backstory", "Riwayat", "Riwayat", "longtext", core=False),
-            _f("relations", "Relasi", "Riwayat", "table", core=False, columns=["nama", "hubungan", "catatan"]),
-            _f("limits", "Hal yang tidak akan dilakukan tokoh", "Batasan", "longtext"),
-            _f("knowledge", "Yang diketahui tokoh", "Batasan", "list", core=False),
-            _f("greetings", "Pesan pembuka", "Pembuka", "list", visibility="ui"),
-            _f("default_scenario", "Skenario default", "Pembuka", "longtext", core=False),
-            _f("tags", "Tag", "Lainnya", "tags", visibility="ui"),
-            _f("notes", "Catatan untukmu", "Lainnya", "longtext", visibility="ui"),
+        "character": {"type": "character", "label": "Character", "version": 4, "fields": [
+            _f("name", "Name", "Identity"),
+            _f("aliases", "Other names / nicknames", "Identity", "tags"),
+            _f("age", "Age", "Identity"),
+            _f("role", "Role in the story", "Identity"),
+            _f("fame", "Fame", "Identity", "select", core=False, options=FAME_LEVELS,
+               help="How well known the character is around the story (a campus, for example). bintang (star) and terkenal "
+                    "(famous): known to everyone, more active in the world, and their card is always in the prompt when there "
+                    "are more than 12 characters"),
+            _f("fame_for", "Known for", "Identity", core=False),
+            _f("appearance", "Appearance", "Identity", "longtext"),
+            _f("description", "General description", "Identity", "longtext"),
+            _f("traits", "Traits", "Personality", "table", columns=["trait", "strength 1-5"]),
+            _f("personality", "Personality", "Personality", "longtext"),
+            _f("speech_style", "Speech style", "Speech", "longtext",
+               help="Speech habits, what they call you, mixing of languages"),
+            _f("speech_samples", "Signature lines", "Speech", "list", max_items=5,
+               help="3-5 lines exactly as this character speaks"),
+            _f("example_dialogue", "Example dialogue", "Speech", "longtext", core=False),
+            _f("languages", "Languages spoken", "Speech"),
+            _f("goals", "Goals", "Agenda", "list"),
+            _f("plan", "Current plan (at the start)", "Agenda", "longtext", core=False),
+            _f("routine", "Routine", "Agenda", "longtext", core=False),
+            _f("schedule", "Schedule (location by world time)", "Agenda", "table", core=False, columns=["jam", "lokasi", "kegiatan"],
+               help="Hour 0-23 or a range such as 08-12. Used to know where the character is when not on screen"),
+            _f("skill_levels", "Skill levels", "Skills", "table", core=False, columns=["skill", "level 0-100"],
+               help="Used by the system to work out dice odds"),
+            _f("fears", "Fears", "Agenda", "list", core=False),
+            _f("secrets", "Secrets", "Agenda", "list", visibility="secret"),
+            _f("backstory", "Backstory", "History", "longtext", core=False),
+            _f("relations", "Relationships", "History", "table", core=False, columns=["name", "relationship", "notes"]),
+            _f("limits", "Things this character will never do", "Limits", "longtext"),
+            _f("knowledge", "What the character knows", "Limits", "list", core=False),
+            _f("greetings", "Opening messages", "Opening", "list", visibility="ui"),
+            _f("default_scenario", "Default scenario", "Opening", "longtext", core=False),
+            _f("tags", "Tags", "Other", "tags", visibility="ui"),
+            _f("notes", "Notes for you", "Other", "longtext", visibility="ui"),
         ]},
-        "persona": {"type": "persona", "label": "Persona", "version": 3, "fields": [
-            _f("name", "Nama", "Identitas"),
-            _f("age", "Umur", "Identitas"),
-            _f("role", "Peran", "Identitas"),
-            _f("fame", "Pamor", "Identitas", "select", core=False, options=FAME_LEVELS,
-               help="Bintang atau terkenal: orang lain tahu siapa tokohmu walau belum berkenalan"),
-            _f("fame_for", "Dikenal karena", "Identitas", core=False),
-            _f("appearance", "Penampilan", "Identitas", "longtext"),
-            _f("background", "Latar belakang", "Identitas", "longtext"),
-            _f("personality", "Kepribadian", "Identitas", "longtext"),
-            _f("skills", "Kemampuan", "Kemampuan", "list"),
-            _f("skill_levels", "Nilai kemampuan", "Kemampuan", "table", core=False, columns=["kemampuan", "nilai 0-100"],
-               help="Dipakai sistem untuk menghitung peluang dadu, misalnya: Bahasa Jerman, 55"),
-            _f("model_may_decide", "Yang boleh diputuskan narator untuk tokoh pemain", "Aturan", "longtext",
-               help="Misalnya: gerakan kecil dan reaksi refleks boleh; ucapan dan keputusan tidak"),
-            _f("limits", "Batasan", "Aturan", "longtext"),
-            _f("notes", "Catatan untukmu", "Lainnya", "longtext", visibility="ui"),
+        "persona": {"type": "persona", "label": "Persona", "version": 4, "fields": [
+            _f("name", "Name", "Identity"),
+            _f("age", "Age", "Identity"),
+            _f("role", "Role", "Identity"),
+            _f("fame", "Fame", "Identity", "select", core=False, options=FAME_LEVELS,
+               help="bintang (star) or terkenal (famous): other people know who your character is even before you meet"),
+            _f("fame_for", "Known for", "Identity", core=False),
+            _f("appearance", "Appearance", "Identity", "longtext"),
+            _f("background", "Background", "Identity", "longtext"),
+            _f("personality", "Personality", "Identity", "longtext"),
+            _f("skills", "Skills", "Skills", "list"),
+            _f("skill_levels", "Skill levels", "Skills", "table", core=False, columns=["skill", "level 0-100"],
+               help="Used by the system to work out dice odds, for example: German, 55"),
+            _f("model_may_decide", "What the narrator may decide for the player character", "Rules", "longtext",
+               help="For example: small movements and reflexes are fine; speech and decisions are not"),
+            _f("limits", "Limits", "Rules", "longtext"),
+            _f("notes", "Notes for you", "Other", "longtext", visibility="ui"),
         ]},
-        "world": {"type": "world", "label": "Dunia", "version": 2, "fields": [
-            _f("name", "Nama dunia", "Inti"),
-            _f("era", "Zaman", "Inti"),
-            _f("setting", "Tempat dan latar", "Inti", "longtext"),
-            _f("realworld", "Berbasis dunia nyata", "Inti", "select", options=["ya", "tidak"],
-               help="ya = fakta dunia nyata wajib akurat dan dicek; tidak = dicek terhadap lore"),
-            _f("technology", "Teknologi", "Inti", "longtext"),
-            _f("society", "Politik, faksi, masyarakat", "Inti", "longtext"),
-            _f("rules", "Aturan dunia", "Inti", "longtext", help="Hukum alam, sihir, batas teknologi"),
-            _f("languages", "Bahasa", "Inti", "longtext"),
-            _f("daily_life", "Kehidupan sehari-hari", "Detail", "longtext", core=False),
-            _f("terms", "Istilah", "Detail", "table", core=False, columns=["istilah", "arti"]),
-            _f("climate", "Iklim (untuk cuaca)", "Detail", "table", core=False, visibility="ui",
+        "world": {"type": "world", "label": "World", "version": 3, "fields": [
+            _f("name", "World name", "Core"),
+            _f("era", "Era", "Core"),
+            _f("setting", "Place and setting", "Core", "longtext"),
+            _f("realworld", "Based on the real world", "Core", "select", options=["ya", "tidak"],
+               help="ya (yes) = real-world facts must be accurate and are checked; tidak (no) = checked against the lore"),
+            _f("technology", "Technology", "Core", "longtext"),
+            _f("society", "Politics, factions, society", "Core", "longtext"),
+            _f("rules", "World rules", "Core", "longtext", help="Laws of nature, magic, limits of technology"),
+            _f("languages", "Languages", "Core", "longtext"),
+            _f("daily_life", "Daily life", "Details", "longtext", core=False),
+            _f("terms", "Terms", "Details", "table", core=False, columns=["istilah", "arti"]),
+            _f("climate", "Climate (for the weather)", "Details", "table", core=False, visibility="ui",
                columns=["bulan", "suhu min", "suhu max", "cuaca"],
-               help="Bulan 1-12 atau nama musim; cuaca dipisah koma, misalnya: cerah, berawan, hujan"),
-            _f("stats", "Statistik pemain", "Mekanik", "table", core=False, visibility="ui",
+               help="Month 1-12 or a season name; weather kinds separated by commas, for example: clear, cloudy, rain"),
+            _f("stats", "Player stats", "Mechanics", "table", core=False, visibility="ui",
                columns=["key", "label", "min", "max", "awal", "laju per jam"],
-               help="Contoh: lapar, Lapar, 0, 100, 20, 4 (naik 4 per jam). Laju kosong = tidak berubah sendiri"),
-            _f("locations", "Waktu tempuh antar tempat", "Mekanik", "table", core=False, columns=["dari", "ke", "menit"],
-               help="Jam dunia maju sesuai perjalanan kalau tokohmu pindah tempat"),
-            _f("wiki_lang", "Bahasa Wikipedia untuk riset", "Mekanik", visibility="ui", help="Misalnya: de,en"),
-            _f("notes", "Catatan untukmu", "Lainnya", "longtext", visibility="ui"),
+               help="Example: hunger, Hunger, 0, 100, 20, 4 (rises 4 per hour). An empty rate means it does not change on its own"),
+            _f("locations", "Travel time between places", "Mechanics", "table", core=False, columns=["dari", "ke", "menit"],
+               help="The world clock moves on by the travel time when your character goes somewhere else"),
+            _f("wiki_lang", "Wikipedia language for research", "Mechanics", visibility="ui", help="For example: de,en"),
+            _f("notes", "Notes for you", "Other", "longtext", visibility="ui"),
         ]},
-        "scenario": {"type": "scenario", "label": "Skenario", "version": 1, "fields": [
-            _f("title", "Judul", "Inti"),
-            _f("premise", "Premis", "Inti", "longtext"),
-            _f("situation", "Situasi awal", "Inti", "longtext"),
-            _f("conflict", "Konflik", "Inti", "longtext"),
-            _f("stakes", "Taruhan", "Inti", "longtext"),
-            _f("plan", "Alur yang direncanakan", "Alur", "list", core=False),
-            _f("start_time", "Tanggal dan jam dunia awal", "Mulai", "datetime", help="Format 1916-07-01 06:30"),
-            _f("start_location", "Lokasi awal", "Mulai"),
-            _f("start_stats", "Statistik awal (menimpa nilai awal dunia)", "Mulai", "table", core=False, visibility="ui",
+        "scenario": {"type": "scenario", "label": "Scenario", "version": 2, "fields": [
+            _f("title", "Title", "Core"),
+            _f("premise", "Premise", "Core", "longtext"),
+            _f("situation", "Starting situation", "Core", "longtext"),
+            _f("conflict", "Conflict", "Core", "longtext"),
+            _f("stakes", "Stakes", "Core", "longtext"),
+            _f("plan", "Planned plot", "Plot", "list", core=False),
+            _f("start_time", "Starting world date and time", "Start", "datetime", help="Format 1916-07-01 06:30"),
+            _f("start_location", "Starting location", "Start"),
+            _f("start_stats", "Starting stats (override the world's starting values)", "Start", "table", core=False, visibility="ui",
                columns=["key", "nilai"]),
-            _f("opening", "Adegan pembuka", "Mulai", "longtext", visibility="ui"),
+            _f("opening", "Opening scene", "Start", "longtext", visibility="ui"),
         ]},
-        "style": {"type": "style", "label": "Gaya", "version": 1, "fields": [
-            _f("pov", "Sudut pandang", "Narasi", "select",
+        "style": {"type": "style", "label": "Style", "version": 2, "fields": [
+            _f("pov", "Point of view", "Narration", "select",
                options=["orang kedua (kamu)", "orang pertama (aku)", "orang ketiga"]),
-            _f("narration_lang", "Bahasa narasi", "Narasi"),
-            _f("dialogue_rule", "Aturan dialog dan terjemahan", "Narasi", "longtext"),
-            _f("target_lang", "Bahasa target (mode belajar)", "Narasi", visibility="ui", help="Kode bahasa, misalnya de"),
-            _f("paragraphs", "Jumlah paragraf", "Panjang", visibility="ui", help="Rentang, misalnya 5-10"),
-            _f("sentences", "Kalimat per paragraf", "Panjang", visibility="ui", help="Rentang, misalnya 5-10"),
-            _f("sentence_style", "Gaya kalimat", "Panjang", "longtext"),
-            _f("dialogue_ratio", "Porsi dialog", "Panjang"),
-            _f("violence", "Detail kekerasan", "Isi", "select", options=["tersirat", "sedang", "grafis"]),
-            _f("tone", "Nada", "Isi", "longtext"),
-            _f("pacing", "Tempo", "Isi"),
-            _f("banned", "Frasa terlarang", "Larangan", "list"),
-            _f("rules", "Aturan tambahan", "Larangan", "list"),
+            _f("narration_lang", "Narration language", "Narration"),
+            _f("dialogue_rule", "Dialogue and translation rule", "Narration", "longtext"),
+            _f("target_lang", "Target language (learning mode)", "Narration", visibility="ui", help="Language code, for example de"),
+            _f("paragraphs", "Number of paragraphs", "Length", visibility="ui", help="A range, for example 5-10"),
+            _f("sentences", "Sentences per paragraph", "Length", visibility="ui", help="A range, for example 5-10"),
+            _f("sentence_style", "Sentence style", "Length", "longtext"),
+            _f("dialogue_ratio", "Share of dialogue", "Length"),
+            _f("violence", "Detail of violence", "Content", "select", options=["tersirat", "sedang", "grafis"]),
+            _f("tone", "Tone", "Content", "longtext"),
+            _f("pacing", "Pacing", "Content"),
+            _f("banned", "Banned phrases", "Restrictions", "list"),
+            _f("rules", "Extra rules", "Restrictions", "list"),
         ]},
-        "gm": {"type": "gm", "label": "GM", "version": 3, "fields": [
+        "gm": {"type": "gm", "label": "GM", "version": 4, "fields": [
             _f("format", "Format", "Format", "select", options=["prosa", "game"], visibility="ui"),
-            _f("realism", "Tingkat realisme", "Dunia", "select", options=["santai", "membumi", "keras"]),
-            _f("lethality", "Kekejaman", "Dunia", "select", options=["rendah", "sedang", "tinggi"]),
-            _f("consequences", "Aturan konsekuensi", "Dunia", "longtext"),
-            _f("npc_behavior", "Perilaku NPC", "Dunia", "longtext"),
-            _f("random_events", "Kejadian acak", "Dunia", "select", options=["jarang", "kadang", "sering"]),
-            _f("dice", "Kapan memakai dadu", "Mekanik", "select", options=["saat ragu", "sering", "jarang"]),
-            _f("fact_policy", "Aturan fakta", "Mekanik", "longtext"),
-            _f("checklist", "Checklist sebelum menjawab", "Mekanik", "list"),
-            _f("rules", "Aturan tambahan", "Mekanik", "list"),
-            _f("choices", "Pilihan", "Pilihan", "select", options=["selalu", "kadang", "tidak"], visibility="ui"),
-            _f("choice_problems", "Jumlah masalah", "Pilihan", visibility="ui", help="Rentang, misalnya 1-3"),
-            _f("choice_options", "Pilihan per masalah", "Pilihan", visibility="ui", help="Rentang, misalnya 3-5"),
-            _f("choice_sentences", "Kalimat per pertanyaan/pilihan", "Pilihan", visibility="ui", help="Rentang, misalnya 1-2"),
-            _f("time_skips", "Tombol lompat waktu", "Waktu", "list", visibility="ui"),
-            _f("afk_scale", "Skala waktu saat AFK", "Waktu", visibility="ui",
-               help="Jam cerita per jam nyata. 0 = dunia berhenti, 1 = sama dengan waktu nyata"),
-            _f("tick_minutes", "World tick tiap (menit diam)", "Waktu", visibility="ui"),
-            _f("offscreen_hours", "Dunia di luar layar bergerak tiap (jam dunia)", "Waktu", visibility="ui",
-               help="Tokoh yang tidak ada di adegan menjalankan agendanya di latar setiap sekian jam waktu dunia. 0 = mati"),
-            _f("state_check", "Pemeriksa keadaan setelah tiap giliran", "Kontinuitas", "select", options=["ya", "tidak"],
-               visibility="ui", help="Mengisi waktu, status, dan ingatan tokoh yang lupa dicatat model"),
-            _f("continuity_check", "Cek kontinuitas", "Kontinuitas", "select", options=["latar", "ketat", "mati"], visibility="ui",
-               help="Menandai tokoh yang tahu hal di luar ingatannya, salah lokasi, sudah mati, atau tidak mengikuti dadu. "
-                    "Ketat: jawaban ditulis ulang"),
+            _f("realism", "Realism", "World", "select", options=["santai", "membumi", "keras"]),
+            _f("lethality", "Lethality", "World", "select", options=["rendah", "sedang", "tinggi"]),
+            _f("consequences", "Consequence rules", "World", "longtext"),
+            _f("npc_behavior", "NPC behavior", "World", "longtext"),
+            _f("random_events", "Random events", "World", "select", options=["jarang", "kadang", "sering"]),
+            _f("dice", "When to roll dice", "Mechanics", "select", options=["saat ragu", "sering", "jarang"]),
+            _f("fact_policy", "Fact rules", "Mechanics", "longtext"),
+            _f("checklist", "Checklist before answering", "Mechanics", "list"),
+            _f("rules", "Extra rules", "Mechanics", "list"),
+            _f("choices", "Choices", "Choices", "select", options=["selalu", "kadang", "tidak"], visibility="ui"),
+            _f("choice_problems", "Number of problems", "Choices", visibility="ui", help="A range, for example 1-3"),
+            _f("choice_options", "Options per problem", "Choices", visibility="ui", help="A range, for example 3-5"),
+            _f("choice_sentences", "Sentences per question/option", "Choices", visibility="ui", help="A range, for example 1-2"),
+            _f("time_skips", "Time skip buttons", "Time", "list", visibility="ui"),
+            _f("afk_scale", "Time scale while AFK", "Time", visibility="ui",
+               help="Story hours per real hour. 0 = the world stops, 1 = same as real time"),
+            _f("tick_minutes", "World tick every (idle minutes)", "Time", visibility="ui"),
+            _f("offscreen_hours", "Off-screen world moves every (world hours)", "Time", visibility="ui",
+               help="Characters who are not in the scene carry out their agenda in the background every so many world hours. "
+                    "0 = off"),
+            _f("state_check", "State check after each turn", "Continuity", "select", options=["ya", "tidak"],
+               visibility="ui", help="Fills in the time, status and character memories the model forgot to record"),
+            _f("continuity_check", "Continuity check", "Continuity", "select", options=["latar", "ketat", "mati"], visibility="ui",
+               help="Flags characters who know things outside their memory, are in the wrong place, are dead, or ignore the "
+                    "dice. latar (background): flags only; ketat (strict): the reply is rewritten; mati: off"),
         ]},
-        "status": {"type": "status", "label": "Status tokoh", "version": 2, "fields": [
-            _f("location", "Lokasi", "Status"),
-            _f("keadaan", "Keadaan", "Status", "select", options=["hidup", "terluka parah", "pingsan", "ditahan", "pergi", "mati"]),
-            _f("outfit", "Pakaian", "Status"),
+        "status": {"type": "status", "label": "Character status", "version": 3, "fields": [
+            _f("location", "Location", "Status"),
+            _f("keadaan", "Condition", "Status", "select", options=["hidup", "terluka parah", "pingsan", "ditahan", "pergi", "mati"]),
+            _f("outfit", "Outfit", "Status"),
             _f("mood", "Mood", "Status"),
-            _f("injuries", "Luka", "Status", "list"),
-            _f("inventory", "Barang bawaan", "Status", "list"),
-            _f("attitude", "Sikap ke tokoh lain", "Status", "table", columns=["tokoh", "sikap"]),
-            _f("plan_now", "Rencana saat ini", "Status", "longtext"),
-            _f("knows", "Yang baru diketahui", "Status", "list"),
+            _f("injuries", "Injuries", "Status", "list"),
+            _f("inventory", "Inventory", "Status", "list"),
+            _f("attitude", "Attitude toward other characters", "Status", "table", columns=["character", "attitude"]),
+            _f("plan_now", "Current plan", "Status", "longtext"),
+            _f("knows", "Newly learned", "Status", "list"),
         ]},
     }
 
@@ -2368,14 +2371,14 @@ def _(
 
         def save_schema(self, sch):
             if not isinstance(sch, dict) or not sch.get("type") or not isinstance(sch.get("fields"), list):
-                raise ValueError("Skema harus punya 'type' dan daftar 'fields'.")
+                raise ValueError("A schema needs a 'type' and a 'fields' list.")
             keys = set()
             for f in sch["fields"]:
                 if not f.get("key") or f["key"] in keys:
-                    raise ValueError(f"Field tanpa key atau key dobel: {f.get('key')!r}")
+                    raise ValueError(f"Field without a key, or a duplicate key: {f.get('key')!r}")
                 keys.add(f["key"])
                 f.setdefault("label", f["key"])
-                f.setdefault("section", "Lainnya")
+                f.setdefault("section", "Other")
                 f.setdefault("type", "text")
                 f.setdefault("core", False)
                 f.setdefault("visibility", "model")
@@ -2559,7 +2562,7 @@ def _(
                     card_id = None
                 elif not name:
                     name = cur["name"]  # Style and GM cards have no name field: saving the form keeps the name
-            name = name or "Tanpa nama"
+            name = name or "Unnamed"
             if not card_id:
                 card_id = self.store.x("INSERT INTO cards (type, name, data, avatar, version, created, updated) VALUES (?, ?, ?, ?, 1, ?, ?)",
                                        (type_, name, json.dumps(data), avatar, now, now))
@@ -2669,7 +2672,7 @@ def _(
             """Fields of a card for the UI form, schema order, with unknown keys appended."""
             sch = self.schema(card["type"])
             known = {f["key"] for f in sch["fields"]}
-            extra = [{"key": k, "label": k, "section": "Tambahan", "type": "longtext", "core": False, "visibility": "model"}
+            extra = [{"key": k, "label": k, "section": "Extra", "type": "longtext", "core": False, "visibility": "model"}
                      for k in card["data"] if k not in known]
             return sch["fields"] + extra
 
@@ -2732,7 +2735,7 @@ def _(
                 text = data if isinstance(data, str) else bytes(data).decode("utf-8-sig")
                 obj, avatar = json.loads(text.lstrip("﻿")), None
             if not isinstance(obj, dict):
-                raise ValueError("File kartu harus berisi satu objek JSON.")
+                raise ValueError("A card file must hold one JSON object.")
             if obj.get("format") == "qcard":
                 return self._import_qcard(obj)
             return self._import_st(obj, avatar)
@@ -2741,12 +2744,12 @@ def _(
             avatar = base64.b64decode(obj["avatar"]) if obj.get("avatar") else None
             type_ = str(obj.get("type") or "")
             if not type_:
-                raise ValueError("qcard tanpa jenis kartu.")
+                raise ValueError("qcard without a card type.")
             known = self.store.one("SELECT 1 AS x FROM card_schemas WHERE type = ?", (type_,)) or type_ in DEFAULT_SCHEMAS
             if not known:  # a custom type brings its own schema
                 sch = obj.get("schema")
                 if not isinstance(sch, dict):
-                    raise ValueError(f"Jenis kartu '{type_}' tidak dikenal dan qcard ini tidak membawa skemanya.")
+                    raise ValueError(f"Card type '{type_}' is unknown and this qcard does not bring its schema.")
                 self.save_schema({**sch, "type": type_})
             data = {k: v for k, v in (obj.get("data") or {}).items() if re.match(r"^[A-Za-z_][\w-]{0,63}$", str(k))}
             name = obj.get("name")
@@ -2771,7 +2774,7 @@ def _(
         def _import_st(self, obj, avatar):
             d = obj.get("data") if isinstance(obj.get("data"), dict) else obj
             if not d.get("name"):
-                raise ValueError("Bukan kartu karakter yang dikenali (tidak ada nama).")
+                raise ValueError("Not a recognized character card (no name).")
             name = str(d["name"]).strip()
             data = {"name": name}
             # {{char}} becomes the name now; {{user}} stays and is replaced with the persona's name in the prompt
@@ -2803,7 +2806,7 @@ def _(
             d = _zlib.decompressobj()
             out = d.decompress(raw, limit)
             if d.unconsumed_tail:
-                raise ValueError("Data kartu di PNG terlalu besar.")
+                raise ValueError("The card data in the PNG is too large.")
             return out
 
         @staticmethod
@@ -2827,7 +2830,7 @@ def _(
                 pos += 12 + length
             raw = found.get("ccv3") or found.get("chara")
             if raw is None:
-                raise ValueError("PNG ini tidak berisi kartu karakter.")
+                raise ValueError("This PNG holds no character card.")
             return json.loads(base64.b64decode(raw).decode("utf-8"))
 
         def export_st_v2(self, card_id):
@@ -6312,10 +6315,10 @@ def _(CFG, base64, io, subprocess, sys, zipfile):
                 try:
                     data = base64.b64decode(f.get("b64") or "")
                 except ValueError:
-                    notes.append(f"{name}: data rusak")
+                    notes.append(f"{name}: corrupt data")
                     continue
                 if len(data) > cls.MAX_BYTES:
-                    notes.append(f"{name}: lebih dari 25 MB, dilewati")
+                    notes.append(f"{name}: larger than 25 MB, skipped")
                     continue
                 try:
                     if mime.startswith("image/"):
@@ -6325,13 +6328,13 @@ def _(CFG, base64, io, subprocess, sys, zipfile):
                                 fitz = cls._mod("fitz", "pymupdf")
                                 data, mime = fitz.Pixmap(data).tobytes("png"), "image/png"
                             except Exception:
-                                notes.append(f"{name}: format gambar {mime} tidak didukung (pakai PNG/JPEG/WebP)")
+                                notes.append(f"{name}: image format {mime} is not supported (use PNG/JPEG/WebP)")
                                 continue
                         media.append({"kind": "image", "mime": mime, "name": name, "data": data})
                     elif mime.startswith("video/"):
                         media.append({"kind": "video", "mime": mime, "name": name, "data": data})
                     elif mime.startswith("audio/"):
-                        notes.append(f"{name}: audio tidak didukung")
+                        notes.append(f"{name}: audio is not supported")
                     elif ext == "pdf" or mime == "application/pdf":
                         pypdf = cls._mod("pypdf", "pypdf")
                         reader = pypdf.PdfReader(io.BytesIO(data))
@@ -6341,9 +6344,9 @@ def _(CFG, base64, io, subprocess, sys, zipfile):
                         doc = fitz.open(stream=data, filetype="pdf")
                         for i, page in enumerate(doc):
                             if i >= cls.MAX_PDF_IMAGES:
-                                notes.append(f"{name}: gambar hanya untuk {cls.MAX_PDF_IMAGES} halaman pertama")
+                                notes.append(f"{name}: images only for the first {cls.MAX_PDF_IMAGES} pages")
                                 break
-                            media.append({"kind": "image", "mime": "image/png", "name": f"{name} hal {i + 1}",
+                            media.append({"kind": "image", "mime": "image/png", "name": f"{name} p. {i + 1}",
                                           "data": page.get_pixmap(dpi=110).tobytes("png")})
                     elif ext == "docx":
                         docx = cls._mod("docx", "python-docx")
@@ -6381,11 +6384,11 @@ def _(CFG, base64, io, subprocess, sys, zipfile):
                     else:
                         t = cls._text(data)
                         if t is None:
-                            notes.append(f"{name}: file biner tidak didukung")
+                            notes.append(f"{name}: binary file is not supported")
                         else:
                             texts.append((name, t))
                 except Exception as e:
-                    notes.append(f"{name}: gagal dibaca ({type(e).__name__}: {str(e)[:120]})")
+                    notes.append(f"{name}: could not be read ({type(e).__name__}: {str(e)[:120]})")
             blocks = [f"[Lampiran: {n}]\n```\n{t[:cls.MAX_TEXT]}\n```" + ("\n(dipotong)" if len(t) > cls.MAX_TEXT else "")
                       for n, t in texts]
             return blocks, media, notes
@@ -11292,8 +11295,8 @@ def _(
 @app.cell(hide_code=True)
 def _(mo):
     dbg_cmd = mo.ui.text_area(value="nvidia-smi; ls ~/.humming/cache 2>/dev/null | tail -5", label="Shell (debug)", full_width=True)
-    dbg_btn = mo.ui.run_button(label="Jalankan")
-    mo.accordion({"Shell untuk debug": mo.vstack([dbg_cmd, dbg_btn])})
+    dbg_btn = mo.ui.run_button(label="Run")
+    mo.accordion({"Debug shell": mo.vstack([dbg_cmd, dbg_btn])})
     return dbg_btn, dbg_cmd
 
 

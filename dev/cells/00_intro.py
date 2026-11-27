@@ -3,15 +3,15 @@ import marimo as mo
 mo.md(r"""
 # Qwen Chat RP
 
-Chat dan roleplay panjang (sampai 512K/1M token) di GPU molab, dengan kartu (tokoh, persona, dunia, skenario,
-gaya, GM), Studio untuk menyusun kartu sambil ngobrol, memory berlingkup, buku fakta, dunia yang tetap
-berjalan, dan compaction yang tidak melupakan detail.
+Chat and long roleplay (up to 512K/1M tokens) on a molab GPU, with cards (character, persona, world, scenario,
+style, GM), a Studio to build cards while you chat, scoped memory, a fact book, a world that keeps moving,
+and compaction that does not forget details.
 
-1. Nyalakan GPU lewat *notebook specs*, lalu **Run all**.
-2. Klik **Install** (sekali per sesi).
-3. Pilih model, klik **Start**, tunggu status `READY`.
-4. Ngobrol di jendela chat paling bawah. Model juga bisa diganti dari dalam chat.
+1. Turn on a GPU in *notebook specs*, then **Run all**.
+2. Click **Install** (once per session).
+3. Pick a model, click **Start**, and wait for the `READY` status.
+4. Chat in the chat window at the bottom. You can also switch models from inside the chat.
 
-Semua data (chat, kartu, memory, fakta) ada di satu file SQLite. Isi workspace molab hilang saat notebook mati:
-pakai **Backup ke Hugging Face** atau tombol **Simpan** di chat.
+All data (chats, cards, memory, facts) lives in one SQLite file. The molab workspace is wiped when the notebook
+shuts down: use **Backup to Hugging Face** or the **Save** button in the chat.
 """)

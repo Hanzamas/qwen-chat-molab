@@ -23,7 +23,7 @@ class Backup:
             try:
                 self.repo = f"{self._api().whoami()['name']}/qwen-chat-backup"
             except Exception as e:
-                self.status["last_error"] = f"Token tidak bisa dipakai: {type(e).__name__}"
+                self.status["last_error"] = f"The token cannot be used: {type(e).__name__}"
                 self.status["enabled"] = False
         self.status["repo"] = self.repo
         if self.status["enabled"]:
@@ -47,7 +47,7 @@ class Backup:
 
     def backup_now(self):
         if not self.token:
-            raise RuntimeError("Isi token HF dulu.")
+            raise RuntimeError("Enter an HF token first.")
         with self.lock:
             self.status["busy"] = True
             rev = self.store.rev
@@ -58,7 +58,7 @@ class Backup:
                 api.create_repo(self.repo, repo_type="dataset", private=True, exist_ok=True)
                 # exist_ok keeps an existing repo as it is: never upload chats to a public one
                 if not getattr(api.repo_info(self.repo, repo_type="dataset"), "private", False):
-                    raise RuntimeError(f"Repo {self.repo} publik. Jadikan private dulu di Hugging Face; backup tidak diunggah.")
+                    raise RuntimeError(f"Repo {self.repo} is public. Make it private on Hugging Face first; nothing was uploaded.")
                 stamp = time.strftime("%Y%m%d-%H%M%S")
                 from huggingface_hub import CommitOperationAdd, CommitOperationDelete
                 ops = [CommitOperationAdd(f"backups/qwen-chat-{stamp}.sqlite", str(tmp)),

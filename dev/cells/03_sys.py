@@ -29,7 +29,7 @@ class Sys:
 
     @staticmethod
     def cell_log(title, text, code):
-        status = "jalan..." if code is None else ("selesai" if code == 0 else f"GAGAL (exit {code})")
+        status = "running..." if code is None else ("done" if code == 0 else f"FAILED (exit {code})")
         mo.output.replace(mo.vstack([mo.md(f"**{title}**: {status}"), mo.plain_text(text)]))
 
     @staticmethod
@@ -63,7 +63,7 @@ class Sys:
                 f.seek(max(0, f.tell() - max_bytes))
                 return "\n".join(f.read().decode("utf-8", "replace").splitlines()[-n:])
         except FileNotFoundError:
-            return "(belum ada log)"
+            return "(no log yet)"
 
     @staticmethod
     def log_errors(path, n=12):

@@ -129,41 +129,41 @@ class ServerManager:
         except ValueError:
             driver = 0
         if not driver:
-            raise RuntimeError("GPU belum terdeteksi. Nyalakan GPU lewat notebook specs, lalu Install lagi.")
+            raise RuntimeError("No GPU detected. Turn on a GPU in notebook specs, then run Install again.")
         # Triton needs cc, FlashInfer JIT needs ninja and links -lcudart from nvidia/cu13/lib64,
         # where the pip CUDA runtime only ships libcudart.so.13.
         Sys.run_live(
-            "(command -v cc && command -v ninja) >/dev/null && echo 'cc + ninja ada' "
-            "|| (apt-get -qq update && apt-get -qq install -y gcc g++ ninja-build >/dev/null && echo 'gcc + ninja terpasang') "
-            "|| echo 'gcc/ninja gagal dipasang'; "
+            "(command -v cc && command -v ninja) >/dev/null && echo 'cc + ninja present' "
+            "|| (apt-get -qq update && apt-get -qq install -y gcc g++ ninja-build >/dev/null && echo 'gcc + ninja installed') "
+            "|| echo 'gcc/ninja install failed'; "
             "for D in /usr/local/lib/python3.*/site-packages/nvidia/cu13 "
             f"{CFG.VENV}/lib/python3.*/site-packages/nvidia/cu13; do "
             "[ -d \"$D\" ] || continue; L=$(find \"$D\" -name 'libcudart.so.1*' | head -1); "
             "[ -n \"$L\" ] && mkdir -p \"$D/lib64\" && ln -sf \"$L\" \"$D/lib64/libcudart.so\" && echo \"libcudart.so -> $L\"; done",
-            "Persiapan compiler", log)
+            "Compiler setup", log)
         pins = " ".join(f"'{k}=={v}'" for k, v in CFG.PIP_PINS.items())
         code = Sys.run_live(
             f"(uv pip install --python {sys.executable} {pins} || {sys.executable} -m pip install -q {pins}) "
             f"&& {sys.executable} -m playwright install --with-deps chromium firefox "
             f"&& {sys.executable} -m camoufox fetch",
-            "Paket kernel + Camoufox + Playwright", log)
+            "Kernel packages + Camoufox + Playwright", log)
         if code != 0:
-            raise RuntimeError("Gagal memasang paket kernel. Lihat log di atas.")
+            raise RuntimeError("Installing the kernel packages failed. See the log above.")
         if not CFG.VLLM_OK.exists():
             pkg = (f'"https://github.com/vllm-project/vllm/releases/download/v{CFG.VLLM_VERSION}/'
                    f'vllm-{CFG.VLLM_VERSION}+cu129-cp38-abi3-manylinux_2_28_x86_64.whl" --torch-backend=cu129'
                    if driver < 580 else f"vllm=={CFG.VLLM_VERSION} --torch-backend=cu130")
             code = Sys.run_live(
                 f"set -e; uv venv --allow-existing {CFG.VENV}; uv pip install --python {CFG.VENV}/bin/python {pkg}; "
-                f"{CFG.VLLM_BIN} download-kernels || echo 'download-kernels dilewati'",
+                f"{CFG.VLLM_BIN} download-kernels || echo 'download-kernels skipped'",
                 f"vLLM {CFG.VLLM_VERSION}", log)
             if code != 0:
-                raise RuntimeError("Gagal memasang vLLM. Lihat log di atas.")
+                raise RuntimeError("Installing vLLM failed. See the log above.")
             CFG.VLLM_OK.touch()
         if not self.llama_bin():
             code = Sys.run_live(self.llama_install_cmd(), f"llama.cpp {CFG.LLAMA_TAG}", log)
             if code != 0 or not self.llama_bin():
-                raise RuntimeError("Gagal memasang llama.cpp. Lihat log di atas.")
+                raise RuntimeError("Installing llama.cpp failed. See the log above.")
         return True
 
     @staticmethod
@@ -198,10 +198,10 @@ class ServerManager:
         call = (f"hf_hub_download('{repo}', '{filename}', revision='{revision}', local_dir='{dest}')" if filename
                 else f"snapshot_download('{repo}', revision='{revision}', local_dir='{dest}')")
         code = Sys.run_live(
-            f"{sys.executable} -c \"from huggingface_hub import hf_hub_download, snapshot_download; {call}; print('selesai')\"",
+            f"{sys.executable} -c \"from huggingface_hub import hf_hub_download, snapshot_download; {call}; print('done')\"",
             f"Download {repo}{'/' + filename if filename else ''}", log)
         if code != 0:
-            raise RuntimeError(f"Download {repo} gagal. Lihat log di atas.")
+            raise RuntimeError(f"Download of {repo} failed. See the log above.")
         marker.touch()
         return target
 
@@ -212,9 +212,9 @@ class ServerManager:
         a watcher thread marks it ready, or retries without MTP if the drafter makes it crash."""
         p = PRESETS[name]
         if ctx > p["yarn_max"]:
-            raise ValueError(f"{name} maksimal {p['yarn_max']:,} token. Pilih konteks yang lebih kecil.")
+            raise ValueError(f"{name} allows at most {p['yarn_max']:,} tokens. Pick a smaller context.")
         if not self.installed() and not CFG.BASE_URL:
-            raise RuntimeError("Belum terpasang. Klik Install dulu.")
+            raise RuntimeError("Not installed yet. Click Install first.")
         with self.lock:
             self.stop(keep_embed=embed)
             # Each start gets a number; stop() and a newer start change it, so a launch whose download
@@ -342,18 +342,18 @@ class ServerManager:
                 if f.suffix in (".log", ".txt", ".err") or "log" in f.name.lower():
                     out.append(f"--- {f} ---\n" + f.read_text(errors="replace")[-4000:])
             if not out and files:
-                out.append(f"--- isi {p} ---\n" + "\n".join(f.name for f in files))
+                out.append(f"--- contents of {p} ---\n" + "\n".join(f.name for f in files))
         return ("\n\n" + "\n\n".join(out)) if out else ""
 
     @staticmethod
     def hint(log_tail, p):
         if "NVRTCCompiler failed" in log_tail or "humming" in log_tail:
-            return ("\n\nPenyebab: kernel Humming vLLM meng-compile kernel saat jalan (NVRTC) dan gagal di GPU/driver ini. "
-                    "Paksa kernel lain lewat preset: vllm_args=['--kernel-config', "
-                    "'{\"linear_backend_per_quant\":{\"<kunci kuantisasi>\":\"marlin\"}}'] (kunci: w8a16_fp8, mixed_precision, "
-                    "mxfp4, nvfp4_w4a16, ...). Log compiler ada di atas.")
+            return ("\n\nCause: vLLM's Humming kernel compiles kernels at run time (NVRTC), and that fails on this GPU/driver. "
+                    "Force another kernel in the preset: vllm_args=['--kernel-config', "
+                    "'{\"linear_backend_per_quant\":{\"<quantization key>\":\"marlin\"}}'] (keys: w8a16_fp8, mixed_precision, "
+                    "mxfp4, nvfp4_w4a16, ...). The compiler log is above.")
         if "out of memory" in log_tail.lower():
-            return "\n\nSaran: VRAM tidak cukup. Kecilkan konteks atau matikan embedder."
+            return "\n\nTip: not enough VRAM. Use a smaller context or turn off the embedder."
         return ""
 
     def _watch(self, p, files, ctx, gen=None):
@@ -365,9 +365,9 @@ class ServerManager:
             if proc is not None and proc.poll() is not None:
                 log_tail = Sys.tail(self.logf[backend], 400)
                 # MTP is required: no silent restart without it. Show the real cause instead.
-                error = Sys.log_errors(self.logf[backend]) or "server berhenti"
+                error = Sys.log_errors(self.logf[backend]) or "server stopped"
                 if self.state.get("mtp") and self.SPEC_ERROR.search(log_tail):
-                    error = "Gagal di bagian MTP/drafter (MTP wajib, server tidak dijalankan ulang tanpa MTP).\n" + error
+                    error = "Failed in the MTP/drafter part (MTP is required; the server is not restarted without MTP).\n" + error
                 self.state.update(phase="failed", error=error + self.jit_logs(log_tail) + self.hint(log_tail, p))
                 self._save()
                 return

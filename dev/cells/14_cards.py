@@ -49,14 +49,14 @@ class Cards:
 
     def save_schema(self, sch):
         if not isinstance(sch, dict) or not sch.get("type") or not isinstance(sch.get("fields"), list):
-            raise ValueError("Skema harus punya 'type' dan daftar 'fields'.")
+            raise ValueError("A schema needs a 'type' and a 'fields' list.")
         keys = set()
         for f in sch["fields"]:
             if not f.get("key") or f["key"] in keys:
-                raise ValueError(f"Field tanpa key atau key dobel: {f.get('key')!r}")
+                raise ValueError(f"Field without a key, or a duplicate key: {f.get('key')!r}")
             keys.add(f["key"])
             f.setdefault("label", f["key"])
-            f.setdefault("section", "Lainnya")
+            f.setdefault("section", "Other")
             f.setdefault("type", "text")
             f.setdefault("core", False)
             f.setdefault("visibility", "model")
@@ -240,7 +240,7 @@ class Cards:
                 card_id = None
             elif not name:
                 name = cur["name"]  # Style and GM cards have no name field: saving the form keeps the name
-        name = name or "Tanpa nama"
+        name = name or "Unnamed"
         if not card_id:
             card_id = self.store.x("INSERT INTO cards (type, name, data, avatar, version, created, updated) VALUES (?, ?, ?, ?, 1, ?, ?)",
                                    (type_, name, json.dumps(data), avatar, now, now))
@@ -350,7 +350,7 @@ class Cards:
         """Fields of a card for the UI form, schema order, with unknown keys appended."""
         sch = self.schema(card["type"])
         known = {f["key"] for f in sch["fields"]}
-        extra = [{"key": k, "label": k, "section": "Tambahan", "type": "longtext", "core": False, "visibility": "model"}
+        extra = [{"key": k, "label": k, "section": "Extra", "type": "longtext", "core": False, "visibility": "model"}
                  for k in card["data"] if k not in known]
         return sch["fields"] + extra
 
@@ -413,7 +413,7 @@ class Cards:
             text = data if isinstance(data, str) else bytes(data).decode("utf-8-sig")
             obj, avatar = json.loads(text.lstrip("﻿")), None
         if not isinstance(obj, dict):
-            raise ValueError("File kartu harus berisi satu objek JSON.")
+            raise ValueError("A card file must hold one JSON object.")
         if obj.get("format") == "qcard":
             return self._import_qcard(obj)
         return self._import_st(obj, avatar)
@@ -422,12 +422,12 @@ class Cards:
         avatar = base64.b64decode(obj["avatar"]) if obj.get("avatar") else None
         type_ = str(obj.get("type") or "")
         if not type_:
-            raise ValueError("qcard tanpa jenis kartu.")
+            raise ValueError("qcard without a card type.")
         known = self.store.one("SELECT 1 AS x FROM card_schemas WHERE type = ?", (type_,)) or type_ in DEFAULT_SCHEMAS
         if not known:  # a custom type brings its own schema
             sch = obj.get("schema")
             if not isinstance(sch, dict):
-                raise ValueError(f"Jenis kartu '{type_}' tidak dikenal dan qcard ini tidak membawa skemanya.")
+                raise ValueError(f"Card type '{type_}' is unknown and this qcard does not bring its schema.")
             self.save_schema({**sch, "type": type_})
         data = {k: v for k, v in (obj.get("data") or {}).items() if re.match(r"^[A-Za-z_][\w-]{0,63}$", str(k))}
         name = obj.get("name")
@@ -452,7 +452,7 @@ class Cards:
     def _import_st(self, obj, avatar):
         d = obj.get("data") if isinstance(obj.get("data"), dict) else obj
         if not d.get("name"):
-            raise ValueError("Bukan kartu karakter yang dikenali (tidak ada nama).")
+            raise ValueError("Not a recognized character card (no name).")
         name = str(d["name"]).strip()
         data = {"name": name}
         # {{char}} becomes the name now; {{user}} stays and is replaced with the persona's name in the prompt
@@ -484,7 +484,7 @@ class Cards:
         d = _zlib.decompressobj()
         out = d.decompress(raw, limit)
         if d.unconsumed_tail:
-            raise ValueError("Data kartu di PNG terlalu besar.")
+            raise ValueError("The card data in the PNG is too large.")
         return out
 
     @staticmethod
@@ -508,7 +508,7 @@ class Cards:
             pos += 12 + length
         raw = found.get("ccv3") or found.get("chara")
         if raw is None:
-            raise ValueError("PNG ini tidak berisi kartu karakter.")
+            raise ValueError("This PNG holds no character card.")
         return json.loads(base64.b64decode(raw).decode("utf-8"))
 
     def export_st_v2(self, card_id):

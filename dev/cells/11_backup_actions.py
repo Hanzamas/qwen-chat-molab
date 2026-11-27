@@ -1,18 +1,18 @@
 def _backup_act():
     BACKUP.configure(bk_token.value or ctl_hf.value, bk_repo.value, bk_interval.value)
     if not BACKUP.status["enabled"]:
-        return mo.md(f"_Backup mati: {BACKUP.status['last_error'] or 'belum ada token.'}_")
+        return mo.md(f"_Backup is off: {BACKUP.status['last_error'] or 'no token yet.'}_")
     try:
         if bk_now.value:
             BACKUP.backup_now()
-            return mo.callout(mo.md(f"Backup tersimpan di `{BACKUP.repo}`."), kind="success")
+            return mo.callout(mo.md(f"Backup saved to `{BACKUP.repo}`."), kind="success")
         if bk_restore.value:
             BACKUP.restore_latest()
-            return mo.callout(mo.md(f"Database dipulihkan dari `{BACKUP.repo}/latest.sqlite`. Muat ulang jendela chat "
-                                    f"(pilih chat lagi dari sidebar)."), kind="success")
+            return mo.callout(mo.md(f"Database restored from `{BACKUP.repo}/latest.sqlite`. Reload the chat window "
+                                    f"(pick the chat again in the sidebar)."), kind="success")
     except Exception as e:
-        return mo.callout(mo.md(f"Gagal: {e}"), kind="danger")
-    return mo.md(f"_Backup otomatis aktif ke `{BACKUP.repo}` setiap {BACKUP.interval // 60} menit kalau ada perubahan._")
+        return mo.callout(mo.md(f"Failed: {e}"), kind="danger")
+    return mo.md(f"_Automatic backup to `{BACKUP.repo}` is on, every {BACKUP.interval // 60} minutes when something changed._")
 
 
 _backup_act()

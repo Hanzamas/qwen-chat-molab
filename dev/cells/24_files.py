@@ -44,10 +44,10 @@ class Files:
             try:
                 data = base64.b64decode(f.get("b64") or "")
             except ValueError:
-                notes.append(f"{name}: data rusak")
+                notes.append(f"{name}: corrupt data")
                 continue
             if len(data) > cls.MAX_BYTES:
-                notes.append(f"{name}: lebih dari 25 MB, dilewati")
+                notes.append(f"{name}: larger than 25 MB, skipped")
                 continue
             try:
                 if mime.startswith("image/"):
@@ -57,13 +57,13 @@ class Files:
                             fitz = cls._mod("fitz", "pymupdf")
                             data, mime = fitz.Pixmap(data).tobytes("png"), "image/png"
                         except Exception:
-                            notes.append(f"{name}: format gambar {mime} tidak didukung (pakai PNG/JPEG/WebP)")
+                            notes.append(f"{name}: image format {mime} is not supported (use PNG/JPEG/WebP)")
                             continue
                     media.append({"kind": "image", "mime": mime, "name": name, "data": data})
                 elif mime.startswith("video/"):
                     media.append({"kind": "video", "mime": mime, "name": name, "data": data})
                 elif mime.startswith("audio/"):
-                    notes.append(f"{name}: audio tidak didukung")
+                    notes.append(f"{name}: audio is not supported")
                 elif ext == "pdf" or mime == "application/pdf":
                     pypdf = cls._mod("pypdf", "pypdf")
                     reader = pypdf.PdfReader(io.BytesIO(data))
@@ -73,9 +73,9 @@ class Files:
                     doc = fitz.open(stream=data, filetype="pdf")
                     for i, page in enumerate(doc):
                         if i >= cls.MAX_PDF_IMAGES:
-                            notes.append(f"{name}: gambar hanya untuk {cls.MAX_PDF_IMAGES} halaman pertama")
+                            notes.append(f"{name}: images only for the first {cls.MAX_PDF_IMAGES} pages")
                             break
-                        media.append({"kind": "image", "mime": "image/png", "name": f"{name} hal {i + 1}",
+                        media.append({"kind": "image", "mime": "image/png", "name": f"{name} p. {i + 1}",
                                       "data": page.get_pixmap(dpi=110).tobytes("png")})
                 elif ext == "docx":
                     docx = cls._mod("docx", "python-docx")
@@ -113,11 +113,11 @@ class Files:
                 else:
                     t = cls._text(data)
                     if t is None:
-                        notes.append(f"{name}: file biner tidak didukung")
+                        notes.append(f"{name}: binary file is not supported")
                     else:
                         texts.append((name, t))
             except Exception as e:
-                notes.append(f"{name}: gagal dibaca ({type(e).__name__}: {str(e)[:120]})")
+                notes.append(f"{name}: could not be read ({type(e).__name__}: {str(e)[:120]})")
         blocks = [f"[Lampiran: {n}]\n```\n{t[:cls.MAX_TEXT]}\n```" + ("\n(dipotong)" if len(t) > cls.MAX_TEXT else "")
                   for n, t in texts]
         return blocks, media, notes
