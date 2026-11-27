@@ -235,7 +235,7 @@ class ChatApp:
         st = SERVERS.status()
         gpu = Sys.gpu_line() if not CFG.BASE_URL else None
         return {"phase": "ready" if SERVERS.ready() else st["phase"],
-                "preset": st.get("preset") or ("Server eksternal" if CFG.BASE_URL else None), "ctx": st.get("ctx"),
+                "preset": st.get("preset") or ("External server" if CFG.BASE_URL else None), "ctx": st.get("ctx"),
                 "mtp": st.get("mtp"), "embed": st.get("embed"), "embed_ready": st.get("embed_ready"),
                 "embed_model": SERVERS.state.get("embed_model") or "0.6B",
                 "warnings": st.get("warnings") or [], "error": st.get("error") or "", "gpu": gpu,
@@ -299,9 +299,9 @@ class ChatApp:
         try:
             fn = getattr(self, "c_" + action, None)
             if fn is None:
-                raise ValueError(f"perintah tidak dikenal: {action}")
+                raise ValueError(f"unknown command: {action}")
             if action in self.BUSY_BLOCKED and self.engine.busy:
-                self.w.toast = {"n": time.time(), "text": "Tunggu balasan selesai atau klik Stop dulu.", "kind": "warn"}
+                self.w.toast = {"n": time.time(), "text": "Wait for the reply to finish or click Stop first.", "kind": "warn"}
                 return
             fn(**{k: v for k, v in cmd.items() if k != "n"})
         except Exception as e:
@@ -336,7 +336,7 @@ class ChatApp:
                     break
                 time.sleep(0.05)
         if not self.engine.forget_chat(int(chat_id)):
-            self.w.toast = {"n": time.time(), "text": "Tugas latar belakang masih berjalan; coba hapus lagi sebentar lagi.",
+            self.w.toast = {"n": time.time(), "text": "A background task is still running; try deleting again in a moment.",
                             "kind": "warn"}
             return
         STORE.delete_chat(int(chat_id))
@@ -345,7 +345,7 @@ class ChatApp:
             self.select(self.w.chats[0]["id"] if self.w.chats else 0)
 
     def c_rename(self, chat_id, title):
-        STORE.x("UPDATE chats SET title = ? WHERE id = ?", (title.strip()[:120] or "Tanpa judul", int(chat_id)))
+        STORE.x("UPDATE chats SET title = ? WHERE id = ?", (title.strip()[:120] or "Untitled", int(chat_id)))
         self.refresh_chats()
         if int(chat_id) == self._cur():
             self.w.chat = self.chat_info(STORE.chat(int(chat_id)))
@@ -361,7 +361,7 @@ class ChatApp:
         system = updates.pop("system", None)
         if system is not None:
             STORE.x("UPDATE chats SET system = ? WHERE id = ?", (system, cid))
-            self.w.toast = {"n": time.time(), "text": "System prompt manual berlaku di epoch berikutnya (Terapkan sekarang)."}
+            self.w.toast = {"n": time.time(), "text": "The manual system prompt applies from the next epoch (Apply now)."}
         if updates:
             STORE.chat_settings(cid, **updates)
         self.w.chat = self.chat_info(STORE.chat(cid))
@@ -400,7 +400,7 @@ class ChatApp:
 
     def c_chapter(self, mid, title):
         STORE.x("INSERT INTO chapters (chat_id, message_id, title, created) VALUES (?, ?, ?, ?)",
-                (self._cur(), int(mid), title or "Bab baru", time.time()))
+                (self._cur(), int(mid), title or "New chapter", time.time()))
         self.on_event("history", self._cur())
 
     def c_choose(self, text):
@@ -424,7 +424,7 @@ class ChatApp:
     def c_apply_now(self):
         PROMPT.new_epoch(self._cur())
         self.on_event("history", self._cur())
-        self.w.toast = {"n": time.time(), "text": "Prompt beku dibangun ulang dengan kartu dan buku cerita terbaru."}
+        self.w.toast = {"n": time.time(), "text": "Frozen prompt rebuilt with the latest cards and story book."}
 
     def c_continue_new(self):
         cid = self.engine.continue_in_new_chat(self._cur())
@@ -483,7 +483,7 @@ class ChatApp:
 
     def c_load_db(self, b64):
         STORE.import_bytes(base64.b64decode(b64))  # the import hook resets chats, cards and the library view
-        self.w.toast = {"n": time.time(), "text": "Database dimuat. File lama disimpan sebagai .before-import."}
+        self.w.toast = {"n": time.time(), "text": "Database loaded. The old file was kept as .before-import."}
 
     def c_impersonate(self, hint=""):
         self.engine.slash(self._cur(), "impersonate", hint)
@@ -495,7 +495,7 @@ class ChatApp:
         c = PROMPT.ctx(self._cur()) if self._cur() else None
         lang = PROMPT.style(c).get("target_lang", "") if c else ""
         ok = self.engine.vocab_add(term, translation, note, example, lang)
-        self.w.toast = {"n": time.time(), "text": f"'{term}' {'masuk daftar kosakata' if ok else 'sudah ada'}."}
+        self.w.toast = {"n": time.time(), "text": f"'{term}' {'added to the vocabulary list' if ok else 'is already in the list'}."}
 
     def c_vocab(self):
         self.w.aux = {"n": time.time(), "kind": "vocab", "data": {"due": self.engine.vocab_due(),
@@ -517,13 +517,13 @@ class ChatApp:
 
     def c_continuity(self, mid):
         if (STORE.chat(self._cur()) or {}).get("kind") not in ("rp", "group"):
-            return self._toast("Cek kontinuitas hanya untuk chat cerita.", "warn")
+            return self._toast("The continuity check is only for story chats.", "warn")
         if self.engine.run(self.engine._continuity_check, self._cur(), int(mid), True):
-            self._toast("Cek kontinuitas…")
+            self._toast("Checking continuity…")
 
     def c_fact_check(self, mid):
         if self.engine.run(self.engine._fact_check, self._cur(), int(mid), True):
-            self._toast("Memeriksa fakta…")
+            self._toast("Checking facts…")
 
     # memory
     def c_memory(self, q=""):
@@ -605,13 +605,13 @@ class ChatApp:
         cid = self._cur()
 
         if (STORE.chat(cid) or {}).get("kind") not in ("rp", "group"):
-            return self._toast("Usulan kartu hanya untuk chat cerita.", "warn")
+            return self._toast("Card proposals are only for story chats.", "warn")
 
         def job():
             self.engine.propose_cards(cid)
             self.c_proposals()
         if self.engine.run(job):
-            self._toast("Menyusun usulan…")
+            self._toast("Drafting proposals…")
 
     def c_proposal(self, pid, accept):
         self.engine.decide_proposal(self._cur(), int(pid), bool(accept))
@@ -624,13 +624,13 @@ class ChatApp:
     def c_fame_suggest(self):
         cid = self._cur()
         if (STORE.chat(cid) or {}).get("kind") not in ("rp", "group"):
-            return self._toast("Usulan pamor hanya untuk chat cerita.", "warn")
+            return self._toast("Fame suggestions are only for story chats.", "warn")
 
         def job():
             rows = self.engine.suggest_fame(cid)
             self.w.aux = {"n": time.time(), "kind": "fame", "data": {"chat_id": cid, "rows": rows}}
         if self.engine.run(job):
-            self._toast("Menyusun usulan pamor…")
+            self._toast("Drafting fame suggestions…")
 
     def c_fame_save(self, items):
         n = 0
@@ -643,7 +643,7 @@ class ChatApp:
             if (card["data"].get("fame") or "", card["data"].get("fame_for") or "") != (data["fame"], data["fame_for"]):
                 CARDS.save(card["id"], card["type"], data)
                 n += 1
-        self._toast(f"Pamor disimpan untuk {n} kartu. Masuk prompt setelah Terapkan sekarang atau compaction berikutnya.")
+        self._toast(f"Fame saved for {n} card(s). It enters the prompt after Apply now or the next compaction.")
         chat = STORE.chat(self._cur()) if self._cur() else None
         if chat:
             self.w.story = self.story_info(chat)
@@ -724,7 +724,7 @@ class ChatApp:
     def c_card_new(self, type):
         # New Gaya/GM cards start from the defaults, so a fresh card already plays sensibly.
         base = next((dict(data) for t, _, data in DEFAULT_CARDS if t == type), {})
-        cid = CARDS.save(None, type, {**base, "title" if type == "scenario" else "name": "Baru"})
+        cid = CARDS.save(None, type, {**base, "title" if type == "scenario" else "name": "New"})
         self.w.library = self.library_info()
         self.w.card = self.card_info(cid)
 
@@ -733,8 +733,8 @@ class ChatApp:
         if version is not None and c and int(version) != c["version"]:
             self.w.card = self.card_info(int(card_id))
             self.w.toast = {"n": time.time(), "kind": "warn", "long": True,
-                            "text": f"Kartu sudah diubah (versi {c['version']}) sejak form dibuka. Tidak disimpan: salin "
-                                    f"perubahanmu, muat versi baru, lalu simpan lagi."}
+                            "text": f"The card was changed (version {c['version']}) since the form was opened. Not saved: copy "
+                                    f"your changes, load the new version, then save again."}
             return
         CARDS.save(int(card_id), c["type"], data, avatar=base64.b64decode(avatar) if avatar else None)
         self.w.card = self.card_info(int(card_id))
@@ -742,7 +742,7 @@ class ChatApp:
         chat = STORE.chat(self._cur()) if self._cur() else None
         if chat:
             self.w.story = self.story_info(chat)
-        self.w.toast = {"n": time.time(), "text": "Kartu disimpan (versi baru)."}
+        self.w.toast = {"n": time.time(), "text": "Card saved (new version)."}
 
     def c_card_delete(self, card_id):
         CARDS.delete(int(card_id))
@@ -758,12 +758,12 @@ class ChatApp:
         cid = CARDS.import_any(base64.b64decode(b64), name)
         self.w.library = self.library_info()
         self.w.card = self.card_info(cid)
-        self.w.toast = {"n": time.time(), "text": f"Kartu diimpor: {CARDS.get(cid)['name']}"}
+        self.w.toast = {"n": time.time(), "text": f"Card imported: {CARDS.get(cid)['name']}"}
 
     def c_card_export(self, card_id, fmt="qcard"):
         c = CARDS.get(int(card_id))
         data = CARDS.export_st_v2(int(card_id)) if fmt == "st" else CARDS.export_qcard(int(card_id))
-        safe = re.sub(r"[^\w\- ]+", "", c["name"])[:60] or "kartu"
+        safe = re.sub(r"[^\w\- ]+", "", c["name"])[:60] or "card"
         self.w.export = {"n": time.time(), "name": f"{safe}.{'st' if fmt == 'st' else 'qcard'}.json",
                          "b64": base64.b64encode(json.dumps(data, ensure_ascii=False, indent=1).encode()).decode()}
 
@@ -777,7 +777,7 @@ class ChatApp:
 
     def c_timeline_save(self, card_id, at, title, text="", entry_id=None):
         if not World.parse_time(at):
-            raise ValueError("Format waktu: YYYY-MM-DD HH:MM")
+            raise ValueError("Time format: YYYY-MM-DD HH:MM")
         CARDS.timeline_save(int(card_id), at, title, text, int(entry_id) if entry_id else None)
         self.w.card = self.card_info(int(card_id))
 
@@ -792,13 +792,13 @@ class ChatApp:
         sch = CARDS.save_schema(schema if isinstance(schema, dict) else json.loads(schema))
         self.w.boot = self.boot()
         self.w.aux = {"n": time.time(), "kind": "schema", "data": sch}
-        self.w.toast = {"n": time.time(), "text": f"Skema {sch['type']} disimpan (versi {sch['version']})."}
+        self.w.toast = {"n": time.time(), "text": f"Schema {sch['type']} saved (version {sch['version']})."}
 
     # model
     def c_model_switch(self, preset, ctx, mtp=True, embed=True, embed_model=None):
         p = PRESETS[preset]
         if int(ctx) > p["yarn_max"]:
-            raise ValueError(f"{preset} maksimal {p['yarn_max']:,} token.")
+            raise ValueError(f"{preset} allows at most {p['yarn_max']:,} tokens.")
         self.engine.switch_model(preset, int(ctx), bool(mtp), bool(embed), embed_model if embed_model in EMBEDDERS else None)
 
     def c_model_stop(self):

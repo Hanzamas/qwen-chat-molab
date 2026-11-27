@@ -167,7 +167,7 @@ class EngineView:
     def export_story(self, chat_id, fmt="md"):
         chat = self.store.chat(chat_id)
         c = self.prompt.ctx(chat_id)
-        persona = (c["cards"].get("persona") or {}).get("name") or "Aku"
+        persona = (c["cards"].get("persona") or {}).get("name") or "Me"
         chapters = {r["message_id"]: r["title"] for r in self.store.q("SELECT message_id, title FROM chapters WHERE chat_id = ?",
                                                                       (chat_id,))}
         blocks, current = [], {"title": chat["title"], "parts": []}
@@ -182,7 +182,7 @@ class EngineView:
             text = m["meta"].get("typed", m["content"]) if m["role"] == "user" else m["content"]
             current["parts"].append((m["role"], text))
         blocks.append(current)
-        safe = re.sub(r"[^\w\- ]+", "", chat["title"])[:60].strip() or "cerita"
+        safe = re.sub(r"[^\w\- ]+", "", chat["title"])[:60].strip() or "story"
         if fmt == "md":
             out = [f"# {chat['title']}\n"]
             for b in blocks:
@@ -222,7 +222,7 @@ class EngineView:
                 spine.append(f'<itemref idref="ch{i}"/>')
                 nav.append(f'<li><a href="ch{i}.xhtml">{_esc(b["title"])}</a></li>')
             z.writestr("OEBPS/nav.xhtml", '<?xml version="1.0" encoding="utf-8"?><html xmlns="http://www.w3.org/1999/xhtml" '
-                       'xmlns:epub="http://www.idpf.org/2007/ops"><head><title>Daftar isi</title></head><body>'
+                       'xmlns:epub="http://www.idpf.org/2007/ops"><head><title>Contents</title></head><body>'
                        f'<nav epub:type="toc"><ol>{"".join(nav)}</ol></nav></body></html>')
             uid = hashlib.sha1(f"{chat_id}-{chat['title']}".encode()).hexdigest()
             z.writestr("OEBPS/content.opf", '<?xml version="1.0" encoding="utf-8"?><package xmlns="http://www.idpf.org/2007/opf" '

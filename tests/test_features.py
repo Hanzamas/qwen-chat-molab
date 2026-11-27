@@ -247,7 +247,7 @@ def test_fame_suggestions_and_save(engine, nb, fake):
     nb["ChatApp"].c_fame_save(obj, [{"card_id": by["Mahasiswi 0"]["card_id"], "fame": "terkenal", "fame_for": "juara debat"},
                                     {"card_id": by["Mira Santoso"]["card_id"], "fame": "bintang", "fame_for": "ketua BEM"}])
     assert nb["CARDS"].get(by["Mahasiswi 0"]["card_id"])["data"]["fame"] == "terkenal"
-    assert "untuk 1 kartu" in toasts[0] and obj.w.story == {"ok": 1}
+    assert "for 1 card" in toasts[0] and obj.w.story == {"ok": 1}
 
 
 def test_world_tick_puts_the_best_known_first(engine, nb, fake):

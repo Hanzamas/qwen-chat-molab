@@ -153,7 +153,7 @@ def test_away_notice(engine, nb):
     engine.send(chat, "Aku pulang.")
     wait_idle(engine)
     notes = engine.events.of("notice")
-    assert notes and notes[-1]["text"].startswith("Selama kamu pergi") and "Frau Brunner" in notes[-1]["text"]
+    assert notes and notes[-1]["text"].startswith("While you were away") and "Frau Brunner" in notes[-1]["text"]
 
 
 def test_server_failure_diagnosis(nb, tmp_path):
@@ -393,11 +393,11 @@ def test_compaction_progress_and_clean_cancel(engine, nb, fake):
     comp.cancel.clear()  # every send sets it (it stops a running idle compaction)
     # progress lines while the model writes
     seen = []
-    text = comp.summarize(chat, path, 0, len(path) - 1, 4096, 0, tools, comp.progress(seen.append, "Meringkas…", 4096))
+    text = comp.summarize(chat, path, 0, len(path) - 1, 4096, 0, tools, comp.progress(seen.append, "Summarizing…", 4096))
     assert text and "## Inti" in text
-    cb = comp.progress(seen.append, "Meringkas…", 4096)
+    cb = comp.progress(seen.append, "Summarizing…", 4096)
     cb({"reasoning": "x" * 700, "content": "y" * 3500})
-    assert seen[-1] == "Meringkas… mikir ≈200 · tulis ≈1.000 / 4.096 token"
+    assert seen[-1] == "Summarizing… thinking ≈200 · writing ≈1.000 / 4.096 tokens"
     # a cancelled summary is never stored as if it were complete
     comp.cancel.set()
     try:
@@ -1104,7 +1104,7 @@ def test_idle_compaction_failure_is_shown_and_backs_off(engine, nb, monkeypatch)
 
     def boom(*a, **kw):
         calls.append(1)
-        raise RuntimeError("Ringkasan pesan 232–314 kosong")
+        raise RuntimeError("Summary of messages 232–314 is empty")
     monkeypatch.setattr(engine.compactor, "maybe", boom)
     engine.active_chat = chat
     engine.last_used[chat] = int(nb["LLM_CLIENT"].max_context() * 0.8)
@@ -1112,7 +1112,7 @@ def test_idle_compaction_failure_is_shown_and_backs_off(engine, nb, monkeypatch)
     engine._idle_once()
     statuses = engine.events.of("status")
     assert calls and statuses[-1] == ""  # the status line is cleared after the failure
-    assert any("Compaction saat diam gagal" in t["text"] for t in engine.events.of("toast"))
+    assert any("Idle compaction failed" in t["text"] for t in engine.events.of("toast"))
     assert nb["STORE"].side_logs(chat, "compaction_error")
     engine._idle_once()
     assert len(calls) == 1  # no retry every 30 s

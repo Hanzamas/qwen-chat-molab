@@ -55,8 +55,8 @@ class Compactor:
                 return
             state["t"] = now
             think, out = len(acc["reasoning"]) * 2 // 7, len(acc["content"]) * 2 // 7
-            bits = ([f"mikir ≈{think:,}".replace(",", ".")] if think else []) + \
-                   [f"tulis ≈{out:,}".replace(",", ".") + (f" / {limit:,}".replace(",", ".") if limit else "") + " token"]
+            bits = ([f"thinking ≈{think:,}".replace(",", ".")] if think else []) + \
+                   [f"writing ≈{out:,}".replace(",", ".") + (f" / {limit:,}".replace(",", ".") if limit else "") + " tokens"]
             phase(f"{label} {' · '.join(bits)}")
         return on_delta
 
@@ -98,7 +98,7 @@ class Compactor:
         strip_pos = ids.index(chat["strip_node"]) if chat.get("strip_node") in ids else -1
         # Stage 1: drop old thinking, attachments and long tool results (originals stay in the database).
         if users and strip_pos < users[-1] - 1:
-            phase("Memadatkan konteks: membuang thinking, lampiran, dan hasil tool lama…")
+            phase("Compacting context: dropping old thinking, attachments and tool results…")
             self.store.x("UPDATE chats SET strip_node = ? WHERE id = ?", (ids[users[-1] - 1], chat_id))
             used = self.measure(chat_id, tools) + pending_estimate
             if not force and used < self.TARGET * maxc:
@@ -126,7 +126,7 @@ class Compactor:
         if cutoff <= done_pos:
             self.last_note = "Compaction skipped: everything older is already summarized; the recent turns stay whole."
             return used
-        label = f"Menyimpan memory sebelum memadatkan pesan {done_pos + 2}–{cutoff + 1}…"
+        label = f"Saving memory before compacting messages {done_pos + 2}–{cutoff + 1}…"
         phase(label)
         self.flush(chat_id, path[:cutoff + 1], toolbox, done_pos + 2, cutoff + 1, self.progress(phase, label))
         if self.cancel.is_set():
@@ -150,14 +150,14 @@ class Compactor:
         for a, b in self.chunks(path, done_pos + 1, cutoff, chapters):
             if self.cancel.is_set():
                 break
-            label = f"Meringkas pesan {a + 1}–{b + 1}…"
+            label = f"Summarizing messages {a + 1}–{b + 1}…"
             phase(label)
             text = self.summarize(chat_id, path, a, b, budget, think, tools, self.progress(phase, label, budget))
             if text is None:  # cancelled: what is already summarized stays, this piece is redone next time
                 break
             if not text:
-                raise RuntimeError(f"Ringkasan pesan {a + 1}–{b + 1} kosong ({getattr(self, 'last_error', '')}). "
-                                   f"Compaction dihentikan; tidak ada yang dihapus.")
+                raise RuntimeError(f"Summary of messages {a + 1}–{b + 1} is empty ({getattr(self, 'last_error', '')}). "
+                                   f"Compaction stopped; nothing was deleted.")
             text = self.entity_check(chat_id, path[a:b + 1], text)
             core = self.core_of(text)
             self.store.x("INSERT INTO summaries (chat_id, node_id, from_id, level, text, core, created) VALUES (?, ?, ?, 'chunk', ?, ?, ?)",
@@ -252,8 +252,8 @@ class Compactor:
                 break
             kw = self.prompt.side_kwargs(c, retry=True)
         if not text:
-            self.last_error = (f"jawaban kosong (finish={acc['finish']}, thinking {len(acc['reasoning'])} karakter, "
-                               f"max_tokens {max_tokens}, prompt ≈{used} token)")
+            self.last_error = (f"empty answer (finish={acc['finish']}, thinking {len(acc['reasoning'])} characters, "
+                               f"max_tokens {max_tokens}, prompt ≈{used} tokens)")
         if text and acc["finish"] == "length":
             text += "\n\n(Ringkasan ini terpotong karena batas token; detail akhir potongan ada di summary_read/history_read.)"
         return text
@@ -286,7 +286,7 @@ class Compactor:
         if total <= self.CHRONICLE_SHARE * maxc or len(chunks) < 3:
             return
         old = chunks[:max(2, len(chunks) // 2)]
-        label = f"Memadatkan {len(old)} ringkasan lama menjadi satu era…"
+        label = f"Condensing {len(old)} old summaries into one era…"
         phase(label)
         instr = ERA_INSTRUCTION.format(texts="\n\n".join(s["text"] for s in old))
         msgs = self.prompt.side(chat_id, instr)

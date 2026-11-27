@@ -140,10 +140,10 @@ class Engine(EngineView):
             if self.busy:
                 if queue_text is not None:
                     self.queue.append((fn, args, queue_text))
-                    self.emit("toast", {"text": f"Masuk antrian ({len(self.queue)})."})
+                    self.emit("toast", {"text": f"Queued ({len(self.queue)})."})
                     self.emit("queue", len(self.queue))
                 else:
-                    self.emit("toast", {"text": "Tunggu balasan selesai atau klik Stop dulu.", "kind": "warn"})
+                    self.emit("toast", {"text": "Wait for the reply to finish or click Stop first.", "kind": "warn"})
                 return False
             self.busy = True
         self.bg_cancel.set()
@@ -171,7 +171,7 @@ class Engine(EngineView):
             self.emit("queue", len(self.queue))
             if dropped:  # Stop cancels the queue, but the typed text goes back to the composer
                 self.emit("compose", "\n\n".join(dropped))
-                self.emit("toast", {"text": f"{len(dropped)} pesan di antrian dibatalkan; teksnya dikembalikan ke kotak pesan.",
+                self.emit("toast", {"text": f"{len(dropped)} queued message(s) cancelled; the text is back in the message box.",
                                     "kind": "warn"})
             if nxt:
                 self._job(nxt[0], nxt[1])
@@ -212,7 +212,7 @@ class Engine(EngineView):
     def _import_guard(self):
         """Loading or restoring a database while a reply is written would put it into another chat of the new file."""
         if self.busy:
-            raise RuntimeError("Tunggu balasan selesai (atau klik Stop) sebelum memuat database.")
+            raise RuntimeError("Wait for the reply to finish (or click Stop) before loading a database.")
         self.importing = True
         self.bg_cancel.set()
         self.compactor.cancel.set()
@@ -221,7 +221,7 @@ class Engine(EngineView):
                 return
             time.sleep(0.1)
         self.importing = False
-        raise RuntimeError("Tugas latar belakang masih berjalan. Coba lagi sebentar lagi.")
+        raise RuntimeError("A background task is still running. Try again in a moment.")
 
     def _after_import(self, ok):
         if ok:
@@ -240,7 +240,7 @@ class Engine(EngineView):
 
     def new_chat(self, kind="chat", title=None, story_id=None, settings=None):
         defaults = {"thinking": None, "length": None, "fact_mode": "latar", "group_mode": "narrator"}
-        cid = self.store.new_chat(title or {"studio": "Studio", "rp": "Cerita baru", "group": "Grup baru"}.get(kind, "Chat baru"),
+        cid = self.store.new_chat(title or {"studio": "Studio", "rp": "New story", "group": "New group"}.get(kind, "New chat"),
                                   kind, story_id, {**defaults, **(settings or {})})
         self.emit("chats")
         return cid
@@ -250,7 +250,7 @@ class Engine(EngineView):
         sc = self.cards.get(card_ids.get("scenario")) if card_ids.get("scenario") else None
         chars = card_ids.get("character") or []
         first_char = self.cards.get(chars[0]) if chars else None
-        title = title or (sc["name"] if sc else (first_char["name"] if first_char else "Cerita baru"))
+        title = title or (sc["name"] if sc else (first_char["name"] if first_char else "New story"))
         for role in ("style", "gm"):
             if not card_ids.get(role):
                 row = self.store.one("SELECT id FROM cards WHERE type = ? ORDER BY id LIMIT 1", (role,))
@@ -281,7 +281,7 @@ class Engine(EngineView):
         path = self.store.path(chat_id)
         ids = [m["id"] for m in path]
         st = self.world.state(chat_id, ids)
-        new = self.new_chat(old["kind"], f"{old['title']} (lanjutan)", old.get("story_id"),
+        new = self.new_chat(old["kind"], f"{old['title']} (continued)", old.get("story_id"),
                             {**old["settings"], "continued_from": chat_id, "continued_head": old["head_id"]})
         for s in self.prompt.summaries_on_path(chat_id, ids):
             self.store.x("INSERT INTO summaries (chat_id, node_id, from_id, level, text, core, created) VALUES (?, 0, 0, ?, ?, ?, ?)",
@@ -358,7 +358,7 @@ class Engine(EngineView):
     def send(self, chat_id, text, files=None, kind=None):
         parsed = TXT.parse_input(text)
         if not chat_id or not self.store.chat(chat_id):
-            chat_id = self.new_chat(kind or "chat", (text or "Chat baru")[:60])
+            chat_id = self.new_chat(kind or "chat", (text or "New chat")[:60])
             self.emit("select", chat_id)
         self.active_chat = chat_id
         if parsed["kind"] == "slash":
@@ -372,7 +372,7 @@ class Engine(EngineView):
         head = (self.store.chat(chat_id) or {}).get("head_id")
         if cmd == "note":
             self.store.chat_settings(chat_id, note=arg)
-            self.emit("toast", {"text": "Author's note disimpan." if arg else "Author's note dihapus."})
+            self.emit("toast", {"text": "Author's note saved." if arg else "Author's note removed."})
             self.emit("settings", chat_id)
         elif cmd == "reroll" and head:
             self.reroll(chat_id, head)
@@ -381,11 +381,11 @@ class Engine(EngineView):
         elif cmd == "bab":
             if head:
                 self.store.x("INSERT INTO chapters (chat_id, message_id, title, created) VALUES (?, ?, ?, ?)",
-                             (chat_id, head, arg or "Bab baru", time.time()))
+                             (chat_id, head, arg or "New chapter", time.time()))
                 self.emit("history", chat_id)
         elif cmd == "ingat":
             rows = self.mem.search(arg, self.mem.ctx_of(chat_id), limit=10, kinds=("fact", "summary_core"))
-            self.emit("toast", {"text": "\n".join(f"#{r['id']} {r['text'][:160]}" for r in rows) or "Tidak ada memory yang cocok.",
+            self.emit("toast", {"text": "\n".join(f"#{r['id']} {r['text'][:160]}" for r in rows) or "No matching memory.",
                                 "long": True})
         elif cmd == "impersonate":
             self.run(self._impersonate, chat_id, arg)
@@ -442,8 +442,8 @@ class Engine(EngineView):
 
     def _away_notice(self, chat_id, before_id, minutes):
         events = self.world.events_after(chat_id, before_id)
-        text = f"Selama kamu pergi ({World.fmt_span(minutes)} waktu dunia): " + (
-            " · ".join(e["text"] for e in events[:6]) if events else "tidak ada kabar yang sampai padamu.")
+        text = f"While you were away ({World.fmt_span(minutes)} of world time): " + (
+            " · ".join(e["text"] for e in events[:6]) if events else "no news reached you.")
         self.emit("notice", {"chat_id": chat_id, "text": text})
 
     # ---------- the turn ----------
@@ -453,7 +453,7 @@ class Engine(EngineView):
         """One reply. also: lines for every round of this turn, not stored (a group speaker, a correction).
         seg_after: a group round's later speaker; its checks cover only its own part. Returns the error, if any."""
         if not self.servers.ready():
-            raise RuntimeError("Server model belum READY. Klik Start dan tunggu status READY.")
+            raise RuntimeError("The model server is not READY yet. Click Start and wait for READY.")
         c = self.prompt.ctx(chat_id)
         tools = self.tools.specs(c)
         allowed = {t["function"]["name"] for t in tools}
@@ -601,7 +601,7 @@ class Engine(EngineView):
                 if self.stop.is_set():
                     break
         except urllib.error.HTTPError as e:
-            error = f"Server menolak request (HTTP {e.code}): {e.read().decode('utf-8', 'replace')[:400]}"
+            error = f"The server rejected the request (HTTP {e.code}): {e.read().decode('utf-8', 'replace')[:400]}"
         except Exception as e:
             error = f"{type(e).__name__}: {e}"
         if final_id is None and state and state.get("mid"):
@@ -632,7 +632,7 @@ class Engine(EngineView):
                 self._after_turn(chat_id, final_id, c, used_info)
             except Exception as e:
                 self.emit("live", {})
-                self.emit("toast", {"text": f"Pemeriksaan setelah giliran gagal: {type(e).__name__}: {e}", "kind": "warn"})
+                self.emit("toast", {"text": f"Post-turn checks failed: {type(e).__name__}: {e}", "kind": "warn"})
             try:
                 self._queue_offscreen(chat_id, c)
             except Exception:
@@ -777,7 +777,7 @@ class Engine(EngineView):
             short = paras < tgt["paragraphs"] - 1 and sum(sents) * 2 < tgt["paragraphs"] * tgt["sent_lo"]
             if short and not self.stop.is_set() and not handed_over:
                 add = max(1, tgt["paragraphs"] - paras)
-                self.emit("live", {"active": True, "content": m["content"], "phase": "Menambah paragraf…", "reasoning": "",
+                self.emit("live", {"active": True, "content": m["content"], "phase": "Adding paragraphs…", "reasoning": "",
                                    "tools": [], "chat_id": chat_id})
                 instr = (f"Lanjutkan narasi tepat dari akhir jawaban terakhir dengan {add} paragraf lagi "
                          f"({tgt['sent_lo']}-{tgt['sent_hi']} kalimat per paragraf). Jangan mengulang isi yang sudah ada, jangan "
@@ -796,7 +796,7 @@ class Engine(EngineView):
         # state: fill in what the model forgot to record (time, status, who saw what)
         if (self.prompt.gm(c).get("state_check") or "ya") == "ya" and os.environ.get("QCHAT_STATE_CHECK", "1") != "0" \
                 and not self.stop.is_set():
-            self.emit("live", {"active": True, "content": m["content"], "phase": "Memeriksa keadaan…", "reasoning": "",
+            self.emit("live", {"active": True, "content": m["content"], "phase": "Checking state…", "reasoning": "",
                                "tools": [], "chat_id": chat_id})
             try:
                 m["meta"]["state_check"] = self._state_check(chat_id, mid, c, self.store.path(chat_id, head=mid), full,
@@ -812,7 +812,7 @@ class Engine(EngineView):
         old = [p for p in (self.store.chat(chat_id) or {}).get("settings", {}).get("avoid") or [] if p not in rep]
         self.store.chat_settings(chat_id, avoid=(rep + old)[:8])  # rolling: a phrase stays avoided for a while
         if rep:
-            flags.append({"kind": "repeat", "text": "Frasa berulang: " + "; ".join(rep[:4])})
+            flags.append({"kind": "repeat", "text": "Repeated phrases: " + "; ".join(rep[:4])})
         # openings: a reply that starts like the recent ones; the next turns are told to start differently (3 turns)
         mine = TXT.opening(full)
         openers = [dict(o, left=o["left"] - 1) for o in (self.store.chat(chat_id) or {}).get("settings", {}).get("openers") or []
@@ -820,11 +820,11 @@ class Engine(EngineView):
         if TXT.repeats_opening(mine, self._openings(path, self._turn_start(path, mid)[0])):
             text = " ".join(mine[:4])
             openers = [o for o in openers if o["text"] != text] + [{"text": text, "left": 3}]
-            flags.append({"kind": "opening", "text": f"Pembuka mirip balasan sebelumnya: \"{text}…\""})
+            flags.append({"kind": "opening", "text": f"Opening like the earlier replies: \"{text}…\""})
         self.store.chat_settings(chat_id, openers=openers[-4:])
         banned = TXT.banned_hits(full, self.prompt.style(c).get("banned") or [])
         if banned:
-            flags.append({"kind": "banned", "text": "Frasa terlarang: " + ", ".join(banned)})
+            flags.append({"kind": "banned", "text": "Banned phrases: " + ", ".join(banned)})
         narr = self.prompt.narration_lang(c) or "Indonesia"
         lang = narr.lower()
         expected = "id" if lang.startswith(("indo", "id")) else "de" if lang.startswith(("jer", "deu", "ger", "de")) else "en"
@@ -832,7 +832,7 @@ class Engine(EngineView):
         rewrite_lang = None
         fixes = []
         if dom != expected and shares.get(dom, 0) > 0.5:
-            flags.append({"kind": "language", "text": f"Narasi tampaknya berbahasa {dom}, bukan {expected}."})
+            flags.append({"kind": "language", "text": f"Narration seems to be in {dom}, not {expected}."})
             fixes.append(f"Narasi giliran sebelumnya tidak dalam bahasa {narr}. Tulis narasi dalam bahasa {narr}.")
             counted = sum(1 for x in TXT.words(full) if any(x in s for s in TXT.STOP.values()))
             if counted >= 15:
@@ -843,13 +843,13 @@ class Engine(EngineView):
             lines_ = TXT.dialogue_lines(full, lv["code"])
             if len(lines_) >= 2 and sum(n for n, _ in lines_) / len(lines_) < lv["lo"] * 0.8:
                 avg = sum(n for n, _ in lines_) / len(lines_)
-                flags.append({"kind": "lang_short", "text": f"Dialog {lv['label']} terlalu pendek untuk {lv['band']} "
-                                                            f"(rata-rata {avg:.0f} kata, target {lv['lo']}-{lv['hi']})."})
+                flags.append({"kind": "lang_short", "text": f"{lv['label']} dialogue too short for {lv['band']} "
+                                                            f"(average {avg:.0f} words, target {lv['lo']}-{lv['hi']})."})
                 fixes.append(f"Ucapan {lv['label']} giliran sebelumnya terlalu pendek untuk tingkat {lv['band']}: kalimatnya "
                              f"harus {lv['lo']}-{lv['hi']} kata.")
             missing = sum(1 for _, tr in lines_ if not tr)
             if missing:
-                flags.append({"kind": "lang_untranslated", "text": f"{missing} kalimat {lv['label']} tanpa terjemahan."})
+                flags.append({"kind": "lang_untranslated", "text": f"{missing} {lv['label']} sentence(s) without a translation."})
                 fixes.append(f"Ada kalimat {lv['label']} tanpa terjemahan di giliran sebelumnya: terjemahkan SETIAP kalimat.")
             self._lang_points(chat_id, mid, c, lv)
         prev_fix = (self.store.chat(chat_id) or {}).get("settings", {}).get("lang_fix") or {}
@@ -860,17 +860,17 @@ class Engine(EngineView):
         elif prev_fix:
             self.store.chat_settings(chat_id, lang_fix=None)
         if TXT.split_dialogue(full) >= 3:
-            flags.append({"kind": "split", "text": "Dialog tampak terpecah per kata dengan terjemahan pendek."})
+            flags.append({"kind": "split", "text": "Dialogue looks split word by word with short translations."})
         persona = (c["cards"].get("persona") or {}).get("name", "")
         acts = TXT.acts_for_user(full, persona)
         if acts:
-            flags.append({"kind": "acts_for_user", "text": "Narasi tampaknya memutuskan ucapan/tindakan pemain: "
+            flags.append({"kind": "acts_for_user", "text": "Narration seems to decide the player's words or actions: "
                                                            + "; ".join(acts[:3])})
         m["meta"]["flags"] = flags
         self.store.update_message(mid, meta=m["meta"])
         if rewrite_lang and not getattr(self, "_rewriting", False) and not self.stop.is_set() \
                 and os.environ.get("QCHAT_LANG_REWRITE", "1") != "0":
-            self.emit("toast", {"text": f"Narasi bukan bahasa {narr}; giliran ditulis ulang. Versi lama bisa digeser.",
+            self.emit("toast", {"text": f"Narration is not in {narr}; the turn was rewritten. Swipe to see the old version.",
                                 "kind": "warn"})
             self._rewrite(chat_id, mid, rewrite_lang)
             return
@@ -878,7 +878,7 @@ class Engine(EngineView):
         gm = self.prompt.gm(c)
         if gm.get("format") == "game" and gm.get("choices", "kadang") != "tidak" and not self.stop.is_set():
             if gm.get("choices") == "selalu" or random.random() < 0.6:
-                self.emit("live", {"active": True, "content": m["content"], "phase": "Membuat pilihan…", "reasoning": "",
+                self.emit("live", {"active": True, "content": m["content"], "phase": "Making choices…", "reasoning": "",
                                    "tools": [], "chat_id": chat_id})
                 try:
                     choices = self._choices(chat_id, c, path)
@@ -887,12 +887,12 @@ class Engine(EngineView):
                         m["meta"]["choices"] = choices
                         self.store.update_message(mid, meta=m["meta"])
                 except Exception as e:
-                    self.emit("toast", {"text": f"Pilihan gagal dibuat: {e}", "kind": "warn"})
+                    self.emit("toast", {"text": f"Could not make choices: {e}", "kind": "warn"})
                 self.emit("live", {})
         # fact check
         mode = c["settings"].get("fact_mode") or "latar"
         if mode == "ketat" and not getattr(self, "_rewriting", False):
-            self.emit("live", {"active": True, "content": m["content"], "phase": "Memeriksa fakta…", "reasoning": "",
+            self.emit("live", {"active": True, "content": m["content"], "phase": "Checking facts…", "reasoning": "",
                                "tools": [], "chat_id": chat_id})
             warnings = self._fact_check(chat_id, mid, False, stop=self.stop)
             self.emit("live", {})
@@ -900,7 +900,7 @@ class Engine(EngineView):
                 # Strict mode: write the turn again with the corrections; the wrong version stays as a sibling.
                 note = "Koreksi fakta untuk giliran ini (jawaban sebelumnya salah):\n" + "\n".join(
                     f"- {w['claim']} -> {w['correction']} ({w['source']})" for w in warnings)
-                self.emit("toast", {"text": f"{len(warnings)} fakta salah; jawaban ditulis ulang. Versi lama bisa digeser.",
+                self.emit("toast", {"text": f"{len(warnings)} wrong fact(s); the reply was rewritten. Swipe to see the old version.",
                                     "kind": "warn"})
                 self._rewrite(chat_id, mid, note)
                 return  # the new version ran its own checks
@@ -909,14 +909,14 @@ class Engine(EngineView):
         # continuity
         cmode = self.prompt.gm(c).get("continuity_check") or "latar"
         if cmode == "ketat" and not getattr(self, "_rewriting", False) and not self.stop.is_set():
-            self.emit("live", {"active": True, "content": m["content"], "phase": "Cek kontinuitas…", "reasoning": "",
+            self.emit("live", {"active": True, "content": m["content"], "phase": "Checking continuity…", "reasoning": "",
                                "tools": [], "chat_id": chat_id})
             issues = self._continuity_check(chat_id, mid, True, stop=self.stop)
             self.emit("live", {})
             if issues and not self.stop.is_set():
                 note = "Koreksi kontinuitas untuk giliran ini (jawaban sebelumnya keliru):\n" + "\n".join(
                     f"- {i.get('who', '')}: {i.get('text', '')} -> {i.get('fix', '')}" for i in issues)
-                self.emit("toast", {"text": f"{len(issues)} masalah kontinuitas; jawaban ditulis ulang. Versi lama bisa digeser.",
+                self.emit("toast", {"text": f"{len(issues)} continuity issue(s); the reply was rewritten. Swipe to see the old version.",
                                     "kind": "warn"})
                 self._rewrite(chat_id, mid, note)
         elif cmode == "latar":
@@ -1133,7 +1133,7 @@ class Engine(EngineView):
         self.store.update_message(mid, meta=m["meta"])
         self.emit("history", chat_id)
         if announce:
-            self.emit("toast", {"text": f"Cek fakta: {len(warnings)} klaim salah." if warnings else "Cek fakta: tidak ada yang salah."})
+            self.emit("toast", {"text": f"Fact check: {len(warnings)} wrong claim(s)." if warnings else "Fact check: nothing wrong."})
         return warnings
 
     # ---------- card change proposals ----------
@@ -1167,7 +1167,7 @@ class Engine(EngineView):
                                 time.time()))
             out.append(pid)
         if out:
-            self.emit("toast", {"text": f"{len(out)} usulan perubahan kartu menunggu persetujuanmu (tab Cerita)."})
+            self.emit("toast", {"text": f"{len(out)} card change proposal(s) await your approval (Story tab)."})
         self.store.side_log("card_proposals", {"answer": acc["content"], "saved": out}, chat_id)
         return out
 
@@ -1256,10 +1256,10 @@ class Engine(EngineView):
                 break
         if data_json is None:  # empty or cut off: that is a failed check, not a clean one
             m = self.store.msg(mid)
-            m["meta"]["continuity_error"] = f"jawaban kosong atau terpotong (finish={acc['finish']})"
+            m["meta"]["continuity_error"] = f"empty or cut-off answer (finish={acc['finish']})"
             self.store.update_message(mid, meta=m["meta"])
             if announce:
-                self.emit("toast", {"text": "Cek kontinuitas gagal: jawaban model kosong atau terpotong.", "kind": "warn"})
+                self.emit("toast", {"text": "Continuity check failed: the model's answer was empty or cut off.", "kind": "warn"})
             return []
         issues = []
         for i in data_json.get("issues") or []:
@@ -1272,7 +1272,7 @@ class Engine(EngineView):
         self.store.side_log("continuity", {"issues": issues, "data": data}, chat_id, mid)
         self.emit("history", chat_id)
         if announce:
-            self.emit("toast", {"text": f"Cek kontinuitas: {len(issues)} masalah." if issues else "Cek kontinuitas: aman."})
+            self.emit("toast", {"text": f"Continuity check: {len(issues)} issue(s)." if issues else "Continuity check: all clear."})
         return issues
 
     # ---------- tree operations ----------
@@ -1287,7 +1287,7 @@ class Engine(EngineView):
     def reroll(self, chat_id, mid):
         u = self._turn_user(chat_id, mid)
         if u is None:
-            self.emit("toast", {"text": "Tidak ada pesan pengguna untuk dijawab ulang.", "kind": "warn"})
+            self.emit("toast", {"text": "No user message to answer again.", "kind": "warn"})
             return
         self.run(self._turn_from, chat_id, u["id"])
 
@@ -1403,7 +1403,7 @@ class Engine(EngineView):
             self.run(self._edit_user, chat_id, mid, text)
             return None
         if m["role"] != "assistant":
-            self.emit("toast", {"text": "Hasil tool tidak bisa diedit.", "kind": "warn"})
+            self.emit("toast", {"text": "Tool results cannot be edited.", "kind": "warn"})
             return None
         # the edited text is a plain answer: a copied tool call without its results would be cut from the prompt
         nid = self.store.add_message(chat_id, m["parent_id"], "assistant", text, m["reasoning"], meta={"edited": True})
@@ -1455,7 +1455,7 @@ class Engine(EngineView):
                 EMB.enqueue("know", r["id"], r["text"])
             m = self.store.msg(mid)
         self.store.set_head(chat_id, mid)
-        live = {"active": True, "content": m["content"], "reasoning": "", "tools": [], "phase": "Melanjutkan…", "chat_id": chat_id}
+        live = {"active": True, "content": m["content"], "reasoning": "", "tools": [], "phase": "Continuing…", "chat_id": chat_id}
         self.emit("live", live)
         instr = ("Lanjutkan jawaban terakhirmu tepat dari kata terakhir, tanpa mengulang dan tanpa pengantar. "
                  "Jangan menulis ucapan atau keputusan pemain.")
@@ -1504,7 +1504,7 @@ class Engine(EngineView):
     def branch_here(self, chat_id, mid):
         self.store.set_head(chat_id, mid)
         self.emit("history", chat_id)
-        self.emit("toast", {"text": "Cabang baru: pesan berikutnya bercabang dari sini."})
+        self.emit("toast", {"text": "New branch: the next message branches from here."})
 
     def pin(self, mid, on):
         self.store.update_message(mid, pinned=int(bool(on)))
@@ -1523,7 +1523,7 @@ class Engine(EngineView):
     def _time_skip(self, chat_id, label, minutes):
         chat = self.store.chat(chat_id)
         uid = self.store.add_message(chat_id, chat["head_id"], "user", f"(Lompat waktu: {label})", meta={"time_skip": label,
-                                                                                                         "typed": f"Lompat waktu {label}"})
+                                                                                                         "typed": f"Time skip {label}"})
         ids = self.store.path_ids(chat_id)
         t0 = self.world.state(chat_id, ids)["time"]
         self.world.advance(chat_id, uid, minutes, f"lompat {label}")
@@ -1546,7 +1546,7 @@ class Engine(EngineView):
                 if stop.is_set():
                     break
                 part = chars[i:i + 10]
-                self.emit("status", f"Menyusun usulan pamor {min(i + 10, len(chars))}/{len(chars)}…")
+                self.emit("status", f"Drafting fame suggestions {min(i + 10, len(chars))}/{len(chars)}…")
                 text = "\n\n".join(self.prompt.cards.render(ch, mode="all", limit=900) for ch in part)
                 msgs = [{"role": "system", "content": "Kamu membantu menyusun cerita. Jawab hanya JSON."},
                         {"role": "user", "content": FAME_SUGGEST.format(n=len(chars), cards=text)}]
@@ -1605,7 +1605,7 @@ class Engine(EngineView):
             return
         sync, now, minutes = span
         stop = stop or self.stop
-        self.emit("status", "Dunia di luar layar bergerak…")
+        self.emit("status", "The off-screen world moves…")
         try:
             self._tick(chat_id, sync, minutes, "Waktu itu berlalu selama adegan pemain. Gerakkan hanya tokoh dan pihak yang TIDAK "
                                                "sedang satu adegan dengan pemain; tokoh di adegan pemain jangan diubah.", stop=stop)
@@ -1692,7 +1692,7 @@ class Engine(EngineView):
             if maxc and used > self.IDLE_COMPACT_AT * maxc and idle > 60 and not self.busy:
                 # Runs while the player is away, so a turn rarely has to wait for it (a turn compacts at 90%).
                 # Sending a message cancels it; finished pieces stay, the rest is done later.
-                note = " (kirim pesan untuk membatalkan; bagian yang selesai tetap tersimpan)"
+                note = " (send a message to cancel; finished parts are kept)"
                 # run() marks the engine busy before it sets the cancel flag: clear first, then look at busy.
                 if self.bg_cancel.is_set() or self.importing:
                     return
@@ -1701,7 +1701,7 @@ class Engine(EngineView):
                     return
                 if time.time() < self.compact_backoff.get(chat_id, 0):
                     return  # it failed recently: wait instead of retrying every 30 s
-                self.emit("status", "Compaction saat diam…" + note)
+                self.emit("status", "Idle compaction…" + note)
                 c = self.prompt.ctx(chat_id)
                 try:
                     self.last_used[chat_id] = self.compactor.maybe(chat_id, self.tools.specs(c), self.tools,
@@ -1712,8 +1712,8 @@ class Engine(EngineView):
                 except Exception as e:
                     self.compact_backoff[chat_id] = time.time() + 15 * 60
                     self.store.side_log("compaction_error", {"error": f"{type(e).__name__}: {e}"}, chat_id)
-                    self.emit("toast", {"text": f"Compaction saat diam gagal: {type(e).__name__}: {str(e)[:300]}. "
-                                                f"Dicoba lagi 15 menit lagi (atau klik Compact).", "kind": "error", "long": True})
+                    self.emit("toast", {"text": f"Idle compaction failed: {type(e).__name__}: {str(e)[:300]}. "
+                                                f"Retrying in 15 minutes (or click Compact).", "kind": "error", "long": True})
                     return
                 finally:
                     self.emit("status", "")
@@ -1723,7 +1723,7 @@ class Engine(EngineView):
                 # only after a real compaction (new epoch), not every time the loop finds the context full
                 if chat["kind"] in ("rp", "group") and not self.busy and not self.bg_cancel.is_set() \
                         and (self.store.chat(chat_id) or {}).get("epoch") != chat.get("epoch"):
-                    self.emit("status", "Menyusun usulan perubahan kartu…")
+                    self.emit("status", "Drafting card change proposals…")
                     try:
                         self.propose_cards(chat_id, stop=self.bg_cancel)
                     finally:
@@ -1748,7 +1748,7 @@ class Engine(EngineView):
                     before = self.world.last_event_id(chat_id)
                     self.world.advance(chat_id, head, minutes, "AFK")
                     self.store.chat_settings(chat_id, world_sync=time.time())
-                self.emit("status", "Dunia berjalan…")
+                self.emit("status", "The world moves on…")
                 self._tick(chat_id, t0, minutes, "Pemain sedang tidak ada (AFK). Tokoh yang sedang satu adegan dengan pemain "
                                                  "tetap di tempat dan menunggu, kecuali waktunya sangat lama.",
                            head=head, stop=self.bg_cancel)
@@ -1795,7 +1795,7 @@ class Engine(EngineView):
                 self.store.side_log("studio_change", {"request": request, "answer": acc["content"],
                                                       "transcript": [m for m in msgs if m["role"] in ("assistant", "tool")]},
                                     chat_id, head)
-                self.emit("toast", {"text": (acc["content"] or "Selesai.").strip()[:600], "long": True})
+                self.emit("toast", {"text": (acc["content"] or "Done.").strip()[:600], "long": True})
                 break
             msgs.append({"role": "assistant", "content": acc["content"], "tool_calls": [
                 {"id": cl["id"] or f"s{i}", "type": "function", "function": {"name": cl["name"], "arguments": cl["arguments"] or "{}"}}
@@ -1808,7 +1808,7 @@ class Engine(EngineView):
             self.store.side_log("studio_change", {"request": request, "answer": "",
                                                   "transcript": [m for m in msgs if m["role"] in ("assistant", "tool")]},
                                 chat_id, head)
-            self.emit("toast", {"text": "Perubahan diproses" + (f" ({', '.join(done)})" if done else "") + ". Cek kartu/buku cerita.",
+            self.emit("toast", {"text": "Changes processed" + (f" ({', '.join(done)})" if done else "") + ". Check the cards and the story book.",
                                 "long": True})
         self.emit("panels", chat_id)
 
@@ -1893,7 +1893,7 @@ class Engine(EngineView):
         cut = max(([m["id"] for m in path].index(s["node_id"]) for s in sums if s["level"] == "chunk"), default=len(path) // 2)
         early = [m for m in path[:cut + 1] if m["role"] in ("user", "assistant") and len(m["content"]) > 200]
         if len(early) < 3:
-            self.emit("recall", {"error": "Belum cukup riwayat lama untuk diuji."})
+            self.emit("recall", {"error": "Not enough older history to test yet."})
             return
         sample = random.sample(early, min(len(early), 6))
         text = "\n\n".join(f"[{m['role']}] {m['content'][:2500]}" for m in sample)
@@ -1902,7 +1902,7 @@ class Engine(EngineView):
                                           tools=self.tools.specs(c))["content"]) or {}
         items = (qa.get("qa") or [])[:n]
         if not items:
-            self.emit("recall", {"error": "Gagal membuat pertanyaan."})
+            self.emit("recall", {"error": "Could not make the questions."})
             return
         ans = self._json(self.llm.complete(self.prompt.side(chat_id, RECALL_ANSWER.format(
             questions="\n".join(f"{i + 1}. {x['q']}" for i, x in enumerate(items)))),
@@ -1921,18 +1921,18 @@ class Engine(EngineView):
     def switch_model(self, preset, ctx, mtp=True, embed=True, embed_model=None):
         def job():
             def log(title, text, code):
-                self.emit("status", f"{title}: {'selesai' if code == 0 else 'gagal' if code else 'jalan…'}")
+                self.emit("status", f"{title}: {'done' if code == 0 else 'failed' if code else 'running…'}")
             try:
                 SERVERS.start(preset, ctx, mtp=mtp, embed=embed, log=log, embed_model=embed_model)
                 self.store.meta_set("server", {"preset": preset, "ctx": ctx, "mtp": mtp, "embed": embed,
                                                "embed_model": embed_model or SERVERS.state.get("embed_model") or "0.6B"})
-                self.emit("toast", {"text": f"{preset} dimulai. Tunggu READY di bar atas."})
+                self.emit("toast", {"text": f"{preset} is starting. Wait for READY in the top bar."})
             except Exception as e:
-                self.emit("toast", {"text": f"Ganti model gagal: {e}", "kind": "error"})
+                self.emit("toast", {"text": f"Model switch failed: {e}", "kind": "error"})
             finally:
                 self.emit("status", "")
                 self.emit("model", None)
         if self.busy:
-            self.emit("toast", {"text": "Tunggu balasan selesai dulu.", "kind": "warn"})
+            self.emit("toast", {"text": "Wait for the reply to finish first.", "kind": "warn"})
             return
         threading.Thread(target=job, daemon=True).start()
