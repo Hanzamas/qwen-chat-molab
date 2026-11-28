@@ -71,6 +71,7 @@ class LLM:
         if tools:
             body["tools"] = tools
             body["tool_choice"] = tool_choice or "auto"
+        LLM.spec_safe(body, cur, self.servers.state.get("mtp"))
         req = urllib.request.Request(cur["base_url"] + "/chat/completions", data=json.dumps(body).encode(), headers=self._hdr())
         acc = {"content": "", "reasoning": "", "calls": {}, "usage": None, "finish": None, "t_think": None, "t_answer": None}
         resp = urllib.request.urlopen(req, timeout=timeout)
@@ -143,6 +144,23 @@ class LLM:
             resp.close()
         except Exception:
             pass
+
+    @staticmethod
+    def spec_safe(body, cur, mtp):
+        """vLLM's speculative decoding (MTP heads or a drafter) refuses min_p and logit_bias ("not yet supported with
+        speculative decoding"). Drop them there; when no top_k is set, a top_k of 64 cuts the tail min_p would have."""
+        if not mtp or ((cur or {}).get("preset") or {}).get("backend") != "vllm":
+            return body
+        try:
+            had_min_p = float(body.get("min_p") or 0) > 0
+            no_top_k = int(body.get("top_k") or 0) <= 0
+        except (TypeError, ValueError):
+            had_min_p, no_top_k = True, True
+        if had_min_p and no_top_k:
+            body["top_k"] = 64
+        body.pop("min_p", None)
+        body.pop("logit_bias", None)
+        return body
 
     def complete(self, messages, kwargs=None, sampling=None, max_tokens=4000, tools=None, timeout=7200, stop=None,
                  on_delta=None):

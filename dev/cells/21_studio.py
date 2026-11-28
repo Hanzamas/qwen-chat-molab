@@ -32,6 +32,10 @@ def STUDIO_EPHEMERAL(c):
             empty = [f["key"] for f in sch["fields"] if f["key"] not in filled]
             lines.append(f"[kartu #{cid}, jenis {type_}]\n{CARDS.render(card, mode='all', limit=6000, include_ui=True)}\n"
                          f"Field kosong: {', '.join(empty) or '-'}")
+            opts = [f"{f['key']} = {' | '.join(map(str, f['options']))}" for f in sch["fields"]
+                    if f.get("type") == "select" and f.get("options")]
+            if opts:
+                lines.append("Pilihan field select (tulis persis salah satu): " + "; ".join(opts))
             if card["type"] == "world":
                 lore = CARDS.lore(cid)
                 if lore:

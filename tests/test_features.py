@@ -256,3 +256,36 @@ def test_world_tick_puts_the_best_known_first(engine, nb, fake):
     n = len(fake["log"])
     engine._tick(chat, datetime(2026, 8, 1, 8, 0), 300, "uji")
     assert "Tokoh paling dikenal: Mira Santoso, Bu Ratna" in json.dumps(fake["log"][n], ensure_ascii=False)
+
+
+# ---------- speculative decoding and loose fame values ----------
+
+def test_min_p_dropped_for_vllm_speculative(nb):
+    spec_safe = nb["LLM"].spec_safe
+    vllm = {"preset": {"backend": "vllm"}}
+    body = spec_safe({"min_p": 0.05, "top_k": 0, "temperature": 1.0, "logit_bias": {"1": -5}}, vllm, True)
+    assert "min_p" not in body and "logit_bias" not in body and body["top_k"] == 64
+    body = spec_safe({"min_p": 0.05, "top_k": 20}, vllm, True)
+    assert "min_p" not in body and body["top_k"] == 20
+    assert spec_safe({"min_p": 0.05}, vllm, False) == {"min_p": 0.05}  # no speculative decoding: untouched
+    assert spec_safe({"min_p": 0.05}, {"preset": {"backend": "llama.cpp"}}, True) == {"min_p": 0.05}
+
+
+def test_fame_values_read_loosely(engine, nb):
+    lv = nb["fame_level"]
+    assert [lv(x) for x in ("bintang", "Bintang Kampus", "star", "Famous", "populer", "tidak terkenal", "known locally",
+                             "dikenal di kelasnya", "ordinary", "", "aneh")] == \
+        ["bintang", "bintang", "bintang", "terkenal", "terkenal", "biasa", "dikenal di lingkungannya",
+         "dikenal di lingkungannya", "biasa", "", ""]
+    C = nb["CARDS"]
+    cid = C.save(None, "character", {"name": "Nadia", "fame": "bintang kampus"})
+    assert C.get(cid)["data"]["fame"] == "bintang"  # saved as the level it means
+    assert nb["PROMPT"].fame({"data": {"fame": "Star of the campus"}}) == "bintang"  # old values still count
+
+
+def test_studio_sees_the_choices(engine, nb):
+    chat = engine.new_chat("studio", "Studio uji")
+    cid = nb["CARDS"].save(None, "character", {"name": "Rina"})
+    nb["STORE"].chat_settings(chat, studio={"drafts": {"character": [cid]}})
+    note = nb["STUDIO_EPHEMERAL"](nb["PROMPT"].ctx(chat))
+    assert "fame = bintang | terkenal | dikenal di lingkungannya | biasa" in note

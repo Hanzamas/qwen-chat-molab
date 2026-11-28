@@ -293,7 +293,7 @@ class Prompt:
 
     @staticmethod
     def fame(card):
-        return str(((card or {}).get("data") or {}).get("fame") or "").strip().lower()
+        return fame_level(((card or {}).get("data") or {}).get("fame"))
 
     def frozen_full(self, c):
         """Names whose core card is in the system prompt: all of a small cast, the best known of a large one."""

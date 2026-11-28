@@ -198,6 +198,8 @@ class Cards:
                 match = next((o for o in f.get("options") or [] if o.lower() == out[k].strip().lower()), None)
                 if match:
                     out[k] = match
+                elif k == "fame" and fame_level(out[k]):  # "bintang kampus", "star": saved as the level it means
+                    out[k] = fame_level(out[k])
             elif t == "number" and isinstance(out[k], str):
                 m = re.fullmatch(r"\s*(-?\d+(?:[.,]\d+)?)\s*", out[k])
                 if m:

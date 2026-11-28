@@ -6,6 +6,29 @@ def _f(key, label, section, type_="text", core=True, visibility="model", **extra
 FAME_LEVELS = ["bintang", "terkenal", "dikenal di lingkungannya", "biasa"]
 TOP_FAME = ("bintang", "terkenal")
 
+
+def fame_level(value):
+    """A fame value as one of FAME_LEVELS: the stored word, an English one, or a loose variant ("bintang kampus",
+    "star", "famous", "not famous"); '' when it is none of them. Read this way, values already saved stay valid."""
+    v = re.sub(r"\s+", " ", str(value or "").strip().lower())
+    if not v:
+        return ""
+    if v in FAME_LEVELS:
+        return v
+    if re.search(r"\b(tidak|bukan|not|kurang)\s+(terkenal|famous|dikenal|known)\b|\bunknown\b|\bnobody\b", v):
+        return "biasa"
+    if re.search(r"bintang|\bstar\b|superstar|\bikon\b|\bicon\b|legend", v):
+        return "bintang"
+    if re.search(r"lingkungan|\blocal|\bkelas\b|jurusan|\bcircle\b", v):
+        return "dikenal di lingkungannya"
+    if re.search(r"terkenal|famous|popul|well[- ]known|dikenal luas|renowned", v):
+        return "terkenal"
+    if re.search(r"dikenal|\bknown\b", v):
+        return "dikenal di lingkungannya"
+    if re.search(r"biasa|ordinary|normal|average|regular", v):
+        return "biasa"
+    return ""
+
 # Default schemas. They are data: stored in card_schemas, editable in the schema editor, exported with cards.
 # Nothing here is tied to a genre; examples in `help` are only hints.
 DEFAULT_SCHEMAS = {

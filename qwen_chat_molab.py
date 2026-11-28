@@ -2095,7 +2095,7 @@ def _(datetime, re):
 
 
 @app.cell(hide_code=True)
-def _():
+def _(re):
     def _f(key, label, section, type_="text", core=True, visibility="model", **extra):
         return {"key": key, "label": label, "section": section, "type": type_, "core": core, "visibility": visibility, **extra}
 
@@ -2103,6 +2103,29 @@ def _():
     # How well known a character is in the story's surroundings (a campus, a village). The top two are common knowledge.
     FAME_LEVELS = ["bintang", "terkenal", "dikenal di lingkungannya", "biasa"]
     TOP_FAME = ("bintang", "terkenal")
+
+
+    def fame_level(value):
+        """A fame value as one of FAME_LEVELS: the stored word, an English one, or a loose variant ("bintang kampus",
+        "star", "famous", "not famous"); '' when it is none of them. Read this way, values already saved stay valid."""
+        v = re.sub(r"\s+", " ", str(value or "").strip().lower())
+        if not v:
+            return ""
+        if v in FAME_LEVELS:
+            return v
+        if re.search(r"\b(tidak|bukan|not|kurang)\s+(terkenal|famous|dikenal|known)\b|\bunknown\b|\bnobody\b", v):
+            return "biasa"
+        if re.search(r"bintang|\bstar\b|superstar|\bikon\b|\bicon\b|legend", v):
+            return "bintang"
+        if re.search(r"lingkungan|\blocal|\bkelas\b|jurusan|\bcircle\b", v):
+            return "dikenal di lingkungannya"
+        if re.search(r"terkenal|famous|popul|well[- ]known|dikenal luas|renowned", v):
+            return "terkenal"
+        if re.search(r"dikenal|\bknown\b", v):
+            return "dikenal di lingkungannya"
+        if re.search(r"biasa|ordinary|normal|average|regular", v):
+            return "biasa"
+        return ""
 
     # Default schemas. They are data: stored in card_schemas, editable in the schema editor, exported with cards.
     # Nothing here is tied to a genre; examples in `help` are only hints.
@@ -2304,8 +2327,8 @@ def _():
         DEFAULTS_CHANGED,
         DEFAULT_CARDS,
         DEFAULT_SCHEMAS,
-        FAME_LEVELS,
         TOP_FAME,
+        fame_level,
     )
 
 
@@ -2317,6 +2340,7 @@ def _(
     STORE,
     TXT,
     base64,
+    fame_level,
     json,
     re,
     time,
@@ -2521,6 +2545,8 @@ def _(
                     match = next((o for o in f.get("options") or [] if o.lower() == out[k].strip().lower()), None)
                     if match:
                         out[k] = match
+                    elif k == "fame" and fame_level(out[k]):  # "bintang kampus", "star": saved as the level it means
+                        out[k] = fame_level(out[k])
                 elif t == "number" and isinstance(out[k], str):
                     m = re.fullmatch(r"\s*(-?\d+(?:[.,]\d+)?)\s*", out[k])
                     if m:
@@ -4601,6 +4627,7 @@ def _(CFG, SERVERS, Sys, json, threading, time, urllib):
             if tools:
                 body["tools"] = tools
                 body["tool_choice"] = tool_choice or "auto"
+            LLM.spec_safe(body, cur, self.servers.state.get("mtp"))
             req = urllib.request.Request(cur["base_url"] + "/chat/completions", data=json.dumps(body).encode(), headers=self._hdr())
             acc = {"content": "", "reasoning": "", "calls": {}, "usage": None, "finish": None, "t_think": None, "t_answer": None}
             resp = urllib.request.urlopen(req, timeout=timeout)
@@ -4674,6 +4701,23 @@ def _(CFG, SERVERS, Sys, json, threading, time, urllib):
             except Exception:
                 pass
 
+        @staticmethod
+        def spec_safe(body, cur, mtp):
+            """vLLM's speculative decoding (MTP heads or a drafter) refuses min_p and logit_bias ("not yet supported with
+            speculative decoding"). Drop them there; when no top_k is set, a top_k of 64 cuts the tail min_p would have."""
+            if not mtp or ((cur or {}).get("preset") or {}).get("backend") != "vllm":
+                return body
+            try:
+                had_min_p = float(body.get("min_p") or 0) > 0
+                no_top_k = int(body.get("top_k") or 0) <= 0
+            except (TypeError, ValueError):
+                had_min_p, no_top_k = True, True
+            if had_min_p and no_top_k:
+                body["top_k"] = 64
+            body.pop("min_p", None)
+            body.pop("logit_bias", None)
+            return body
+
         def complete(self, messages, kwargs=None, sampling=None, max_tokens=4000, tools=None, timeout=7200, stop=None,
                      on_delta=None):
             """Like chat(); tools are sent (for an identical prompt prefix) but not used."""
@@ -4704,6 +4748,7 @@ def _(
     TXT,
     WORLD,
     base64,
+    fame_level,
     json,
     os,
     random,
@@ -5006,7 +5051,7 @@ def _(
 
         @staticmethod
         def fame(card):
-            return str(((card or {}).get("data") or {}).get("fame") or "").strip().lower()
+            return fame_level(((card or {}).get("data") or {}).get("fame"))
 
         def frozen_full(self, c):
             """Names whose core card is in the system prompt: all of a small cast, the best known of a large one."""
@@ -5327,6 +5372,10 @@ def _(CARDS, Cards):
                 empty = [f["key"] for f in sch["fields"] if f["key"] not in filled]
                 lines.append(f"[kartu #{cid}, jenis {type_}]\n{CARDS.render(card, mode='all', limit=6000, include_ui=True)}\n"
                              f"Field kosong: {', '.join(empty) or '-'}")
+                opts = [f"{f['key']} = {' | '.join(map(str, f['options']))}" for f in sch["fields"]
+                        if f.get("type") == "select" and f.get("options")]
+                if opts:
+                    lines.append("Pilihan field select (tulis persis salah satu): " + "; ".join(opts))
                 if card["type"] == "world":
                     lore = CARDS.lore(cid)
                     if lore:
@@ -6644,7 +6693,6 @@ def _(
     Compactor,
     EMB,
     EngineView,
-    FAME_LEVELS,
     Files,
     KNOW,
     LLM_CLIENT,
@@ -6664,6 +6712,7 @@ def _(
     WEB,
     WORLD,
     World,
+    fame_level,
     json,
     os,
     quant_of,
@@ -8236,10 +8285,10 @@ def _(
                     got = {str(x.get("name", "")).strip().lower(): x for x in items if isinstance(x, dict)}
                     for ch in part:
                         x = got.get(ch["name"].strip().lower()) or {}
-                        fame = str(x.get("fame") or "").strip().lower()
+                        fame = fame_level(x.get("fame"))
                         now = self.prompt.fame(ch)
                         rows.append({"card_id": ch["id"], "name": ch["name"], "current": now,
-                                     "fame": fame if fame in FAME_LEVELS else now,
+                                     "fame": fame or now,
                                      "fame_for": str(x.get("fame_for") or ch["data"].get("fame_for") or "")[:200],
                                      "reason": str(x.get("reason") or "")[:300]})
             finally:
@@ -10454,7 +10503,6 @@ def _(
     EMBEDDERS,
     Engine,
     EngineView,
-    FAME_LEVELS,
     KNOW,
     LLM_CLIENT,
     MEM,
@@ -10475,6 +10523,7 @@ def _(
     WORLD,
     World,
     base64,
+    fame_level,
     json,
     mo,
     re,
@@ -10599,7 +10648,7 @@ def _(
                 c = CARDS.get(l["card_id"])
                 if c:
                     links.append({"id": c["id"], "role": l["role"], "name": c["name"], "version": l["version"],
-                                  "latest": c["version"], "avatar": c["avatar"], "fame": str(c["data"].get("fame") or ""),
+                                  "latest": c["version"], "avatar": c["avatar"], "fame": fame_level(c["data"].get("fame")),
                                   "fame_for": str(c["data"].get("fame_for") or "")})
             return {"id": sid, "title": s["title"], "canon": STORIES.canon(sid, STORE.visible_ids(chat["id"]), chat["id"]),
                     "never_forget": s["data"]["never_forget"],
@@ -11122,7 +11171,7 @@ def _(
                 card = CARDS.get(int(it.get("card_id") or 0))
                 if not card or card["type"] not in ("character", "persona"):
                     continue
-                fame = it.get("fame") if it.get("fame") in FAME_LEVELS else ""
+                fame = fame_level(it.get("fame"))
                 data = {**card["data"], "fame": fame, "fame_for": str(it.get("fame_for") or "").strip()[:200]}
                 if (card["data"].get("fame") or "", card["data"].get("fame_for") or "") != (data["fame"], data["fame_for"]):
                     CARDS.save(card["id"], card["type"], data)

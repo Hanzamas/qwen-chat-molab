@@ -1559,10 +1559,10 @@ class Engine(EngineView):
                 got = {str(x.get("name", "")).strip().lower(): x for x in items if isinstance(x, dict)}
                 for ch in part:
                     x = got.get(ch["name"].strip().lower()) or {}
-                    fame = str(x.get("fame") or "").strip().lower()
+                    fame = fame_level(x.get("fame"))
                     now = self.prompt.fame(ch)
                     rows.append({"card_id": ch["id"], "name": ch["name"], "current": now,
-                                 "fame": fame if fame in FAME_LEVELS else now,
+                                 "fame": fame or now,
                                  "fame_for": str(x.get("fame_for") or ch["data"].get("fame_for") or "")[:200],
                                  "reason": str(x.get("reason") or "")[:300]})
         finally:

@@ -115,7 +115,7 @@ class ChatApp:
             c = CARDS.get(l["card_id"])
             if c:
                 links.append({"id": c["id"], "role": l["role"], "name": c["name"], "version": l["version"],
-                              "latest": c["version"], "avatar": c["avatar"], "fame": str(c["data"].get("fame") or ""),
+                              "latest": c["version"], "avatar": c["avatar"], "fame": fame_level(c["data"].get("fame")),
                               "fame_for": str(c["data"].get("fame_for") or "")})
         return {"id": sid, "title": s["title"], "canon": STORIES.canon(sid, STORE.visible_ids(chat["id"]), chat["id"]),
                 "never_forget": s["data"]["never_forget"],
@@ -638,7 +638,7 @@ class ChatApp:
             card = CARDS.get(int(it.get("card_id") or 0))
             if not card or card["type"] not in ("character", "persona"):
                 continue
-            fame = it.get("fame") if it.get("fame") in FAME_LEVELS else ""
+            fame = fame_level(it.get("fame"))
             data = {**card["data"], "fame": fame, "fame_for": str(it.get("fame_for") or "").strip()[:200]}
             if (card["data"].get("fame") or "", card["data"].get("fame_for") or "") != (data["fame"], data["fame_for"]):
                 CARDS.save(card["id"], card["type"], data)
