@@ -603,9 +603,22 @@ class Engine(EngineView):
                 if force_answer:
                     fails_in_row = 0
                 content = TXT.dedupe_parens(acc["content"]) if c["kind"] in ("rp", "group") else acc["content"]
+                salvaged = 0
+                if c["kind"] in ("rp", "group") and "{" in content and not force_answer and not self.stop.is_set():
+                    # Calls Gemma wrote as text in its own format (the parser missed them): run them as real calls.
+                    props = {t["function"]["name"]: set((t["function"].get("parameters") or {}).get("properties") or {})
+                             for t in tools}
+                    found, rest = TXT.gemma_calls(content, allowed)
+                    if found or rest != content.strip():
+                        content = rest
+                    for i, (name, args) in enumerate(found):
+                        args = {k: v for k, v in args.items() if not props.get(name) or k in props[name]}
+                        calls.append({"id": f"call_text_{int(time.time())}_{i}", "type": "function",
+                                      "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}})
+                        salvaged += 1
                 if c["kind"] in ("rp", "group") and TXT.leaked_tools(content):
                     clean = TXT.strip_leaks(content)
-                    if len(clean) >= 200:
+                    if len(clean) >= 200 or salvaged:
                         content = clean  # leaked tool text around a whole narration: keep the narration
                     else:
                         garbled, calls = "leak", []

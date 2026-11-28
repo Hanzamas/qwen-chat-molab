@@ -232,6 +232,66 @@ class TXT:
                       r'"(?:success|odds|roll|saved|updated|ok)":\s*[\[\d"tf]')
 
     @staticmethod
+    def gemma_args(body):
+        """Gemma's argument syntax ({key:value} with <|"|> around strings) as a dict; raises ValueError if it is not."""
+        strings = []
+
+        def keep(m):
+            strings.append(m.group(1))
+            return f"\x00{len(strings) - 1}\x00"
+        s = re.sub(r'<\|"\|>(.*?)<\|"\|>', keep, body, flags=re.S)
+        s = re.sub(r'([{,\[]\s*)([A-Za-z_][\w\- ]*?)\s*:', lambda m: f'{m.group(1)}"{m.group(2).strip()}":', s)
+        s = re.sub(r':\s*([A-Za-z_][\w\- ]*?)\s*(?=[,}\]])',  # bare words as values
+                   lambda m: ":" + (m.group(1) if m.group(1) in ("true", "false", "null") else json.dumps(m.group(1))), s)
+        s = re.sub(r"\x00(\d+)\x00", lambda m: json.dumps(strings[int(m.group(1))]), s)
+        out = json.loads(s)
+        if not isinstance(out, dict):
+            raise ValueError("not an object")
+        return out
+
+    @staticmethod
+    def gemma_calls(text, names):
+        """Tool calls written as text in Gemma's format, [prefix:]name{key:value,...}, for the tools in `names`.
+        Returns ([(name, args)], text without them). An echoed result (only value:<|"|>...<|"|>) is removed, not run."""
+        found, spans, i = [], [], 0
+        pat = re.compile(r"(?:(?<![\w])[a-z]{1,10}:|(?<![\w:]))([a-z_][a-z0-9_]{2,40})\{")
+        while True:
+            m = pat.search(text or "", i)
+            if not m:
+                break
+            i = m.end()
+            if m.group(1) not in names:
+                continue
+            depth, j, n, in_str = 0, m.end() - 1, len(text), False
+            while j < n:
+                if text.startswith('<|"|>', j):
+                    in_str = not in_str
+                    j += 5
+                    continue
+                if not in_str:
+                    if text[j] == "{":
+                        depth += 1
+                    elif text[j] == "}":
+                        depth -= 1
+                        if depth == 0:
+                            break
+                j += 1
+            end = j + 1 if j < n else n
+            spans.append((m.start(), end))
+            i = end
+            try:
+                args = TXT.gemma_args(text[m.end() - 1:end])
+            except (ValueError, TypeError):
+                continue  # cut off or garbled: removed from the narration, not run
+            if set(args) == {"value"}:
+                continue  # the model repeating a tool's result: not a call
+            found.append((m.group(1), args))
+        rest = text or ""
+        for a, b in reversed(spans):
+            rest = rest[:a] + rest[b:]
+        return found, re.sub(r"\n{3,}", "\n\n", rest).strip()
+
+    @staticmethod
     def leaked_tools(text):
         return bool(TXT.LEAK.search(text or ""))
 

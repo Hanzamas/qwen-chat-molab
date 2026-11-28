@@ -757,4 +757,6 @@ dicatat di bawah sebagai usulan.
 - [x] Balasan dobel: narasi lengkap + alat pencatat saja = giliran selesai; narasi yang hampir sama di putaran
       berikutnya menggantikan salinan lama.
 - [x] Tulis ulang bahasa berhenti setelah 2 kali gagal berturut-turut (cukup tanda).
-- [x] Gemma dengan MTP: suhu maksimal 0,85.
+- [x] Pemanggilan alat yang Gemma tulis sebagai teks dalam formatnya sendiri (`[awalan:]nama{kunci:nilai}` dengan `<|"|>`)
+      di-parse dan dijalankan seperti pemanggilan normal (hanya alat yang tersedia, argumen asing dibuang); gema hasil
+      alat (`value:…`) dibuang tanpa dijalankan. Suhu Gemma tetap sesuai preset (batas 0,85 dibatalkan).

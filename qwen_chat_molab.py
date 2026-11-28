@@ -1797,7 +1797,7 @@ def _(BACKUP, bk_interval, bk_now, bk_repo, bk_restore, bk_token, ctl_hf, mo):
 
 
 @app.cell(hide_code=True)
-def _(datetime, re):
+def _(datetime, json, re):
     class TXT:
         """Text utilities: search queries, counting, similarity, and the RP quality checks."""
 
@@ -2030,6 +2030,66 @@ def _(datetime, re):
         # Tool-call syntax written as text: Gemma's <|"|> quote token and name:tool{ form, special tokens, tool-result JSON.
         LEAK = re.compile(r'<\|"\|>|<\|/?[a-z_]{2,30}\|>|<(?:start|end)_function|(?<![\w/])[a-z]{2,12}:[a-z_]{3,30}\{|'
                           r'"(?:success|odds|roll|saved|updated|ok)":\s*[\[\d"tf]')
+
+        @staticmethod
+        def gemma_args(body):
+            """Gemma's argument syntax ({key:value} with <|"|> around strings) as a dict; raises ValueError if it is not."""
+            strings = []
+
+            def keep(m):
+                strings.append(m.group(1))
+                return f"\x00{len(strings) - 1}\x00"
+            s = re.sub(r'<\|"\|>(.*?)<\|"\|>', keep, body, flags=re.S)
+            s = re.sub(r'([{,\[]\s*)([A-Za-z_][\w\- ]*?)\s*:', lambda m: f'{m.group(1)}"{m.group(2).strip()}":', s)
+            s = re.sub(r':\s*([A-Za-z_][\w\- ]*?)\s*(?=[,}\]])',  # bare words as values
+                       lambda m: ":" + (m.group(1) if m.group(1) in ("true", "false", "null") else json.dumps(m.group(1))), s)
+            s = re.sub(r"\x00(\d+)\x00", lambda m: json.dumps(strings[int(m.group(1))]), s)
+            out = json.loads(s)
+            if not isinstance(out, dict):
+                raise ValueError("not an object")
+            return out
+
+        @staticmethod
+        def gemma_calls(text, names):
+            """Tool calls written as text in Gemma's format, [prefix:]name{key:value,...}, for the tools in `names`.
+            Returns ([(name, args)], text without them). An echoed result (only value:<|"|>...<|"|>) is removed, not run."""
+            found, spans, i = [], [], 0
+            pat = re.compile(r"(?:(?<![\w])[a-z]{1,10}:|(?<![\w:]))([a-z_][a-z0-9_]{2,40})\{")
+            while True:
+                m = pat.search(text or "", i)
+                if not m:
+                    break
+                i = m.end()
+                if m.group(1) not in names:
+                    continue
+                depth, j, n, in_str = 0, m.end() - 1, len(text), False
+                while j < n:
+                    if text.startswith('<|"|>', j):
+                        in_str = not in_str
+                        j += 5
+                        continue
+                    if not in_str:
+                        if text[j] == "{":
+                            depth += 1
+                        elif text[j] == "}":
+                            depth -= 1
+                            if depth == 0:
+                                break
+                    j += 1
+                end = j + 1 if j < n else n
+                spans.append((m.start(), end))
+                i = end
+                try:
+                    args = TXT.gemma_args(text[m.end() - 1:end])
+                except (ValueError, TypeError):
+                    continue  # cut off or garbled: removed from the narration, not run
+                if set(args) == {"value"}:
+                    continue  # the model repeating a tool's result: not a call
+                found.append((m.group(1), args))
+            rest = text or ""
+            for a, b in reversed(spans):
+                rest = rest[:a] + rest[b:]
+            return found, re.sub(r"\n{3,}", "\n\n", rest).strip()
 
         @staticmethod
         def leaked_tools(text):
@@ -4743,14 +4803,7 @@ def _(CFG, SERVERS, Sys, json, threading, time, urllib):
             """vLLM's speculative decoding (MTP heads or a drafter) refuses min_p and logit_bias ("not yet supported with
             speculative decoding"). Drop them there; when no top_k is set, a top_k of 64 cuts the tail min_p would have."""
             p = (cur or {}).get("preset") or {}
-            if not mtp:
-                return body
-            if p.get("family") == "gemma":  # Gemma with MTP loops more easily at 1.0
-                try:
-                    body["temperature"] = min(float(body.get("temperature", 1.0)), 0.85)
-                except (TypeError, ValueError):
-                    body["temperature"] = 0.85
-            if p.get("backend") != "vllm":
+            if not mtp or p.get("backend") != "vllm":
                 return body
             try:
                 had_min_p = float(body.get("min_p") or 0) > 0
@@ -7374,9 +7427,22 @@ def _(
                     if force_answer:
                         fails_in_row = 0
                     content = TXT.dedupe_parens(acc["content"]) if c["kind"] in ("rp", "group") else acc["content"]
+                    salvaged = 0
+                    if c["kind"] in ("rp", "group") and "{" in content and not force_answer and not self.stop.is_set():
+                        # Calls Gemma wrote as text in its own format (the parser missed them): run them as real calls.
+                        props = {t["function"]["name"]: set((t["function"].get("parameters") or {}).get("properties") or {})
+                                 for t in tools}
+                        found, rest = TXT.gemma_calls(content, allowed)
+                        if found or rest != content.strip():
+                            content = rest
+                        for i, (name, args) in enumerate(found):
+                            args = {k: v for k, v in args.items() if not props.get(name) or k in props[name]}
+                            calls.append({"id": f"call_text_{int(time.time())}_{i}", "type": "function",
+                                          "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}})
+                            salvaged += 1
                     if c["kind"] in ("rp", "group") and TXT.leaked_tools(content):
                         clean = TXT.strip_leaks(content)
-                        if len(clean) >= 200:
+                        if len(clean) >= 200 or salvaged:
                             content = clean  # leaked tool text around a whole narration: keep the narration
                         else:
                             garbled, calls = "leak", []

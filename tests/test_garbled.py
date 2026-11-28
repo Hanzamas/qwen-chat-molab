@@ -86,8 +86,30 @@ def test_same_narration_after_a_roll_is_kept_once(engine, nb, fake):
     assert bot["content"].count("Lena berjalan mendekat") == 1 and "Lalu dia duduk." in bot["content"]
 
 
-def test_gemma_runs_at_085_with_mtp(nb):
+def test_gemma_keeps_its_temperature(nb):
     spec_safe = nb["LLM"].spec_safe
-    assert spec_safe({"temperature": 1.0}, {"preset": {"family": "gemma", "backend": "llama.cpp"}}, True)["temperature"] == 0.85
-    assert spec_safe({"temperature": 0.7}, {"preset": {"family": "gemma", "backend": "vllm"}}, True)["temperature"] == 0.7
-    assert spec_safe({"temperature": 1.0}, {"preset": {"family": "gemma"}}, False)["temperature"] == 1.0
+    assert spec_safe({"temperature": 1.0}, {"preset": {"family": "gemma", "backend": "vllm"}}, True)["temperature"] == 1.0
+
+
+GEMMA = ('world_advance{minutes:73,summary:<|"|>Seminar selesai.<|"|>}\n'
+         'status_update{changes:{Rep:{"kelas":38,"fakultas":12},Energi:-5,Lapar:5},reason:<|"|>kuliah panjang<|"|>,'
+         'subject:<|"|>player<|"|>}\n'
+         'cio:roll{value:<|"|>{"event": "x", "success": true}<|"|>}')
+
+
+def test_gemma_calls_parsed_from_text(nb):
+    found, rest = nb["TXT"].gemma_calls(GEMMA + "\n" + STORY, {"world_advance", "status_update", "roll"})
+    assert [n for n, _ in found] == ["world_advance", "status_update"]  # the echoed roll result is not a call
+    assert found[0][1] == {"minutes": 73, "summary": "Seminar selesai."}
+    assert found[1][1]["changes"]["Rep"] == {"kelas": 38, "fakultas": 12} and found[1][1]["subject"] == "player"
+    assert rest == STORY
+
+
+def test_gemma_text_calls_are_run(engine, nb, fake):
+    chat, _ = _story(nb, engine)
+    fake["script"] += [{"content": GEMMA}, {"content": STORY}]
+    engine.send(chat, "Aku menunggu.")
+    wait_idle(engine)
+    bot = engine.display(chat)["items"][-1]
+    assert "world_advance" not in bot["content"] and bot["content"].startswith("Lena berjalan mendekat")
+    assert engine.panels(chat)["time"].endswith("22:13")  # 21:00 + 73 minutes: the call really ran
