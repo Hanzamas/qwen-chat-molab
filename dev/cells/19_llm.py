@@ -149,7 +149,15 @@ class LLM:
     def spec_safe(body, cur, mtp):
         """vLLM's speculative decoding (MTP heads or a drafter) refuses min_p and logit_bias ("not yet supported with
         speculative decoding"). Drop them there; when no top_k is set, a top_k of 64 cuts the tail min_p would have."""
-        if not mtp or ((cur or {}).get("preset") or {}).get("backend") != "vllm":
+        p = (cur or {}).get("preset") or {}
+        if not mtp:
+            return body
+        if p.get("family") == "gemma":  # Gemma with MTP loops more easily at 1.0
+            try:
+                body["temperature"] = min(float(body.get("temperature", 1.0)), 0.85)
+            except (TypeError, ValueError):
+                body["temperature"] = 0.85
+        if p.get("backend") != "vllm":
             return body
         try:
             had_min_p = float(body.get("min_p") or 0) > 0

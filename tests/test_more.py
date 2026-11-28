@@ -470,7 +470,8 @@ def test_turn_writes_under_its_own_head(engine, nb, fake):
     engine.send(chat, "Pertama.")
     wait_idle(engine)
     other = S.chat(chat)["head_id"]
-    fake["script"].append({"content": "Jawaban lambat. " * 30, "slow": 0.05})
+    words = "satu dua tiga empat lima enam tujuh delapan sembilan sepuluh sebelas duabelas".split()
+    fake["script"].append({"content": " ".join(f"Jawaban lambat bagian {words[i % 12]}." for i in range(30)), "slow": 0.05})
     engine.send(chat, "Kedua.")
     time.sleep(0.4)
     uid = [m for m in S.path(chat) if m["role"] == "user"][-1]["id"]

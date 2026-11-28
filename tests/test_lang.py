@@ -102,3 +102,22 @@ def test_wrong_narration_language_is_rewritten_once(engine, nb, fake, monkeypatc
     wait_idle(engine, 60)
     last = engine.display(chat)["items"][-1]
     assert last["content"].startswith("Frau Weber walks in") and last["swipe"] == [2, 2]
+
+
+def test_language_rewrite_gives_up_after_two_failures(engine, nb, fake, monkeypatch):
+    monkeypatch.setenv("QCHAT_LANG_REWRITE", "1")
+    chat = _german_story(nb, engine)
+    indo = ("Frau Weber masuk ke kelas dan menutup pintu dengan pelan. Dia melihat ke arah kamu dan tersenyum, lalu dia "
+            "berjalan ke meja yang ada di depan dan meletakkan tas di atas meja itu. Semua orang diam karena dia sudah ada di sini.")
+    for _ in range(2):
+        n = len(fake["script"])
+        fake["script"] += [{"content": indo}, {"content": indo}]
+        engine.send(chat, "I wait.")
+        wait_idle(engine, 60)
+        assert len(fake["script"]) == n  # written, then rewritten once
+    assert nb["STORE"].chat(chat)["settings"]["lang_fail"] == 2
+    fake["script"] += [{"content": indo}, {"content": "unused"}]
+    engine.send(chat, "I wait.")
+    wait_idle(engine, 60)
+    assert fake["script"] == [{"content": "unused"}]  # no third rewrite: only flagged
+    fake["script"].clear()

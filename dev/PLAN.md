@@ -744,3 +744,17 @@ dicatat di bawah sebagai usulan.
 - [x] Tampilan aplikasi dalam bahasa Inggris: tombol, tab, form kartu (label skema), toast, status, pemberitahuan, kontrol
       notebook. Nilai data tetap (fakta, bintang, "2 jam", dll.) dan ditampilkan dengan label Inggris. Perintah /chapter,
       /remember, /check ditambahkan di samping /bab, /ingat, /cek. Instruksi ke model tetap bahasa Indonesia.
+
+### Balasan rusak dan rollback (selesai, belum dites di GPU)
+
+- [x] Teks pemanggilan alat yang bocor (`<|"|>`, `nama:alat{…}`, JSON hasil alat) dibuang dari balasan kalau narasinya
+      utuh; kalau tidak ada narasi yang tersisa, balasan dianggap rusak.
+- [x] Pengulangan tanpa henti (kata atau pola yang sama ≥12 kali berturut-turut, angka diabaikan) dihentikan saat
+      sedang ditulis.
+- [x] Rollback: balasan rusak jadi cabang samping (efek alatnya ikut hilang dari cabang aktif), lalu ditulis ulang
+      sekali dengan suhu ≤0,7 dan frequency_penalty 0,4. Rusak lagi: berhenti dengan pesan error dan tombol Retry.
+- [x] Batas alat: 10 per putaran, 20 per giliran; lebih dari itu tidak dijalankan dan giliran di-rollback.
+- [x] Balasan dobel: narasi lengkap + alat pencatat saja = giliran selesai; narasi yang hampir sama di putaran
+      berikutnya menggantikan salinan lama.
+- [x] Tulis ulang bahasa berhenti setelah 2 kali gagal berturut-turut (cukup tanda).
+- [x] Gemma dengan MTP: suhu maksimal 0,85.

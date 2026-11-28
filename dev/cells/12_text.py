@@ -227,6 +227,43 @@ class TXT:
         dominant = max(shares, key=shares.get) if w else expected
         return dominant, shares
 
+    # Tool-call syntax written as text: Gemma's <|"|> quote token and name:tool{ form, special tokens, tool-result JSON.
+    LEAK = re.compile(r'<\|"\|>|<\|/?[a-z_]{2,30}\|>|<(?:start|end)_function|(?<![\w/])[a-z]{2,12}:[a-z_]{3,30}\{|'
+                      r'"(?:success|odds|roll|saved|updated|ok)":\s*[\[\d"tf]')
+
+    @staticmethod
+    def leaked_tools(text):
+        return bool(TXT.LEAK.search(text or ""))
+
+    @staticmethod
+    def strip_leaks(text):
+        """The text without the lines that hold leaked tool syntax."""
+        keep = [ln for ln in (text or "").split("\n") if not TXT.LEAK.search(ln)]
+        return re.sub(r"\n{3,}", "\n\n", "\n".join(keep)).strip()
+
+    @staticmethod
+    def is_narration(text):
+        """A finished piece of narration: at least two paragraphs and a few hundred characters."""
+        return len((text or "").strip()) >= 300 and len(TXT.paragraphs(text)) >= 2
+
+    @staticmethod
+    def runaway(text, repeats=12):
+        """The end of the text repeats itself: one word, or a short pattern (numbers aside), many times in a row."""
+        tail = re.sub(r"\d+", "#", (text or "")[-4000:].lower())
+        toks = re.findall(r"\w+|[^\w\s]", tail)
+        if len(toks) < repeats * 2:
+            return False
+        for n in range(1, 9):
+            unit = toks[-n:]
+            if not any(re.match(r"\w", t) for t in unit):
+                continue  # "......" or "!?!?" is punctuation, not a loop
+            k = 1
+            while len(toks) >= (k + 1) * n and toks[-(k + 1) * n:len(toks) - k * n] == unit:
+                k += 1
+            if k >= repeats:
+                return True
+        return False
+
     QUOTE = re.compile(r"[\"“„«]([^\"”“»\n]{1,500})[\"”“»]")
 
     @staticmethod

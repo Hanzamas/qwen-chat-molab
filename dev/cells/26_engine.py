@@ -95,6 +95,16 @@ TIME_SKIP_NOTE = ("Pemain melompati waktu {label}. Ceritakan transisi singkat (1
                   "panggil world_advance lagi.")
 
 
+class AnyEvent:
+    """Set when any of the given events is set: a stop for one request that the global Stop also ends."""
+
+    def __init__(self, *events):
+        self.events = events
+
+    def is_set(self):
+        return any(e.is_set() for e in self.events)
+
+
 class Engine(EngineView):
     IDLE_COMPACT_AT = 0.75
     def __init__(self, emit=None):
@@ -448,8 +458,14 @@ class Engine(EngineView):
 
     # ---------- the turn ----------
 
+    # Calls that only record what the narration already says: after them the turn needs no further round.
+    RECORDING_TOOLS = {"world_advance", "status_update", "knowledge_add", "tell", "relationship", "thread_open", "thread_close",
+                       "canon_set", "memory_save", "memory_update", "memory_forget", "world_event", "fact_save"}
+    MAX_CALLS_ROUND, MAX_CALLS_TURN = 10, 20
+    GARBLED = {"runaway": "text repeating itself", "leak": "tool calls written as text", "tools": "too many tool calls"}
+
     def _turn(self, chat_id, extra=None, pending_estimate=0, length_override=None, group_note=True, also=None,
-              seg_after=False, speaker=None, no_time=False):
+              seg_after=False, speaker=None, no_time=False, safe=False):
         """One reply. also: lines for every round of this turn, not stored (a group speaker, a correction).
         seg_after: a group round's later speaker; its checks cover only its own part. Returns the error, if any."""
         if not self.servers.ready():
@@ -460,6 +476,7 @@ class Engine(EngineView):
         # The turn writes under its own head. Re-reading chats.head_id would follow the UI to another branch.
         turn = {"head": (self.store.chat(chat_id) or {}).get("head_id"), "ooc": False}
         seg = turn["head"] if seg_after else None
+        start_head, extra_in, also_in = turn["head"], list(extra or []), list(also or [])  # for a rollback
         hm = self.store.msg(turn["head"]) if turn["head"] else None
         if hm and hm["role"] == "user":
             turn["ooc"] = bool(hm["ooc"]) and c["kind"] in ("rp", "group")
@@ -500,6 +517,10 @@ class Engine(EngineView):
                          + ", ".join(f'"{o["text"]}…"' for o in openers[-3:]) + "). Mulai giliran ini dengan cara lain.")
         error, state = None, None
         seen_calls, fails_in_row = {}, 0
+        garbled, prev_round = None, None
+        sampling = self.prompt.sampling(c)
+        if safe:  # the second try after a broken reply: calmer sampling, repetition discouraged
+            sampling = {**sampling, "temperature": min(float(sampling.get("temperature") or 1.0), 0.7), "frequency_penalty": 0.4}
         try:
             reserve = self._default_max_tokens(c)
             used = self.compactor.maybe(chat_id, tools, self.tools, phase, last_used=self.last_used.get(chat_id, 0),
@@ -528,14 +549,20 @@ class Engine(EngineView):
                         um = path[-1]
                         self.store.update_message(um["id"], meta={**um["meta"], "ephemeral": used_round["note"]})
                 base_c, base_r = live["content"], live["reasoning"]
-                state = {"mid": None, "saved": 0.0}
+                state = {"mid": None, "saved": 0.0, "checked": 0.0}
+                round_stop = threading.Event()
 
-                def on_delta(acc, base_c=base_c, base_r=base_r, state=state):
+                def on_delta(acc, base_c=base_c, base_r=base_r, state=state, round_stop=round_stop):
                     live["content"] = base_c + ("\n\n" if base_c and acc["content"] else "") + acc["content"]
                     live["reasoning"] = base_r + ("\n\n" if base_r and acc["reasoning"] else "") + acc["reasoning"]
                     live["thinking"] = bool(acc["reasoning"]) and not acc["content"] and not acc["calls"]
                     self.emit("live", live)
                     now = time.time()
+                    if now - state["checked"] > 1.0:  # a reply that loops is cut off at once, not after thousands of tokens
+                        state["checked"] = now
+                        if TXT.runaway(acc["content"]) or TXT.runaway(acc["reasoning"]):
+                            state["bad"] = "runaway"
+                            round_stop.set()
                     if now - state["saved"] > 3:
                         state["saved"] = now
                         if state["mid"] is None:
@@ -545,9 +572,10 @@ class Engine(EngineView):
 
                 # After many failed tool calls in a row the model must answer with what it has.
                 force_answer = fails_in_row >= 6
-                acc = self.llm.chat(msgs, tools=tools, kwargs=self.prompt.kwargs(c), sampling=self.prompt.sampling(c),
+                acc = self.llm.chat(msgs, tools=tools, kwargs=self.prompt.kwargs(c), sampling=sampling,
                                     max_tokens=c["settings"].get("max_tokens") or self._default_max_tokens(c),
-                                    on_delta=on_delta, stop=self.stop, tool_choice="none" if force_answer else None)
+                                    on_delta=on_delta, stop=AnyEvent(self.stop, round_stop),
+                                    tool_choice="none" if force_answer else None)
                 live["thinking"] = False
                 usage = acc["usage"] or usage
                 if acc["usage"]:
@@ -558,6 +586,16 @@ class Engine(EngineView):
                     totals["gen_s"] += time.time() - start
                 if acc["t_think"]:
                     totals["think_s"] += (acc["t_answer"] or time.time()) - acc["t_think"]
+                if not state.get("bad") and (TXT.runaway(acc["content"]) or TXT.runaway(acc["reasoning"])):
+                    state["bad"] = "runaway"
+                if state.get("bad"):
+                    garbled = state["bad"]
+                    if state["mid"] is None:
+                        state["mid"] = add("assistant", acc["content"][:4000], acc["reasoning"][:4000], status="partial")
+                    else:
+                        self.store.update_message(state["mid"], content=acc["content"][:4000], status="partial")
+                    final_id = state["mid"]
+                    break
                 calls = [] if self.stop.is_set() or force_answer else [
                     {"id": cl["id"] or f"call_{int(time.time())}_{i}", "type": "function",
                      "function": {"name": cl["name"], "arguments": cl["arguments"] or "{}"}}
@@ -565,6 +603,14 @@ class Engine(EngineView):
                 if force_answer:
                     fails_in_row = 0
                 content = TXT.dedupe_parens(acc["content"]) if c["kind"] in ("rp", "group") else acc["content"]
+                if c["kind"] in ("rp", "group") and TXT.leaked_tools(content):
+                    clean = TXT.strip_leaks(content)
+                    if len(clean) >= 200:
+                        content = clean  # leaked tool text around a whole narration: keep the narration
+                    else:
+                        garbled, calls = "leak", []
+                if len(calls) > self.MAX_CALLS_ROUND or totals["tools"] + len(calls) > self.MAX_CALLS_TURN:
+                    garbled, calls = "tools", []
                 status = "partial" if acc["finish"] in ("stopped", "length") and not calls else "final"
                 if state["mid"] is None:
                     if content or acc["reasoning"] or calls:
@@ -573,7 +619,9 @@ class Engine(EngineView):
                     self.store.update_message(state["mid"], content=content, reasoning=acc["reasoning"],
                                               tool_calls=calls or None, status=status)
                 final_id = state["mid"] or final_id
-                if not calls:
+                if prev_round and prev_round[0] and content and TXT.jaccard(content, prev_round[1]) >= 0.6:
+                    self.store.update_message(prev_round[0], content="")  # the same narration written again: keep one
+                if garbled or not calls:
                     break
                 for tc in calls:
                     name, args = tc["function"]["name"], tc["function"]["arguments"]
@@ -600,10 +648,35 @@ class Engine(EngineView):
                         self.last_used[chat_id] += len(res) // 3 + 1500 * len(media)
                 if self.stop.is_set():
                     break
+                prev_round = (state["mid"], content)
+                if c["kind"] in ("rp", "group") and {tc["function"]["name"] for tc in calls} <= self.RECORDING_TOOLS \
+                        and TXT.is_narration(content):
+                    break  # the narration is written and these calls only recorded it: asking again would repeat it
         except urllib.error.HTTPError as e:
             error = f"The server rejected the request (HTTP {e.code}): {e.read().decode('utf-8', 'replace')[:400]}"
         except Exception as e:
             error = f"{type(e).__name__}: {e}"
+        if garbled and not error and not self.stop.is_set():
+            # Roll back: the broken reply becomes a side branch, and the time, status, dice, memories and feelings its
+            # tool calls recorded leave the active branch with it. Then one calmer try; a second break stops here.
+            label = self.GARBLED.get(garbled, garbled)
+            self.store.set_head(chat_id, start_head)
+            turn["head"] = start_head
+            self.store.side_log("garbled", {"why": garbled, "safe": safe}, chat_id, start_head)
+            if not safe:
+                self.emit("live", {})
+                self.emit("toast", {"text": f"The reply broke ({label}); it was set aside and is being written again.",
+                                    "kind": "warn"})
+                note = ("Balasan sebelumnya rusak (" + {"runaway": "teks berputar mengulang",
+                                                        "leak": "pemanggilan alat tertulis sebagai teks",
+                                                        "tools": "terlalu banyak pemanggilan alat"}[garbled]
+                        + "). Tulis narasi biasa. Jangan pernah menulis pemanggilan alat atau hasil alat sebagai teks; panggil "
+                          "alat hanya lewat fungsi, dan hanya yang benar-benar perlu.")
+                return self._turn(chat_id, extra=extra_in, pending_estimate=pending_estimate, length_override=length_override,
+                                  group_note=group_note, also=also_in + [note], seg_after=seg_after, speaker=speaker,
+                                  no_time=no_time, safe=True)
+            final_id, state = None, None
+            error = f"The reply broke twice ({label}) and was set aside. Use Retry."
         if final_id is None and state and state.get("mid"):
             final_id = state["mid"]  # the error came mid-stream: keep what was written as one cut-off reply
             self.store.update_message(final_id, status="partial")
@@ -831,11 +904,17 @@ class Engine(EngineView):
         dom, shares = TXT.narration_language(full, expected)
         rewrite_lang = None
         fixes = []
-        if dom != expected and shares.get(dom, 0) > 0.5:
+        wrong_lang = dom != expected and shares.get(dom, 0) > 0.5
+        lang_fails = int((self.store.chat(chat_id) or {}).get("settings", {}).get("lang_fail") or 0)
+        if getattr(self, "_rewriting", False):  # this reply is itself a rewrite: count whether it fixed the language
+            self.store.chat_settings(chat_id, lang_fail=lang_fails + 1 if wrong_lang else 0)
+        elif not wrong_lang and lang_fails:
+            self.store.chat_settings(chat_id, lang_fail=0)
+        if wrong_lang:
             flags.append({"kind": "language", "text": f"Narration seems to be in {dom}, not {expected}."})
             fixes.append(f"Narasi giliran sebelumnya tidak dalam bahasa {narr}. Tulis narasi dalam bahasa {narr}.")
             counted = sum(1 for x in TXT.words(full) if any(x in s for s in TXT.STOP.values()))
-            if counted >= 15:
+            if counted >= 15 and lang_fails < 2:  # two rewrites in a row did not help: flag only, save the time
                 rewrite_lang = (f"Jawaban sebelumnya tidak ditulis dalam bahasa {narr}. Tulis ulang giliran ini: narasi dalam "
                                 f"bahasa {narr}; ucapan tokoh dalam bahasa asing tetap dalam bahasanya, dengan terjemahan {narr}.")
         lv = used.get("lang")
